@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 
 #[derive(Default)]
 pub(super) struct IpcState {
-    pub(super) server: Option<Arc<RwLock<IpcHttpServer>>>,
+    pub(super) server: Arc<RwLock<Option<IpcHttpServer>>>,
 }
 
 impl IpcState {
@@ -17,15 +17,11 @@ impl IpcState {
 
     pub(super) async fn set_server(server: IpcHttpServer) {
         let mut guard = IpcState::global().write().await;
-        guard.server = Some(Arc::new(RwLock::new(server)));
+        guard.server = Arc::new(RwLock::new(Some(server)));
     }
 
-    pub(super) async fn get_server() -> Arc<RwLock<IpcHttpServer>> {
+    pub(super) async fn get_server() -> Arc<RwLock<Option<IpcHttpServer>>> {
         let guard = IpcState::global().read().await;
-        guard
-            .server
-            .as_ref()
-            .expect("Server not initialized")
-            .clone()
+        guard.server.clone()
     }
 }
