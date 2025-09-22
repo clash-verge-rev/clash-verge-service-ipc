@@ -1,3 +1,5 @@
+#![cfg(feature = "standalone")]
+
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};

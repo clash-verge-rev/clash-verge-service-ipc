@@ -1,3 +1,5 @@
+#![cfg(feature = "standalone")]
+
 use kode_bridge::IpcHttpServer;
 use once_cell::sync::Lazy;
 use std::sync::Arc;

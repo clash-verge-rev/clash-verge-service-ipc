@@ -1,15 +1,12 @@
-use anyhow::Result;
-use clash_verge_service_ipc;
-use clash_verge_service_ipc::{IPC_PATH, run_ipc_server, stop_ipc_server};
-use kode_bridge;
-use kode_bridge::IpcHttpClient;
-use std::time::Duration;
-use tokio::time::sleep;
-use tracing::debug;
-
+#![cfg(feature = "standalone")]
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use anyhow::Result;
+    use clash_verge_service_ipc::{IPC_PATH, run_ipc_server, stop_ipc_server};
+    use kode_bridge::IpcHttpClient;
+    use std::time::Duration;
+    use tokio::time::sleep;
+    use tracing::debug;
 
     fn connect_ipc() -> Result<IpcHttpClient> {
         debug!("Connecting to IPC at {}", IPC_PATH);
