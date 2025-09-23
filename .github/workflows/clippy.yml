@@ -1,0 +1,67 @@
+name: Clippy
+
+on:
+    push:
+        branches: [main, master]
+    pull_request:
+        branches: [main, master]
+
+jobs:
+    clippy:
+        name: Clippy Check
+        strategy:
+            matrix:
+                include:
+                    - os: macos-latest
+                      target: x86_64-apple-darwin
+                    - os: macos-latest
+                      target: aarch64-apple-darwin
+                    - os: windows-latest
+                      target: x86_64-pc-windows-msvc
+                    - os: windows-latest
+                      target: aarch64-pc-windows-msvc
+        runs-on: ${{ matrix.os }}
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Install Rust toolchain
+              uses: actions-rs/toolchain@v1
+              with:
+                toolchain: stable
+                target: ${{ matrix.target }}
+                override: true
+
+            - name: Install Clippy
+              run: rustup component add clippy --toolchain stable
+
+            - name: Run Clippy
+              run: cargo clippy --all-targets --all-features --features standalone --target ${{ matrix.target }} -- -D warnings
+
+    test:
+        name: Cargo Test
+        strategy:
+            matrix:
+                include:
+                    - os: macos-latest
+                      target: x86_64-apple-darwin
+                    - os: macos-latest
+                      target: aarch64-apple-darwin
+                    - os: windows-latest
+                      target: x86_64-pc-windows-msvc
+                    - os: windows-latest
+                      target: aarch64-pc-windows-msvc
+        runs-on: ${{ matrix.os }}
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Install Rust toolchain
+              uses: actions-rs/toolchain@v1
+              with:
+                toolchain: stable
+                target: ${{ matrix.target }}
+                override: true
+
+            - name: Run cargo test
+              run: cargo test --all-features --features standalone --target ${{ matrix.target }}
