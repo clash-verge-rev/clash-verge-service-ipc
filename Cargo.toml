@@ -10,8 +10,18 @@ name = "clash_verge_service_ipc"
 path = "src/lib.rs"
 
 [[bin]]
-name = "clash-verge-service-ipc"
-path = "src/main.rs"
+name = "clash-verge-service"
+path = "src/bin/service.rs"
+required-features = ["standalone"]
+
+[[bin]]
+name = "clash-verge-service-install"
+path = "src/bin/install_service.rs"
+required-features = ["standalone"]
+
+[[bin]]
+name = "clash-verge-service-uninstall"
+path = "src/bin/uninstall_service.rs"
 required-features = ["standalone"]
 
 [features]
@@ -33,7 +43,7 @@ kode-bridge = { version = "0.2.1", features = ["server"], optional = true }
 once_cell = { version = "1.21.3", features = ["parking_lot"], optional = true }
 anyhow = { version = "1.0.100", optional = true }
 http = { version = "1.3.1", optional = true }
-serde = { version = "1.0.219", features = ["derive"], optional = false}
+serde = { version = "1.0.219", features = ["derive"], optional = false }
 serde_json = { version = "1.0.143", optional = true }
 strum = { version = "0.27.2", optional = false }
 strum_macros = { version = "0.27.2", optional = false }

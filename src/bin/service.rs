@@ -1,5 +1,3 @@
-#![cfg(feature = "standalone")]
-
 use clash_verge_service_ipc::{run_ipc_server, set_ipc_socket_permissions, IPC_PATH};
 use kode_bridge::KodeBridgeError;
 use tokio::signal::unix::{SignalKind, signal};
