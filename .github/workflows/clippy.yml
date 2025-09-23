@@ -8,6 +8,13 @@ on:
     branches: [main, master]
 
 jobs:
+  skip-check:
+    if: github.event_name != 'push' || contains(github.event.head_commit.modified, 'src/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if src/ changed
+        run: echo "Continue workflow because src/ changed or not a push event."
+
   clippy:
     name: Clippy Check
     strategy:
