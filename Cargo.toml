@@ -23,6 +23,8 @@ standalone = [
     "tokio",
     "anyhow",
     "once_cell",
+    "serde_json",
+    "serde",
 ]
 default = []
 

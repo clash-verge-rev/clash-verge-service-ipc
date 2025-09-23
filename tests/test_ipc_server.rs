@@ -63,37 +63,4 @@ mod tests {
             "Should not be able to connect after stopping IPC server"
         );
     }
-
-    //     #[tokio::test]
-    //     #[serial]
-    //     async fn test_mihomo_start_success() {
-    //         // Arrange: set up any required state or mocks
-
-    //         // Act: call the function to start Mihomo
-
-    //         // Assert: check that Mihomo started successfully
-    //         // Example: assert_eq!(result, expected_value);
-    //     }
-
-    //     #[tokio::test]
-    //     #[serial]
-    //     async fn test_mihomo_start_failure() {
-    //         // Arrange: set up state to cause failure
-
-    //         // Act: attempt to start Mihomo
-
-    //         // Assert: verify that the error is handled as expected
-    //         // Example: assert!(result.is_err());
-    //     }
-
-    //     #[tokio::test]
-    //     #[serial]
-    //     async fn test_mihomo_start_with_custom_config() {
-    //         // Arrange: prepare a custom configuration
-
-    //         // Act: start Mihomo with the custom config
-
-    //         // Assert: verify Mihomo started with the correct config
-    //         // Example: assert_eq!(config_used, custom_config);
-    //     }
 }
