@@ -3,33 +3,48 @@ use crate::IpcCommand;
 use crate::core::manager::{CORE_MANAGER, CoreConfig};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
+use tokio::sync::oneshot;
 use tracing::info;
 
 pub async fn run_ipc_server() -> Result<()> {
     cleanup_ipc_path()?;
     init_ipc_state().await?;
-    {
-        let server_arc = IpcState::get_server().await;
-        let mut guard = server_arc.write().await;
-        if let Some(server) = guard.as_mut() {
-            server.serve().await
-        } else {
-            Err(kode_bridge::KodeBridgeError::configuration(
-                "IPC server not initialized".to_string(),
-            ))
+
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    IpcState::global()
+        .read()
+        .await
+        .set_sender(shutdown_tx)
+        .await;
+
+    let server_arc = IpcState::global().write().await.get_server();
+    let mut guard = server_arc.write().await;
+    if let Some(server) = guard.as_mut() {
+        tokio::select! {
+            res = server.serve() => res,
+            _ = &mut shutdown_rx => Ok(()),
         }
+    } else {
+        Err(kode_bridge::KodeBridgeError::configuration(
+            "IPC server not initialized".to_string(),
+        ))
     }
 }
 
 pub async fn stop_ipc_server() -> Result<()> {
+    if let Some(sender) = IpcState::global().read().await.take_sender().await {
+        let _ = sender.send(());
+    }
+
     {
-        let server_arc = IpcState::get_server().await;
+        let server_arc = IpcState::global().read().await.get_server();
         let mut guard = server_arc.write().await;
         if let Some(server) = guard.as_mut() {
             server.shutdown();
         }
         *guard = None;
     }
+
     cleanup_ipc_path()?;
     Ok(())
 }
@@ -56,7 +71,7 @@ pub async fn init_ipc_state() -> Result<()> {
     let server = create_ipc_server()?;
     let router = create_ipc_router()?;
     let server = server.router(router);
-    IpcState::set_server(server).await;
+    IpcState::global().read().await.set_server(server).await;
     Ok(())
 }
 
