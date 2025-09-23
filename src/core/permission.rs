@@ -12,6 +12,6 @@ pub fn set_ipc_socket_permissions(ipc_path: &str) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-pub fn set_ipc_socket_permissions(ipc_path: &str) -> std::io::Result<()> {
+pub fn set_ipc_socket_permissions(_ipc_path: &str) -> std::io::Result<()> {
     Ok(())
 }
