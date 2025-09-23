@@ -5,7 +5,7 @@ use std::{
     process::{Child, Command},
     sync::{Arc, Mutex},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreConfig {
@@ -31,7 +31,7 @@ impl CoreManager {
     pub fn start_core(&mut self, config: CoreConfig) -> Result<()> {
         if self.running_child.lock().unwrap().is_some() {
             info!("Core is already running");
-            self.stop_core()?;
+            let _ = self.stop_core();
             return Ok(());
         }
 
@@ -57,17 +57,18 @@ impl CoreManager {
     pub fn stop_core(&mut self) -> Result<()> {
         info!("Stopping core");
 
-        if let Some(child) = self.running_child.lock().unwrap().as_mut() {
-            child.kill()?;
-            child.wait()?;
-            *self.running_child.lock().unwrap() = None;
+        let child_opt = self.running_child.lock().unwrap().take();
+        if let Some(mut child) = child_opt {
+            if let Err(e) = child.kill() {
+                warn!("Failed to kill child ({0}): {e}", child.id());
+            }
         } else {
             info!("No running core process found");
         }
 
-        if let Some(config) = self.running_config.lock().unwrap().as_ref() {
+        let config_opt = self.running_config.lock().unwrap().take();
+        if let Some(config) = config_opt {
             info!("Clearing running config: {:?}", config);
-            *self.running_config.lock().unwrap() = None;
         } else {
             info!("No running config to clear");
         }
