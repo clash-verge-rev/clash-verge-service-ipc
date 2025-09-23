@@ -1,5 +1,5 @@
 [package]
-name = "clash-verge-service-ipc"
+name = "clash_verge_service_ipc"
 version = "0.1.0"
 edition = "2024"
 authors = ["Tunglies"]
