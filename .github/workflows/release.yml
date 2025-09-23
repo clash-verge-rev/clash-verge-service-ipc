@@ -80,6 +80,7 @@ jobs:
           tag_name: ${{ matrix.target }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: CodeSign
         if: startsWith(matrix.os, 'macos')
         run: |
@@ -95,18 +96,22 @@ jobs:
           file target/${{ matrix.target }}/release/install-service
           lipo -info target/${{ matrix.target }}/release/install-service || true
 
-          # 对服务程序进行签名
-          codesign --force \
-            -s "${{ secrets.APPLE_SIGNING_IDENTITY }}" \
-            --keychain github-actions.keychain \
-            --options runtime \
-            --timestamp \
-            --identifier "io.github.clash-verge-rev.clash-verge-rev-service-ipc" \
-            target/${{ matrix.target }}/release/clash-verge-service-ipc
+          # 对所有服务程序进行签名
+          for bin in clash-verge-service clash-verge-service-install clash-verge-service-uninstall; do
+            codesign --force \
+              -s "${{ secrets.APPLE_SIGNING_IDENTITY }}" \
+              --keychain github-actions.keychain \
+              --options runtime \
+              --timestamp \
+              --identifier "io.github.clash-verge-rev.clash-verge-rev-service-ipc" \
+              target/${{ matrix.target }}/release/$bin
+          done
 
           # 验证签名
-          codesign -dvv target/${{ matrix.target }}/release/clash-verge-service-ipc
-          codesign -d --entitlements /dev/stdout target/${{ matrix.target }}/release/clash-verge-service-ipc
+          for bin in clash-verge-service clash-verge-service-install clash-verge-service-uninstall; do
+            codesign -dvv target/${{ matrix.target }}/release/$bin
+            codesign -d --entitlements /dev/stdout target/${{ matrix.target }}/release/$bin
+          done
 
       - name: Release
         if: matrix.os == 'windows-latest'
@@ -116,7 +121,9 @@ jobs:
           tag_name: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
           files: |
-            target/${{ matrix.target }}/release/clash-verge-service-ipc.exe
+            target/${{ matrix.target }}/release/clash-verge-service.exe
+            target/${{ matrix.target }}/release/clash-verge-service-install.exe
+            target/${{ matrix.target }}/release/clash-verge-service-uninstall.exe
 
       - name: Release
         if: matrix.os != 'windows-latest'
@@ -126,4 +133,6 @@ jobs:
           tag_name: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
           files: |
-            target/${{ matrix.target }}/release/clash-verge-service-ipc
+            target/${{ matrix.target }}/release/clash-verge-service
+            target/${{ matrix.target }}/release/clash-verge-service-install
+            target/${{ matrix.target }}/release/clash-verge-service-uninstall

@@ -1,6 +1,9 @@
-use clash_verge_service_ipc::{run_ipc_server, set_ipc_socket_permissions, IPC_PATH};
+use clash_verge_service_ipc::{IPC_PATH, run_ipc_server, set_ipc_socket_permissions};
 use kode_bridge::KodeBridgeError;
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
+#[cfg(windows)]
+use tokio::signal::windows;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
@@ -16,9 +19,7 @@ async fn main() -> Result<(), KodeBridgeError> {
     let pid = std::process::id();
     info!("Current process PID: {}", pid);
 
-    let mut server = Some(tokio::spawn(async {
-        run_ipc_server().await
-    }));
+    let mut server = Some(tokio::spawn(async { run_ipc_server().await }));
 
     #[cfg(unix)]
     {
@@ -31,6 +32,11 @@ async fn main() -> Result<(), KodeBridgeError> {
                 info!("IPC socket permissions set to 666");
             }
         });
+    }
+    #[cfg(windows)]
+    {
+        // This actually does nothing on Windows, but we call it for consistency.
+        set_ipc_socket_permissions(IPC_PATH)?;
     }
 
     #[cfg(unix)]
@@ -58,23 +64,20 @@ async fn main() -> Result<(), KodeBridgeError> {
     }
     #[cfg(windows)]
     {
-        info!("IPC server started. Waiting for Ctrl+C or SIGTERM to shut down...");
-        let ctrl_c = tokio::signal::ctrl_c();
-        #[cfg(windows)]
-        let sigterm =
-            tokio::signal::windows::signal(tokio::signal::windows::SignalKind::terminate())?;
+        info!("IPC server started. Waiting for Ctrl+C or Ctrl+Break to shut down...");
+        let mut ctrl_c = windows::ctrl_c()?;
+        let mut ctrl_break = windows::ctrl_break()?;
 
         tokio::select! {
-            _ = ctrl_c => {
+            _ = ctrl_c.recv() => {
                 info!("Received Ctrl+C. Shutting down IPC server...");
-                std::process::exit(0);
+                return Ok(());
             },
-            #[cfg(windows)]
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM. Shutting down IPC server...");
-                std::process::exit(0);
+            _ = ctrl_break.recv() => {
+                info!("Received Ctrl+Break. Shutting down IPC server...");
+                return Ok(());
             },
-            res = server => {
+            res = &mut server.as_mut().unwrap() => {
                 info!("IPC server task finished.");
                 return res.map_err(|e| KodeBridgeError::from(Box::new(e) as Box<dyn std::error::Error + Send + Sync>))?;
             }

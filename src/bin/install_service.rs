@@ -3,7 +3,6 @@ fn main() {
     panic!("This program is not intended to run on this platform.");
 }
 
-#[cfg(not(windows))]
 use anyhow::Error;
 use std::env;
 
@@ -112,7 +111,6 @@ fn main() -> Result<(), Error> {
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Error> {
     const SERVICE_NAME: &str = "clash-verge-service";
-    use clash_verge_service::utils::run_command;
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
@@ -129,14 +127,14 @@ fn main() -> Result<(), Error> {
 
     // Check service status
     let status_output = std::process::Command::new("systemctl")
-        .args(&["status", &format!("{}.service", SERVICE_NAME), "--no-pager"])
+        .args(["status", &format!("{}.service", SERVICE_NAME), "--no-pager"])
         .output()
         .map_err(|e| anyhow::anyhow!("Failed to check service status: {}", e))?;
 
     match status_output.status.code() {
         Some(0) => return Ok(()), // Service is running
         Some(1) | Some(2) | Some(3) => {
-            let _ = run_command(
+            run_command(
                 "systemctl",
                 &["start", &format!("{}.service", SERVICE_NAME)],
                 debug,
@@ -152,7 +150,7 @@ fn main() -> Result<(), Error> {
     let unit_file = Path::new(&unit_file);
 
     let unit_file_content = format!(
-        include_str!("files/systemd_service_unit.tmpl"),
+        include_str!("../../resources/systemd_service_unit.tmpl"),
         service_binary_path.to_str().unwrap()
     );
 
@@ -183,20 +181,20 @@ fn main() -> windows_service::Result<()> {
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
     let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::START;
-    if let Ok(service) = service_manager.open_service("clash_verge_service", service_access) {
-        if let Ok(status) = service.query_status() {
-            match status.current_state {
-                ServiceState::StopPending
-                | ServiceState::Stopped
-                | ServiceState::PausePending
-                | ServiceState::Paused => {
-                    service.start(&Vec::<&OsStr>::new())?;
-                }
-                _ => {}
-            };
+    if let Ok(service) = service_manager.open_service("clash_verge_service", service_access)
+        && let Ok(status) = service.query_status()
+    {
+        match status.current_state {
+            ServiceState::StopPending
+            | ServiceState::Stopped
+            | ServiceState::PausePending
+            | ServiceState::Paused => {
+                service.start(&Vec::<&OsStr>::new())?;
+            }
+            _ => {}
+        };
 
-            return Ok(());
-        }
+        return Ok(());
     }
 
     let service_binary_path = env::current_exe()

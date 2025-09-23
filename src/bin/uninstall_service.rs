@@ -3,7 +3,6 @@ fn main() {
     panic!("This program is not intended to run on this platform.");
 }
 
-#[cfg(not(windows))]
 use anyhow::Error;
 
 #[cfg(target_os = "macos")]
@@ -47,7 +46,6 @@ fn main() -> Result<(), Error> {
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Error> {
-    use clash_verge_service::utils::run_command;
     const SERVICE_NAME: &str = "clash-verge-service";
     use std::env;
 
