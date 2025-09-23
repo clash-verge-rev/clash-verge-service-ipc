@@ -1,6 +1,6 @@
 #![cfg(feature = "standalone")]
 
-use clash_verge_service_ipc::run_ipc_server;
+use clash_verge_service_ipc::{run_ipc_server, set_ipc_socket_permissions, IPC_PATH};
 use kode_bridge::KodeBridgeError;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{Level, info};
@@ -18,7 +18,22 @@ async fn main() -> Result<(), KodeBridgeError> {
     let pid = std::process::id();
     info!("Current process PID: {}", pid);
 
-    let mut server = Some(tokio::spawn(async { run_ipc_server().await }));
+    let mut server = Some(tokio::spawn(async {
+        run_ipc_server().await
+    }));
+
+    #[cfg(unix)]
+    {
+        // Set IPC socket permissions once after a short delay to ensure the socket is created.
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+            if let Err(e) = set_ipc_socket_permissions(IPC_PATH) {
+                tracing::error!("Failed to set IPC socket permissions: {}", e);
+            } else {
+                info!("IPC socket permissions set to 666");
+            }
+        });
+    }
 
     #[cfg(unix)]
     {

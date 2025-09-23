@@ -3,7 +3,7 @@ mod core;
 pub use core::IpcCommand;
 
 #[cfg(feature = "standalone")]
-pub use core::{run_ipc_server, stop_ipc_server};
+pub use core::{run_ipc_server, stop_ipc_server, set_ipc_socket_permissions};
 
 #[cfg(unix)]
 pub static IPC_PATH: &str = "/tmp/clash-verge-service-ipc.sock";
