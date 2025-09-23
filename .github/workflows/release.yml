@@ -65,14 +65,14 @@ jobs:
       - name: Build
         if: matrix.os != 'ubuntu-latest'
         run: |
-          cargo clean
-          cargo build --release --target ${{ matrix.target }} --verbose
+          cargo build --release --target ${{ matrix.target }} --features standalone --verbose
 
       - name: Build
         if: matrix.os == 'ubuntu-latest'
         uses: ./.github/build-for-linux
         with:
           target: ${{ matrix.target }}
+          features: standalone
 
       - name: Update Tag
         uses: richardsimko/update-tag@v1
