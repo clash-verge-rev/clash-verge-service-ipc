@@ -58,10 +58,9 @@ fn make_ipc_dir() -> Result<()> {
 
         use crate::IPC_PATH;
 
-        if let Some(dir_path) = Path::new(IPC_PATH).parent() {
-            if !dir_path.exists() {
+        if let Some(dir_path) = Path::new(IPC_PATH).parent() 
+            && !dir_path.exists() {
             fs::create_dir_all(dir_path)?;
-            }
         }
     }
     #[cfg(windows)]
