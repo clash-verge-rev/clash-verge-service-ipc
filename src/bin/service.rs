@@ -25,7 +25,7 @@ async fn main() -> Result<(), KodeBridgeError> {
     {
         // Set IPC socket permissions once after a short delay to ensure the socket is created.
         tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+            tokio::time::sleep(std::time::Duration::from_micros(275)).await;
             if let Err(e) = set_ipc_socket_permissions(IPC_PATH) {
                 tracing::error!("Failed to set IPC socket permissions: {}", e);
             } else {
