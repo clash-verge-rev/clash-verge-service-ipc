@@ -9,7 +9,6 @@ on:
 
 jobs:
   clippy:
-    if: github.event_name != 'push' || contains(github.event.head_commit.modified, 'src/')
     name: Clippy Check
     strategy:
       matrix:
