@@ -55,8 +55,10 @@ fn make_ipc_dir() -> Result<()> {
     {
         use std::fs;
         use std::path::Path;
-
+        #[cfg(linux)]
         let dir_path = Path::new("/run/verge");
+        #[cfg(macos)]
+        let dir_path = Path::new("/private/var/run/verge");
         if !dir_path.exists() {
             fs::create_dir_all(dir_path)?;
         }
