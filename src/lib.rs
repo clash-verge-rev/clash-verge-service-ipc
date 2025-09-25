@@ -5,10 +5,10 @@ pub use core::IpcCommand;
 #[cfg(feature = "standalone")]
 pub use core::{run_ipc_server, set_ipc_socket_permissions, stop_ipc_server};
 
-#[cfg(linux)]
+#[cfg(target_os="linux")]
 pub static IPC_PATH: &str = "/run/verge/clash-verge-service-ipc.sock";
 
-#[cfg(macos)]
+#[cfg(target_os="macos")]
 pub static IPC_PATH: &str = "/private/var/run/verge/clash-verge-service-ipc.sock";
 
 #[cfg(windows)]
