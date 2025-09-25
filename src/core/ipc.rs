@@ -7,6 +7,7 @@ use tokio::sync::oneshot;
 use tracing::info;
 
 pub async fn run_ipc_server() -> Result<()> {
+    make_ipc_dir()?;
     cleanup_ipc_path()?;
     init_ipc_state().await?;
 
@@ -46,6 +47,24 @@ pub async fn stop_ipc_server() -> Result<()> {
     }
 
     cleanup_ipc_path()?;
+    Ok(())
+}
+
+fn make_ipc_dir() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs;
+        use std::path::Path;
+
+        let dir_path = Path::new("/tmp/verge");
+        if !dir_path.exists() {
+            fs::create_dir_all(dir_path)?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        // No directory creation needed for Windows named pipes
+    }
     Ok(())
 }
 
