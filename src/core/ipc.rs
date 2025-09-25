@@ -56,7 +56,7 @@ fn make_ipc_dir() -> Result<()> {
         use std::fs;
         use std::path::Path;
 
-        let dir_path = Path::new("/tmp/verge");
+        let dir_path = Path::new("/run/verge");
         if !dir_path.exists() {
             fs::create_dir_all(dir_path)?;
         }
