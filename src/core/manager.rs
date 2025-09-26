@@ -1,23 +1,44 @@
+use crate::WriterConfig;
+use crate::core::StartClash;
+use crate::core::logger::{SharedWriter, service_writer};
 use anyhow::Result;
+use flexi_logger::writers::LogWriter;
+use flexi_logger::{DeferredNow, Record};
 use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
-use std::{
-    process::{Child, Command},
-    sync::{Arc, Mutex},
-};
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::io::AsyncBufReadExt;
+use tokio::{io::BufReader, process::Command};
+use tokio::{process::Child, sync::Mutex};
 use tracing::{info, warn};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CoreConfig {
-    pub core_path: String,
-    pub config_path: String,
-    pub config_dir: String,
-    pub log_dir: String,
+struct ChildGuard(Option<Child>);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            tokio::spawn(async move {
+                if let Err(e) = child.kill().await {
+                    warn!("Failed to kill child ({:?}): {e}", child.id());
+                } else {
+                    info!("Successfully killed child ({:?})", child.id());
+                }
+            });
+        } else {
+            info!("No running core process found");
+        }
+    }
+}
+
+impl ChildGuard {
+    fn inner(&mut self) -> Option<&mut Child> {
+        self.0.as_mut()
+    }
 }
 
 pub struct CoreManager {
-    running_child: Arc<Mutex<Option<Child>>>,
-    running_config: Arc<Mutex<Option<CoreConfig>>>,
+    running_child: Arc<Mutex<Option<ChildGuard>>>,
+    running_config: Arc<Mutex<Option<StartClash>>>,
 }
 
 impl CoreManager {
@@ -28,46 +49,42 @@ impl CoreManager {
         }
     }
 
-    pub fn start_core(&mut self, config: CoreConfig) -> Result<()> {
-        if self.running_child.lock().unwrap().is_some() {
+    pub async fn start_core(&mut self, config: StartClash) -> Result<()> {
+        if self.running_child.lock().await.is_some() {
             info!("Core is already running");
-            let _ = self.stop_core();
+            let _ = self.stop_core().await;
             return Ok(());
         }
 
         info!("Starting core with config: {:?}", config);
         self.running_config = Arc::new(Mutex::new(Some(config)));
 
-        if let Some(config) = self.running_config.lock().unwrap().as_ref() {
+        if let Some(config) = self.running_config.lock().await.as_ref() {
             let args = vec![
                 "-d",
-                config.config_dir.as_str(),
+                config.core_config.config_dir.as_str(),
                 "-f",
-                config.config_path.as_str(),
+                config.core_config.config_path.as_str(),
             ];
 
-            let child = Command::new(config.core_path.as_str()).args(args).spawn()?;
+            let child_guard =
+                run_with_logging(&config.core_config.core_path, &args, &config.log_config).await?;
 
-            self.running_child = Arc::new(Mutex::new(Some(child)));
+            let mut child_lock = self.running_child.lock().await;
+            *child_lock = Some(child_guard);
         }
 
         Ok(())
     }
 
-    pub fn stop_core(&mut self) -> Result<()> {
+    pub async fn stop_core(&mut self) -> Result<()> {
         info!("Stopping core");
 
-        let child_opt = self.running_child.lock().unwrap().take();
-        if let Some(mut child) = child_opt {
-            if let Err(e) = child.kill() {
-                warn!("Failed to kill child ({0}): {e}", child.id());
-            }
-        } else {
-            info!("No running core process found");
-        }
+        let child_guard = self.running_child.lock().await.take();
+        drop(child_guard);
 
-        let config_opt = self.running_config.lock().unwrap().take();
-        if let Some(config) = config_opt {
+        let start_clash = self.running_config.lock().await.take();
+        if let Some(config) = start_clash {
             info!("Clearing running config: {:?}", config);
         } else {
             info!("No running config to clear");
@@ -75,6 +92,65 @@ impl CoreManager {
 
         Ok(())
     }
+}
+
+async fn run_with_logging(
+    bin_path: &str,
+    args: &Vec<&str>,
+    writer_config: &WriterConfig,
+) -> Result<ChildGuard> {
+    let child = Command::new(bin_path)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut child_guard = ChildGuard(Some(child));
+
+    let shared_writer: SharedWriter = Arc::new(Mutex::new(service_writer(writer_config)?));
+    let stdout = child_guard
+        .inner()
+        .as_mut()
+        .and_then(|c| c.stdout.take())
+        .unwrap();
+    let stderr = child_guard
+        .inner()
+        .as_mut()
+        .and_then(|c| c.stderr.take())
+        .unwrap();
+
+    let mut stdout_reader = BufReader::new(stdout).lines();
+    let shared_writer_clone = shared_writer.clone();
+    tokio::spawn(async move {
+        let w = shared_writer_clone.lock().await;
+        while let Ok(Some(line)) = stdout_reader.next_line().await {
+            let mut now = DeferredNow::default();
+            let arg = format_args!("{}", line);
+            let record = Record::builder()
+                .args(arg)
+                .level(log::Level::Info)
+                .target("service")
+                .build();
+            let _ = w.write(&mut now, &record);
+        }
+    });
+
+    let mut stderr_reader = BufReader::new(stderr).lines();
+    let shared_writer_clone = shared_writer.clone();
+    tokio::spawn(async move {
+        let w = shared_writer_clone.lock().await;
+        while let Ok(Some(line)) = stderr_reader.next_line().await {
+            let mut now = DeferredNow::default();
+            let arg = format_args!("{}", line);
+            let record = Record::builder()
+                .args(arg)
+                .level(log::Level::Error)
+                .target("service")
+                .build();
+            let _ = w.write(&mut now, &record);
+        }
+    });
+
+    Ok(child_guard)
 }
 
 pub static CORE_MANAGER: Lazy<Arc<Mutex<CoreManager>>> =

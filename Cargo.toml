@@ -1,6 +1,6 @@
 [package]
 name = "clash_verge_service_ipc"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 authors = ["Tunglies"]
 license = "GPL-3.0"
@@ -34,6 +34,9 @@ standalone = [
     "anyhow",
     "once_cell",
     "serde_json",
+    "clash_verge_logger",
+    "flexi_logger",
+    "log",
 ]
 default = []
 
@@ -47,9 +50,16 @@ serde = { version = "1.0.219", features = ["derive"], optional = false }
 serde_json = { version = "1.0.143", optional = true }
 strum = { version = "0.27.2", optional = false }
 strum_macros = { version = "0.27.2", optional = false }
-tokio = { version = "1.47.1", optional = true }
+tokio = { version = "1.47.1", features = [
+    "process",
+    "io-util",
+    "rt-multi-thread",
+], optional = true }
 tracing = { version = "0.1.41", optional = true }
 tracing-subscriber = { version = "0.3.20", optional = true }
+clash_verge_logger = { git = "https://github.com/clash-verge-rev/clash-verge-logger.git", version = "0.1.0", optional = true }
+flexi_logger = { version = "0.31.4", optional = true }
+log = { version = "0.4.28", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-service = "0.8.0"

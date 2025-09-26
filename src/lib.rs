@@ -1,6 +1,6 @@
 mod core;
 
-pub use core::IpcCommand;
+pub use core::{CoreConfig, IpcCommand, StartClash, WriterConfig};
 
 #[cfg(feature = "standalone")]
 pub use core::{run_ipc_server, set_ipc_socket_permissions, stop_ipc_server};

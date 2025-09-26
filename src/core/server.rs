@@ -1,6 +1,6 @@
 use super::state::IpcState;
-use crate::IpcCommand;
-use crate::core::manager::{CORE_MANAGER, CoreConfig};
+use crate::core::manager::CORE_MANAGER;
+use crate::{IpcCommand, StartClash};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
 use tokio::sync::oneshot;
@@ -58,8 +58,9 @@ fn make_ipc_dir() -> Result<()> {
 
         use crate::IPC_PATH;
 
-        if let Some(dir_path) = Path::new(IPC_PATH).parent() 
-            && !dir_path.exists() {
+        if let Some(dir_path) = Path::new(IPC_PATH).parent()
+            && !dir_path.exists()
+        {
             fs::create_dir_all(dir_path)?;
         }
     }
@@ -88,7 +89,7 @@ fn cleanup_ipc_path() -> Result<()> {
     Ok(())
 }
 
-pub async fn init_ipc_state() -> Result<()> {
+async fn init_ipc_state() -> Result<()> {
     let server = create_ipc_server()?;
     let router = create_ipc_router()?;
     let server = server.router(router);
@@ -112,9 +113,9 @@ fn create_ipc_router() -> Result<Router> {
                 .build())
         })
         .post(IpcCommand::StartClash.as_ref(), |payload| async move {
-            match payload.json::<CoreConfig>() {
-                Ok(config) => {
-                    match CORE_MANAGER.lock().unwrap().start_core(config) {
+            match payload.json::<StartClash>() {
+                Ok(start_clash) => {
+                    match CORE_MANAGER.lock().await.start_core(start_clash).await {
                         Ok(_) => info!("Core started successfully"),
                         Err(e) => {
                             let json_value = serde_json::json!({
@@ -144,7 +145,7 @@ fn create_ipc_router() -> Result<Router> {
             }
         })
         .delete(IpcCommand::StopClash.as_ref(), |_| async move {
-            match CORE_MANAGER.lock().unwrap().stop_core() {
+            match CORE_MANAGER.lock().await.stop_core().await {
                 Ok(_) => info!("Core stopped successfully"),
                 Err(e) => {
                     let json_value = serde_json::json!({
