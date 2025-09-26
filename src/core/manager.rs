@@ -1,6 +1,6 @@
 use crate::WriterConfig;
 use crate::core::StartClash;
-use crate::core::logger::{SharedWriter, service_writer};
+use crate::core::logger::{get_writer, set_or_update_writer};
 use anyhow::Result;
 use flexi_logger::writers::LogWriter;
 use flexi_logger::{DeferredNow, Record};
@@ -12,7 +12,7 @@ use tokio::{io::BufReader, process::Command};
 use tokio::{process::Child, sync::Mutex};
 use tracing::{info, warn};
 
-struct ChildGuard(Option<Child>);
+pub struct ChildGuard(Option<Child>);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -94,19 +94,22 @@ impl CoreManager {
     }
 }
 
-async fn run_with_logging(
+pub async fn run_with_logging(
     bin_path: &str,
     args: &Vec<&str>,
     writer_config: &WriterConfig,
 ) -> Result<ChildGuard> {
+    set_or_update_writer(&writer_config).await?;
+    let shared_writer = get_writer().unwrap();
+
     let child = Command::new(bin_path)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+
     let mut child_guard = ChildGuard(Some(child));
 
-    let shared_writer: SharedWriter = Arc::new(Mutex::new(service_writer(writer_config)?));
     let stdout = child_guard
         .inner()
         .as_mut()
