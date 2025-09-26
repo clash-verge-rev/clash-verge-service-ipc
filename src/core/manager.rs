@@ -99,7 +99,7 @@ pub async fn run_with_logging(
     args: &Vec<&str>,
     writer_config: &WriterConfig,
 ) -> Result<ChildGuard> {
-    set_or_update_writer(&writer_config).await?;
+    set_or_update_writer(writer_config).await?;
     let shared_writer = get_writer().unwrap();
 
     let child = Command::new(bin_path)
