@@ -3,4 +3,16 @@
   "extends": [
     "config:recommended"
   ]
+  ,
+  "packageRules": [
+    {
+      "managers": ["cargo"],
+      "enabled": true
+    },
+    {
+      "managers": ["github-actions"],
+      "enabled": true
+    }
+  ],
+  "automerge": true
 }
