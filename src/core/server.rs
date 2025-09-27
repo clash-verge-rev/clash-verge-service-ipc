@@ -99,7 +99,13 @@ async fn init_ipc_state() -> Result<()> {
 
 fn create_ipc_server() -> Result<IpcHttpServer> {
     use crate::IPC_PATH;
-    IpcHttpServer::new(IPC_PATH)
+    let server = IpcHttpServer::new(IPC_PATH)?;
+    #[cfg(unix)]
+    let server = server.with_listener_mode(0o666);
+    #[cfg(windows)]
+    let server = server.with_listener_security_descriptor("D:(A;;GA;;;WD)");
+
+    Ok(server)
 }
 
 fn create_ipc_router() -> Result<Router> {

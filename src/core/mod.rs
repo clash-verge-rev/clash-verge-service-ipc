@@ -9,14 +9,9 @@ mod logger;
 #[cfg(feature = "standalone")]
 mod manager;
 #[cfg(feature = "standalone")]
-mod permission;
-#[cfg(feature = "standalone")]
 mod server;
 #[cfg(feature = "standalone")]
 mod state;
 
 #[cfg(feature = "standalone")]
 pub use server::{run_ipc_server, stop_ipc_server};
-
-#[cfg(feature = "standalone")]
-pub use permission::set_ipc_socket_permissions;
