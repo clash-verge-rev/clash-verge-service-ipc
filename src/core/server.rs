@@ -53,15 +53,19 @@ pub async fn stop_ipc_server() -> Result<()> {
 fn make_ipc_dir() -> Result<()> {
     #[cfg(unix)]
     {
+        use crate::IPC_PATH;
         use std::fs;
+        #[cfg(unix)]
+        use std::fs::set_permissions;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
         use std::path::Path;
 
-        use crate::IPC_PATH;
-
-        if let Some(dir_path) = Path::new(IPC_PATH).parent()
-            && !dir_path.exists()
-        {
-            fs::create_dir_all(dir_path)?;
+        if let Some(dir_path) = Path::new(IPC_PATH).parent() {
+            if !dir_path.exists() {
+                fs::create_dir_all(dir_path)?;
+            }
+            set_permissions(dir_path, fs::Permissions::from_mode(0o777))?;
         }
     }
     #[cfg(windows)]
@@ -101,7 +105,7 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
     use crate::IPC_PATH;
     let server = IpcHttpServer::new(IPC_PATH)?;
     #[cfg(unix)]
-    let server = server.with_listener_mode(0o666);
+    let server = server.with_listener_mode(0o777);
     #[cfg(windows)]
     let server = server.with_listener_security_descriptor("D:(A;;GA;;;WD)");
 
