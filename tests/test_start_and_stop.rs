@@ -66,6 +66,8 @@ mod tests {
     #[serial]
     async fn test_start_and_stop_ipc_server() {
         start_and_stop_ipc_server_helper().await;
+        #[cfg(windows)]
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ use tokio::sync::{oneshot, Mutex};
 pub(super) struct IpcState {
     pub(super) server: Arc<Mutex<Option<IpcHttpServer>>>,
     pub(super) sender: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    pub(super) done: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
 }
 
 impl IpcState {
@@ -14,6 +15,7 @@ impl IpcState {
             Arc::new(Mutex::new(IpcState {
                 server: Arc::new(Mutex::new(None)),
                 sender: Arc::new(Mutex::new(None)),
+                done: Arc::new(Mutex::new(None)),
             }))
         });
         &IPC_STATE
@@ -35,6 +37,16 @@ impl IpcState {
 
     pub(super) async fn take_sender(&self) -> Option<oneshot::Sender<()>> {
         let mut guard = self.sender.lock().await;
+        guard.take()
+    }
+
+    pub(super) async fn set_done(&self, done: oneshot::Receiver<()>) {
+        let mut guard = self.done.lock().await;
+        *guard = Some(done);
+    }
+
+    pub(super) async fn take_done(&self) -> Option<oneshot::Receiver<()>> {
+        let mut guard = self.done.lock().await;
         guard.take()
     }
 }

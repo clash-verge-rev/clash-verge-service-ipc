@@ -12,19 +12,24 @@ pub async fn run_ipc_server() -> Result<()> {
     init_ipc_state().await?;
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-    IpcState::global()
-        .lock()
-        .await
-        .set_sender(shutdown_tx)
-        .await;
+    let (done_tx, done_rx) = oneshot::channel();
 
-    let server_arc = IpcState::global().lock().await.get_server();
+    let state = IpcState::global();
+    let guard = state.lock().await;
+    guard.set_sender(shutdown_tx).await;
+    guard.set_done(done_rx).await;
+
+    let server_arc = guard.get_server();
+    drop(guard);
+
     let mut guard = server_arc.lock().await;
     if let Some(server) = guard.as_mut() {
-        tokio::select! {
+        let res = tokio::select! {
             res = server.serve() => res,
             _ = &mut shutdown_rx => Ok(()),
-        }
+        };
+        let _ = done_tx.send(());
+        res
     } else {
         Err(kode_bridge::KodeBridgeError::configuration(
             "IPC server not initialized".to_string(),
@@ -37,6 +42,10 @@ pub async fn stop_ipc_server() -> Result<()> {
         let _ = sender.send(());
     }
 
+    if let Some(done) = IpcState::global().lock().await.take_done().await {
+        let _ = done.await;
+    }
+
     {
         let server_arc = IpcState::global().lock().await.get_server();
         let mut guard = server_arc.lock().await;
@@ -46,14 +55,6 @@ pub async fn stop_ipc_server() -> Result<()> {
         *guard = None;
     }
 
-    #[cfg(windows)]
-    {
-        // On Windows, give some time for the named pipe to close properly
-        #[cfg(target_arch = "x86")]
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        #[cfg(not(target_arch = "x86"))]
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
     cleanup_ipc_path()?;
     Ok(())
 }
