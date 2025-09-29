@@ -2,7 +2,7 @@
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use clash_verge_service_ipc::{run_ipc_server, stop_ipc_server, IpcCommand, IPC_PATH, VERSION};
+    use clash_verge_service_ipc::{IPC_PATH, IpcCommand, VERSION, run_ipc_server, stop_ipc_server};
     use kode_bridge::IpcHttpClient;
     use serde_json::Value;
     use serial_test::serial;
@@ -14,7 +14,6 @@ mod tests {
         client.get(IpcCommand::Magic.as_ref()).send().await?;
         Ok(client)
     }
-
 
     #[tokio::test]
     #[serial]
@@ -34,17 +33,21 @@ mod tests {
             "Should be able to connect to IPC server after starting"
         );
 
-        let version = client.unwrap().get(IpcCommand::GetVersion.as_ref()).send().await;
+        let version = client
+            .unwrap()
+            .get(IpcCommand::GetVersion.as_ref())
+            .send()
+            .await;
         assert!(
             version.is_ok(),
             "Should receive a response from GetVersion command"
         );
 
-        let version_value: Value = version.unwrap().json().expect("Should parse GetVersion response");
-        assert!(
-            !version_value.is_null(),
-            "Version value should not be null"
-        );
+        let version_value: Value = version
+            .unwrap()
+            .json()
+            .expect("Should parse GetVersion response");
+        assert!(!version_value.is_null(), "Version value should not be null");
 
         assert!(
             version_value["version"] == VERSION,
@@ -58,5 +61,4 @@ mod tests {
 
         let _ = server_handle.await;
     }
-    
 }

@@ -4,32 +4,38 @@ use crate::{IpcCommand, StartClash, VERSION};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tracing::info;
 
-pub async fn run_ipc_server() -> Result<()> {
+pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     make_ipc_dir()?;
     cleanup_ipc_path()?;
     init_ipc_state().await?;
 
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-    let (done_tx, done_rx) = oneshot::channel();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
 
-    let state = IpcState::global();
-    let guard = state.lock().await;
-    guard.set_sender(shutdown_tx).await;
-    guard.set_done(done_rx).await;
+    {
+        let guard = IpcState::global().lock().await;
+        guard.set_sender(shutdown_tx).await;
+        guard.set_done(done_rx).await;
+    }
 
-    let server_arc = guard.get_server();
-    drop(guard);
-
+    let server_arc = IpcState::global().lock().await.get_server();
     let mut guard = server_arc.lock().await;
-    if let Some(server) = guard.as_mut() {
-        let res = tokio::select! {
-            res = server.serve() => res,
-            _ = &mut shutdown_rx => Ok(()),
-        };
-        let _ = done_tx.send(());
-        res
+
+    if let Some(mut server) = guard.take() {
+        let handle = tokio::spawn(async move {
+            let res = tokio::select! {
+                res = server.serve() => res,
+                _ = &mut shutdown_rx => Ok(()),
+            };
+
+            let _ = done_tx.send(());
+            res
+        });
+
+        Ok(handle)
     } else {
         Err(kode_bridge::KodeBridgeError::configuration(
             "IPC server not initialized".to_string(),
@@ -56,6 +62,10 @@ pub async fn stop_ipc_server() -> Result<()> {
     }
 
     cleanup_ipc_path()?;
+
+    #[cfg(windows)]
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
     Ok(())
 }
 

@@ -77,10 +77,18 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_start_and_stop_ipc_server_multiple_times() {
-        let _ = stop_ipc_server().await;
+        for i in 0..50 {
+            println!("Iteration {}", i);
 
-        for _ in 0..10 {
-            start_and_stop_ipc_server_helper().await;
+            let handle = run_ipc_server().await.unwrap();
+
+            assert!(connect_ipc().await.is_ok(), "Should connect after starting");
+
+            stop_ipc_server().await.unwrap();
+
+            // 等待 server 完全退出
+            let res = handle.await.unwrap();
+            assert!(res.is_ok(), "server should exit cleanly");
         }
     }
 }

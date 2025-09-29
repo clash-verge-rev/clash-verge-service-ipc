@@ -19,7 +19,7 @@ async fn main() -> Result<(), KodeBridgeError> {
     let pid = std::process::id();
     info!("Current process PID: {}", pid);
 
-    let mut server = Some(tokio::spawn(async { run_ipc_server().await }));
+    let mut server_handle = run_ipc_server().await?;
 
     #[cfg(unix)]
     {
@@ -38,12 +38,13 @@ async fn main() -> Result<(), KodeBridgeError> {
                 info!("Received SIGTERM. Shutting down IPC server...");
                 std::process::exit(0);
             },
-            res = &mut server.as_mut().unwrap() => {
+            res = &mut server_handle => {
                 info!("IPC server task finished.");
                 return res.map_err(|e| KodeBridgeError::from(Box::new(e) as Box<dyn std::error::Error + Send + Sync>))?;
             }
         }
     }
+
     #[cfg(windows)]
     {
         info!("IPC server started. Waiting for Ctrl+C or Ctrl+Break to shut down...");
@@ -59,7 +60,7 @@ async fn main() -> Result<(), KodeBridgeError> {
                 info!("Received Ctrl+Break. Shutting down IPC server...");
                 return Ok(());
             },
-            res = &mut server.as_mut().unwrap() => {
+            res = &mut server_handle => {
                 info!("IPC server task finished.");
                 return res.map_err(|e| KodeBridgeError::from(Box::new(e) as Box<dyn std::error::Error + Send + Sync>))?;
             }

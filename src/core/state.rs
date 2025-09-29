@@ -1,7 +1,7 @@
 use kode_bridge::IpcHttpServer;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 
 pub(super) struct IpcState {
     pub(super) server: Arc<Mutex<Option<IpcHttpServer>>>,
