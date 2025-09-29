@@ -13,13 +13,13 @@ pub async fn run_ipc_server() -> Result<()> {
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     IpcState::global()
-        .read()
+        .lock()
         .await
         .set_sender(shutdown_tx)
         .await;
 
-    let server_arc = IpcState::global().write().await.get_server();
-    let mut guard = server_arc.write().await;
+    let server_arc = IpcState::global().lock().await.get_server();
+    let mut guard = server_arc.lock().await;
     if let Some(server) = guard.as_mut() {
         tokio::select! {
             res = server.serve() => res,
@@ -33,13 +33,13 @@ pub async fn run_ipc_server() -> Result<()> {
 }
 
 pub async fn stop_ipc_server() -> Result<()> {
-    if let Some(sender) = IpcState::global().read().await.take_sender().await {
+    if let Some(sender) = IpcState::global().lock().await.take_sender().await {
         let _ = sender.send(());
     }
 
     {
-        let server_arc = IpcState::global().read().await.get_server();
-        let mut guard = server_arc.write().await;
+        let server_arc = IpcState::global().lock().await.get_server();
+        let mut guard = server_arc.lock().await;
         if let Some(server) = guard.as_mut() {
             server.shutdown();
         }
@@ -50,7 +50,7 @@ pub async fn stop_ipc_server() -> Result<()> {
     {
         // On Windows, give some time for the named pipe to close properly
         #[cfg(target_arch = "x86")]
-        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         #[cfg(not(target_arch = "x86"))]
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -105,7 +105,7 @@ async fn init_ipc_state() -> Result<()> {
     let server = create_ipc_server()?;
     let router = create_ipc_router()?;
     let server = server.router(router);
-    IpcState::global().read().await.set_server(server).await;
+    IpcState::global().lock().await.set_server(server).await;
     Ok(())
 }
 
