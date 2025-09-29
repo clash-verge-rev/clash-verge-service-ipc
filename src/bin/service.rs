@@ -1,4 +1,4 @@
-use clash_verge_service_ipc::run_ipc_server;
+use clash_verge_service_ipc::{run_ipc_server, stop_ipc_server};
 use kode_bridge::KodeBridgeError;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -32,13 +32,16 @@ async fn main() -> Result<(), KodeBridgeError> {
         tokio::select! {
             _ = sigint.recv() => {
                 info!("Received SIGINT (Ctrl+C / Command+C). Shutting down IPC server...");
+                let _ = stop_ipc_server().await;
                 std::process::exit(0);
             },
             _ = sigterm.recv() => {
                 info!("Received SIGTERM. Shutting down IPC server...");
+                let _ = stop_ipc_server().await;
                 std::process::exit(0);
             },
             res = &mut server_handle => {
+                let _ = stop_ipc_server().await;
                 info!("IPC server task finished.");
                 return res.map_err(|e| KodeBridgeError::from(Box::new(e) as Box<dyn std::error::Error + Send + Sync>))?;
             }
@@ -54,14 +57,17 @@ async fn main() -> Result<(), KodeBridgeError> {
         tokio::select! {
             _ = ctrl_c.recv() => {
                 info!("Received Ctrl+C. Shutting down IPC server...");
+                let _ = stop_ipc_server().await;
                 return Ok(());
             },
             _ = ctrl_break.recv() => {
                 info!("Received Ctrl+Break. Shutting down IPC server...");
+                let _ = stop_ipc_server().await;
                 return Ok(());
             },
             res = &mut server_handle => {
                 info!("IPC server task finished.");
+                let _ = stop_ipc_server().await;
                 return res.map_err(|e| KodeBridgeError::from(Box::new(e) as Box<dyn std::error::Error + Send + Sync>))?;
             }
         }

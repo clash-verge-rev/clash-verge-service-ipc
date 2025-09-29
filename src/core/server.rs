@@ -44,6 +44,8 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
 }
 
 pub async fn stop_ipc_server() -> Result<()> {
+    CORE_MANAGER.lock().await.stop_core().await.ok();
+    
     if let Some(sender) = IpcState::global().lock().await.take_sender().await {
         let _ = sender.send(());
     }
