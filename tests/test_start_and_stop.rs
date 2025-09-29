@@ -33,9 +33,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn test_start_and_stop_ipc_server() {
+    async fn start_and_stop_ipc_server_helper() {
         let _ = stop_ipc_server().await;
 
         let server_handle = tokio::spawn(async {
@@ -66,44 +64,17 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_start_and_stop_ipc_server() {
+        start_and_stop_ipc_server_helper().await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_start_and_stop_ipc_server_multiple_times() {
         let _ = stop_ipc_server().await;
 
-        for i in 0..50 {
-            // Start the server
-            let server_handle = tokio::spawn({
-                async move {
-                    assert!(
-                        run_ipc_server().await.is_ok(),
-                        "Iteration {}: Starting IPC server should return Ok",
-                        i
-                    );
-                }
-            });
-
-            // Connect to the server
-            let client = connect_ipc().await;
-            assert!(
-                client.is_ok(),
-                "Iteration {}: Should be able to connect to IPC server after starting",
-                i
-            );
-
-            // Stop the server
-            assert!(
-                stop_ipc_server().await.is_ok(),
-                "Iteration {}: Stopping IPC server after starting should return Ok",
-                i
-            );
-
-            let _ = server_handle.await;
-
-            // Ensure server is stopped
-            assert!(
-                connect_ipc().await.is_err(),
-                "Iteration {}: Should not be able to connect after stopping IPC server",
-                i
-            );
+        for _ in 0..50 {
+            start_and_stop_ipc_server_helper().await;
         }
     }
 }

@@ -50,7 +50,7 @@ pub async fn stop_ipc_server() -> Result<()> {
     {
         // On Windows, give some time for the named pipe to close properly
         #[cfg(target_arch = "x86")]
-        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
         #[cfg(not(target_arch = "x86"))]
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
