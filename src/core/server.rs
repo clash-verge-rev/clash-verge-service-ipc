@@ -1,6 +1,6 @@
 use super::state::IpcState;
 use crate::core::manager::CORE_MANAGER;
-use crate::{IpcCommand, StartClash};
+use crate::{IpcCommand, StartClash, VERSION};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
 use tokio::sync::oneshot;
@@ -118,8 +118,13 @@ fn create_ipc_router() -> Result<Router> {
             Ok(HttpResponse::builder().text("Tunglies!").build())
         })
         .get(IpcCommand::GetVersion.as_ref(), |_| async move {
+            let json_value = serde_json::json!({
+                "code": 0,
+                "version": VERSION
+            });
             Ok(HttpResponse::builder()
-                .text(env!("CARGO_PKG_VERSION"))
+                .status(StatusCode::OK)
+                .json(&json_value)?
                 .build())
         })
         .post(IpcCommand::StartClash.as_ref(), |payload| async move {

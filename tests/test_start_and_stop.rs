@@ -72,7 +72,6 @@ mod tests {
         for i in 0..50 {
             // Start the server
             let server_handle = tokio::spawn({
-                let i = i;
                 async move {
                     assert!(
                         run_ipc_server().await.is_ok(),

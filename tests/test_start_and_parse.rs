@@ -2,8 +2,9 @@
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use clash_verge_service_ipc::{IPC_PATH, IpcCommand, run_ipc_server, stop_ipc_server};
+    use clash_verge_service_ipc::{run_ipc_server, stop_ipc_server, IpcCommand, IPC_PATH, VERSION};
     use kode_bridge::IpcHttpClient;
+    use serde_json::Value;
     use serial_test::serial;
     use tracing::debug;
 
@@ -39,10 +40,15 @@ mod tests {
             "Should receive a response from GetVersion command"
         );
 
-        let version_value: String = version.unwrap().body().expect("Should parse GetVersion response");
+        let version_value: Value = version.unwrap().json().expect("Should parse GetVersion response");
         assert!(
-            !version_value.is_empty(),
-            "Version value should not be empty"
+            !version_value.is_null(),
+            "Version value should not be null"
+        );
+
+        assert!(
+            version_value["version"] == VERSION,
+            "Version value should be a string"
         );
 
         assert!(

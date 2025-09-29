@@ -8,6 +8,9 @@ pub use core::{CoreConfig, IpcCommand, StartClash, WriterConfig};
 #[cfg(feature = "standalone")]
 pub use core::{run_ipc_server, stop_ipc_server};
 
+#[cfg(feature = "client")]
+pub use client::connect;
+
 #[cfg(unix)]
 pub static IPC_PATH: &str = "/tmp/verge/clash-verge-service.sock";
 #[cfg(windows)]
