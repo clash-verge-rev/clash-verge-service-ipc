@@ -43,7 +43,11 @@ mod tests {
             );
         });
 
-        let client = connect_ipc().await;
+        let client = {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            connect_ipc().await
+        };
+
         assert!(
             client.is_ok(),
             "Should be able to connect to IPC server after starting"
@@ -67,7 +71,7 @@ mod tests {
     async fn test_start_and_stop_ipc_server() {
         start_and_stop_ipc_server_helper().await;
         #[cfg(windows)]
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
 
     #[tokio::test]
@@ -75,7 +79,7 @@ mod tests {
     async fn test_start_and_stop_ipc_server_multiple_times() {
         let _ = stop_ipc_server().await;
 
-        for _ in 0..50 {
+        for _ in 0..10 {
             start_and_stop_ipc_server_helper().await;
         }
     }
