@@ -3,6 +3,8 @@ name: Clippy
 on:
   workflow_dispatch:
   push:
+    branches-ignore:
+      - 'v*.*.*'
     branches: [main, master]
   pull_request:
     branches: [main, master]
