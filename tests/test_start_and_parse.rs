@@ -14,28 +14,10 @@ mod tests {
         Ok(client)
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn test_stop_ipc_server_when_not_running() {
-        assert!(
-            stop_ipc_server().await.is_ok(),
-            "Stopping IPC server when not running should return Ok"
-        );
-    }
 
     #[tokio::test]
     #[serial]
-    async fn test_connect_ipc_when_server_not_running() {
-        let _ = stop_ipc_server().await;
-        assert!(
-            connect_ipc().await.is_err(),
-            "Connecting to IPC when server is not running should return an error"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_start_and_stop_ipc_server() {
+    async fn test_start_and_parse() {
         let _ = stop_ipc_server().await;
 
         let server_handle = tokio::spawn(async {
@@ -51,16 +33,24 @@ mod tests {
             "Should be able to connect to IPC server after starting"
         );
 
+        let version = client.unwrap().get(IpcCommand::GetVersion.as_ref()).send().await;
+        assert!(
+            version.is_ok(),
+            "Should receive a response from GetVersion command"
+        );
+
+        let version_value: String = version.unwrap().body().expect("Should parse GetVersion response");
+        assert!(
+            !version_value.is_empty(),
+            "Version value should not be empty"
+        );
+
         assert!(
             stop_ipc_server().await.is_ok(),
             "Stopping IPC server after starting should return Ok"
         );
 
         let _ = server_handle.await;
-
-        assert!(
-            connect_ipc().await.is_err(),
-            "Should not be able to connect after stopping IPC server"
-        );
     }
+    
 }

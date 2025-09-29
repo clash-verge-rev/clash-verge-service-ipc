@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "clash_verge_service_ipc"
-version = "2.0.3"
+version = "2.0.4"
 dependencies = [
  "anyhow",
  "clash_verge_logger",
@@ -395,9 +395,9 @@ dependencies = [
 
 [[package]]
 name = "kode-bridge"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "368479099245d8ecd5b74e6b2b6279a69b38556a442aefbbaadd3ecf8246ffc3"
+checksum = "67c4181e05ac1ea913ce85f348ea8cd81e553f8d4305397ae731726ae78d02ea"
 dependencies = [
  "bytes",
  "futures",

@@ -1,5 +1,8 @@
 mod core;
 
+#[cfg(feature = "client")]
+mod client;
+
 pub use core::{CoreConfig, IpcCommand, StartClash, WriterConfig};
 
 #[cfg(feature = "standalone")]
