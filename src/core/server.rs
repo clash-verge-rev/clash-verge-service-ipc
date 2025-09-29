@@ -49,7 +49,7 @@ pub async fn stop_ipc_server() -> Result<()> {
     #[cfg(windows)]
     {
         // On Windows, give some time for the named pipe to close properly
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
     cleanup_ipc_path()?;
     Ok(())
