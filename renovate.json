@@ -2,15 +2,18 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
-  ]
-  ,
+  ],
   "packageRules": [
     {
-      "managers": ["cargo"],
+      "matchManagers": [
+        "cargo"
+      ],
       "enabled": true
     },
     {
-      "managers": ["github-actions"],
+      "matchManagers": [
+        "github-actions"
+      ],
       "enabled": true
     }
   ],
