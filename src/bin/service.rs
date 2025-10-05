@@ -70,8 +70,7 @@ mod windows {
     /// Parse command line arguments
     fn parse_args() -> bool {
         let args: Vec<String> = std::env::args().collect();
-        let run_as_service = args.iter().any(|arg| arg == "--service" || arg == "-s");
-        run_as_service
+        args.iter().any(|arg| arg == "--service" || arg == "-s")
     }
 
     /// Check if we have a console attached (running in terminal)
