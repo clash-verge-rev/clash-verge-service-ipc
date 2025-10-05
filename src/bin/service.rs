@@ -3,8 +3,10 @@
 //! This service can run in two modes:
 //! - As a system service (Windows Service / systemd / launchd)
 //! - As a standalone process (for testing/debugging)
-
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+//!
+//! Note: We do NOT use #![windows_subsystem = "windows"] to allow console output
+//! in standalone mode. When running as a service, SCM will manage the process
+//! without a visible console window.
 
 use clash_verge_service_ipc::{run_ipc_server, stop_ipc_server};
 use kode_bridge::KodeBridgeError;
@@ -65,28 +67,57 @@ mod windows {
 
     define_windows_service!(ffi_service_main, service_main);
 
+    /// Parse command line arguments
+    fn parse_args() -> bool {
+        let args: Vec<String> = std::env::args().collect();
+        let run_as_service = args.iter().any(|arg| arg == "--service" || arg == "-s");
+        run_as_service
+    }
+
+    /// Check if we have a console attached (running in terminal)
+    fn has_console() -> bool {
+        use std::io::IsTerminal;
+        std::io::stdout().is_terminal()
+    }
+
     /// Main entry point for Windows
     pub fn main_entry() -> Result<(), Box<dyn std::error::Error>> {
-        // Try to start as a Windows service
-        match service_dispatcher::start("clash_verge_service", ffi_service_main) {
-            Ok(_) => {
-                // Successfully running as a service
-                Ok(())
-            }
-            Err(_e) => {
-                // Not running as a service, run in standalone mode
-                eprintln!("Running in standalone mode (not as a Windows service)");
-                eprintln!("To install as a service: clash-verge-service-install.exe");
-                eprintln!();
+        let run_as_service = parse_args();
 
-                let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(async {
-                    match run_standalone().await {
-                        Ok(_) => Ok(()),
-                        Err(e) => Err(Box::new(e) as Box<dyn std::error::Error>),
-                    }
-                })
+        if run_as_service {
+            // Explicitly requested to run as service
+            // This is called by SCM with --service flag
+            service_dispatcher::start("clash_verge_service", ffi_service_main)?;
+            Ok(())
+        } else {
+            // Run in standalone mode (debugging/testing)
+
+            // Check if we're running in a terminal
+            let in_terminal = has_console();
+
+            eprintln!("╔════════════════════════════════════════════════════════════════╗");
+            eprintln!("║  Clash Verge Service - Standalone Mode                        ║");
+            eprintln!("╚════════════════════════════════════════════════════════════════╝");
+            eprintln!();
+            eprintln!("Running in standalone mode (not as a Windows service)");
+            if in_terminal {
+                eprintln!("Console: Attached (terminal session detected)");
+            } else {
+                eprintln!("Console: Window mode (launched directly)");
             }
+            eprintln!();
+            eprintln!("Commands:");
+            eprintln!("  - Install as service: clash-verge-service-install.exe");
+            eprintln!("  - Run as service:     clash-verge-service.exe --service");
+            eprintln!("  - Force console:      clash-verge-service.exe --console");
+            eprintln!();
+
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                run_standalone()
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+            })
         }
     }
 
@@ -247,26 +278,71 @@ mod windows {
 
     /// Run in standalone mode (not as a service)
     async fn run_standalone() -> Result<(), KodeBridgeError> {
+        use std::io::IsTerminal;
         use tokio::signal::windows;
 
-        // Initialize console logging
-        let subscriber = FmtSubscriber::builder()
-            .with_max_level(Level::INFO)
-            .with_writer(std::io::stdout)
-            .finish();
+        // Determine if we're running in a terminal or not
+        let in_terminal = std::io::stdout().is_terminal();
 
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("Failed to set default subscriber");
+        // Initialize logging with fallback to file if no terminal
+        if in_terminal {
+            // Console logging for terminal mode
+            let subscriber = FmtSubscriber::builder()
+                .with_max_level(Level::INFO)
+                .with_writer(std::io::stdout)
+                .with_ansi(true)
+                .finish();
+
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("Failed to set default subscriber");
+        } else {
+            // File logging for non-terminal mode (e.g., double-clicked from Explorer)
+            let log_file = std::env::temp_dir().join("clash-verge-service-standalone.log");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_file)
+                .expect("Failed to open log file");
+
+            eprintln!("No terminal detected. Logging to: {:?}", log_file);
+            eprintln!("The console window will remain open. Press Ctrl+C to exit.");
+            eprintln!();
+
+            let subscriber = FmtSubscriber::builder()
+                .with_max_level(Level::INFO)
+                .with_writer(Mutex::new(file))
+                .finish();
+
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("Failed to set default subscriber");
+        }
 
         let pid = std::process::id();
         info!("Current process PID: {}", pid);
+        info!("Starting Clash Verge Service IPC server...");
 
         // Start IPC server
-        let mut server_handle = run_ipc_server().await?;
+        let server_handle = run_ipc_server().await?;
 
-        info!("IPC server started. Waiting for Ctrl+C or Ctrl+Break to shut down...");
+        info!("IPC server started successfully!");
+        info!("Press Ctrl+C or Ctrl+Break to shut down...");
 
-        // Wait for shutdown signals
+        // Spawn a task to monitor the server handle (but don't block on it)
+        let monitor_handle = tokio::spawn(async move {
+            match server_handle.await {
+                Ok(Ok(())) => {
+                    error!("IPC server task finished unexpectedly (no error)");
+                }
+                Ok(Err(e)) => {
+                    error!("IPC server task finished with error: {:?}", e);
+                }
+                Err(e) => {
+                    error!("IPC server task panicked: {:?}", e);
+                }
+            }
+        });
+
+        // Wait for shutdown signals only
         let mut ctrl_c = windows::ctrl_c()?;
         let mut ctrl_break = windows::ctrl_break()?;
 
@@ -277,16 +353,16 @@ mod windows {
             _ = ctrl_break.recv() => {
                 info!("Received Ctrl+Break. Shutting down...");
             },
-            res = &mut server_handle => {
-                info!("IPC server task finished.");
-                let _ = stop_ipc_server().await;
-                return res.map_err(|e| {
-                    KodeBridgeError::from(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-                })?;
-            }
         }
 
+        // Graceful shutdown
+        info!("Stopping IPC server...");
         let _ = stop_ipc_server().await;
+
+        // Abort the monitor task since we're shutting down intentionally
+        monitor_handle.abort();
+
+        info!("Service shutdown complete.");
         Ok(())
     }
 }
