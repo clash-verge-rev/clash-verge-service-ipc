@@ -78,7 +78,7 @@ fn main() -> Result<(), Error> {
 
 /// stop and uninstall the service
 #[cfg(windows)]
-fn main() -> windows_service::Result<()> {
+fn main() -> anyhow::Result<()> {
     use std::{thread, time::Duration};
     use windows_service::{
         service::{ServiceAccess, ServiceState},

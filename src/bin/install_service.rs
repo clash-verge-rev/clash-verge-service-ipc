@@ -4,10 +4,10 @@ fn main() {
 }
 
 use anyhow::Error;
-use std::env;
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Error> {
+    use std::env;
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
@@ -111,6 +111,7 @@ fn main() -> Result<(), Error> {
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Error> {
     const SERVICE_NAME: &str = "clash-verge-service";
+    use std::env;
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
@@ -167,7 +168,8 @@ fn main() -> Result<(), Error> {
 
 /// install and start the service
 #[cfg(windows)]
-fn main() -> windows_service::Result<()> {
+fn main() -> anyhow::Result<()> {
+    use std::env;
     use std::ffi::{OsStr, OsString};
     use windows_service::{
         service::{
@@ -213,7 +215,7 @@ fn main() -> windows_service::Result<()> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: service_binary_path,
-        launch_arguments: vec!["--service".into()],
+        launch_arguments: vec![],
         dependencies: vec![],
         account_name: None, // run as System
         account_password: None,

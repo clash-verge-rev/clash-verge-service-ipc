@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "clash_verge_service_ipc"
-version = "2.0.6"
+version = "2.0.7"
 dependencies = [
  "anyhow",
  "clash_verge_logger",
@@ -164,9 +164,9 @@ checksum = "1ced73b1dacfc750a6db6c0a0c3a3853c8b41997e2e2c563dc90804ae6867959"
 
 [[package]]
 name = "flexi_logger"
-version = "0.31.4"
+version = "0.31.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff38b61724dd492b5171d5dbb0921dfc8e859022c5993b22f80f74e9afe6d573"
+checksum = "a2e6950c82d35cd4812bec062a174bb49323aa3796572363effa1e2733737a68"
 dependencies = [
  "chrono",
  "log",
