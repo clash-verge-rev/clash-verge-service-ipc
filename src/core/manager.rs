@@ -1,5 +1,5 @@
 use crate::WriterConfig;
-use crate::core::StartClash;
+use crate::core::ClashConfig;
 use crate::core::logger::{get_writer, set_or_update_writer};
 use anyhow::Result;
 use flexi_logger::writers::LogWriter;
@@ -38,7 +38,7 @@ impl ChildGuard {
 
 pub struct CoreManager {
     running_child: Arc<Mutex<Option<ChildGuard>>>,
-    running_config: Arc<Mutex<Option<StartClash>>>,
+    running_config: Arc<Mutex<Option<ClashConfig>>>,
 }
 
 impl CoreManager {
@@ -49,7 +49,7 @@ impl CoreManager {
         }
     }
 
-    pub async fn start_core(&mut self, config: StartClash) -> Result<()> {
+    pub async fn start_core(&mut self, config: ClashConfig) -> Result<()> {
         if self.running_child.lock().await.is_some() {
             info!("Core is already running");
             let _ = self.stop_core().await;

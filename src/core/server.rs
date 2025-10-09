@@ -1,6 +1,7 @@
 use super::state::IpcState;
 use crate::core::manager::CORE_MANAGER;
-use crate::{IpcCommand, StartClash, VERSION};
+use crate::core::structure::Response;
+use crate::{ClashConfig, IpcCommand, VERSION};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
 use tokio::sync::oneshot;
@@ -139,36 +140,38 @@ fn create_ipc_router() -> Result<Router> {
             Ok(HttpResponse::builder().text("Tunglies!").build())
         })
         .get(IpcCommand::GetVersion.as_ref(), |_| async move {
-            let json_value = serde_json::json!({
-                "code": 0,
-                "version": VERSION
-            });
+            let json_value = Response {
+                code: 0,
+                message: "Success".to_string(),
+                data: Some(VERSION.to_string()),
+            };
             Ok(HttpResponse::builder()
                 .status(StatusCode::OK)
                 .json(&json_value)?
                 .build())
         })
         .post(IpcCommand::StartClash.as_ref(), |payload| async move {
-            match payload.json::<StartClash>() {
+            match payload.json::<ClashConfig>() {
                 Ok(start_clash) => {
                     match CORE_MANAGER.lock().await.start_core(start_clash).await {
                         Ok(_) => info!("Core started successfully"),
                         Err(e) => {
-                            let json_value = serde_json::json!({
-                                "code": 1,
-                                "msg": format!("Failed to start core: {}", e)
-                            });
+                            let json_value: Response<()> = Response {
+                                code: 1,
+                                message: format!("Failed to start core: {}", e),
+                                data: None,
+                            };
                             return Ok(HttpResponse::builder()
                                 .status(StatusCode::SERVICE_UNAVAILABLE)
                                 .json(&json_value)?
                                 .build());
                         }
                     }
-
-                    let json_value = serde_json::json!({
-                        "code": 0,
-                        "msg": "Core started successfully"
-                    });
+                    let json_value: Response<()> = Response {
+                        code: 0,
+                        message: "Core started successfully".to_string(),
+                        data: None,
+                    };
                     Ok(HttpResponse::builder()
                         .status(StatusCode::OK)
                         .json(&json_value)?
@@ -184,22 +187,22 @@ fn create_ipc_router() -> Result<Router> {
             match CORE_MANAGER.lock().await.stop_core().await {
                 Ok(_) => info!("Core stopped successfully"),
                 Err(e) => {
-                    let json_value = serde_json::json!({
-                        "code": 1,
-                        "msg": format!("Failed to stop core: {}", e)
-                    });
+                    let json_value: Response<()> = Response {
+                        code: 1,
+                        message: format!("Failed to stop core: {}", e),
+                        data: None,
+                    };
                     return Ok(HttpResponse::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
                         .json(&json_value)?
                         .build());
                 }
             }
-
-            let json_value = serde_json::json!({
-                "code": 0,
-                "msg": "Core stopped successfully"
-            });
-
+            let json_value: Response<()> = Response {
+                code: 0,
+                message: "Core stopped successfully".to_string(),
+                data: None,
+            };
             Ok(HttpResponse::builder()
                 .status(StatusCode::OK)
                 .json(&json_value)?
