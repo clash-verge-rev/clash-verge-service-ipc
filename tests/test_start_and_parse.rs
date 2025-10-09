@@ -50,7 +50,7 @@ mod tests {
         assert!(!version_value.is_null(), "Version value should not be null");
 
         assert!(
-            version_value["version"] == VERSION,
+            version_value["data"] == VERSION,
             "Version value should be a string"
         );
 
