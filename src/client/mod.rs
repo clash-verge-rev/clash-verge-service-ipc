@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use kode_bridge::{ClientConfig, IpcHttpClient};
@@ -13,9 +13,36 @@ use crate::{
 
 static CLIENT: Lazy<Arc<Mutex<Option<IpcHttpClient>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 
-pub async fn connect(config: Option<ClientConfig>) -> Result<()> {
+pub struct IpcConfig {
+    pub default_timeout: Duration,
+    pub max_retries: usize,
+    pub retry_delay: Duration,
+}
+
+impl Default for IpcConfig {
+    fn default() -> Self {
+        Self {
+            default_timeout: Duration::from_millis(100),
+            max_retries: 3,
+            retry_delay: Duration::from_millis(50),
+        }
+    }
+}
+
+pub async fn connect(config: Option<IpcConfig>) -> Result<()> {
     debug!("Connecting to IPC at {}", IPC_PATH);
-    let client = kode_bridge::IpcHttpClient::with_config(IPC_PATH, config.unwrap_or_default())?;
+    let c = config.unwrap_or_default();
+
+    let client = kode_bridge::IpcHttpClient::with_config(
+        IPC_PATH,
+        ClientConfig {
+            default_timeout: c.default_timeout,
+            max_retries: c.max_retries,
+            retry_delay: c.retry_delay,
+            ..Default::default()
+        },
+    )?;
+
     client.get(IpcCommand::Magic.as_ref()).send().await?;
     CLIENT.lock().await.replace(client);
     Ok(())
@@ -38,7 +65,8 @@ pub async fn get_version() -> Result<Response<String>> {
         .unwrap()
         .get(IpcCommand::GetVersion.as_ref())
         .send()
-        .await?.json::<Response<String>>()?;
+        .await?
+        .json::<Response<String>>()?;
     Ok(response)
 }
 
