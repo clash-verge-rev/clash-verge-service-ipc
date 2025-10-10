@@ -26,10 +26,8 @@ pub async fn get_client() -> Result<MutexGuard<'static, Option<IpcHttpClient>>> 
     if guard.is_some() {
         Ok(guard)
     } else {
-        // drop(guard);
-        // Err(anyhow::anyhow!("IPC client not connected"))
-        connect(None).await?;
-        Ok(guard)
+        drop(guard);
+        Err(anyhow::anyhow!("IPC client not connected"))
     }
 }
 
