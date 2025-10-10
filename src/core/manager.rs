@@ -74,6 +74,8 @@ impl CoreManager {
             *child_lock = Some(child_guard);
         }
 
+        self.after_start().await;
+
         Ok(())
     }
 
@@ -90,7 +92,55 @@ impl CoreManager {
             info!("No running config to clear");
         }
 
+        self.after_stop().await;
+
         Ok(())
+    }
+
+    pub async fn after_start(&self) {
+        #[cfg(unix)]
+        {
+            use std::fs::Permissions;
+            use std::os::unix::fs::PermissionsExt;
+            use std::path::Path;
+            use tokio::fs;
+
+            let target = Path::new("/tmp/verge/verge-mihomo.sock");
+            if target.exists() {
+                info!("Setting permissions for {:?}", target);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    match fs::set_permissions(target, Permissions::from_mode(0o777)).await {
+                        Ok(_) => info!("Permissions set to 777 for {:?}", target),
+                        Err(e) => warn!("Failed to set permissions for {:?}: {}", target, e),
+                    }
+                });
+            } else {
+                warn!("{:?} does not exist, skipping permission setting", target);
+            }
+        }
+    }
+
+    pub async fn after_stop(&self) {
+        #[cfg(unix)]
+        {
+            use std::path::Path;
+            use tokio::fs;
+
+            let target = Path::new("/tmp/verge/verge-mihomo.sock");
+            if target.exists() {
+                info!("Removing socket file {:?}", target);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    match fs::remove_file(target).await {
+                        Ok(_) => info!("Successfully removed {:?}", target),
+                        Err(e) => warn!("Failed to remove {:?}: {}", target, e),
+                    }
+                });
+            } else {
+                info!("{:?} does not exist, no need to remove", target);
+            }
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use kode_bridge::{ClientConfig, IpcHttpClient};
@@ -13,6 +13,7 @@ use crate::{
 
 static CLIENT: Lazy<Arc<Mutex<Option<IpcHttpClient>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 
+#[derive(Debug, Clone)]
 pub struct IpcConfig {
     pub default_timeout: Duration,
     pub max_retries: usize,
@@ -31,6 +32,12 @@ impl Default for IpcConfig {
 
 pub async fn connect(config: Option<IpcConfig>) -> Result<()> {
     debug!("Connecting to IPC at {}", IPC_PATH);
+
+    if !Path::new(IPC_PATH).exists() {
+        return Err(anyhow::anyhow!("IPC path does not exist: {}", IPC_PATH));
+    }
+
+    debug!("Using config: {:?}", config);
     let c = config.unwrap_or_default();
 
     let client = kode_bridge::IpcHttpClient::with_config(

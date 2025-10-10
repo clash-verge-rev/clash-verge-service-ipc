@@ -9,8 +9,8 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
-    make_ipc_dir()?;
-    cleanup_ipc_path()?;
+    make_ipc_dir().await?;
+    cleanup_ipc_path().await?;
     init_ipc_state().await?;
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
@@ -64,7 +64,7 @@ pub async fn stop_ipc_server() -> Result<()> {
         *guard = None;
     }
 
-    cleanup_ipc_path()?;
+    cleanup_ipc_path().await?;
 
     #[cfg(windows)]
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -72,22 +72,20 @@ pub async fn stop_ipc_server() -> Result<()> {
     Ok(())
 }
 
-fn make_ipc_dir() -> Result<()> {
+async fn make_ipc_dir() -> Result<()> {
     #[cfg(unix)]
     {
         use crate::IPC_PATH;
-        use std::fs;
-        #[cfg(unix)]
-        use std::fs::set_permissions;
-        #[cfg(unix)]
+        use std::fs::Permissions;
         use std::os::unix::fs::PermissionsExt;
         use std::path::Path;
+        use tokio::fs;
 
         if let Some(dir_path) = Path::new(IPC_PATH).parent() {
             if !dir_path.exists() {
-                fs::create_dir_all(dir_path)?;
+                fs::create_dir_all(dir_path).await?;
             }
-            set_permissions(dir_path, fs::Permissions::from_mode(0o777))?;
+            fs::set_permissions(dir_path, Permissions::from_mode(0o777)).await?;
         }
     }
     #[cfg(windows)]
@@ -97,14 +95,15 @@ fn make_ipc_dir() -> Result<()> {
     Ok(())
 }
 
-fn cleanup_ipc_path() -> Result<()> {
+async fn cleanup_ipc_path() -> Result<()> {
     #[cfg(unix)]
     {
         use crate::IPC_PATH;
-        use std::{fs, path::Path};
+        use std::path::Path;
+        use tokio::fs;
 
         if Path::new(IPC_PATH).exists() {
-            fs::remove_file(IPC_PATH)?;
+            fs::remove_file(IPC_PATH).await?;
         }
     }
     #[cfg(windows)]
