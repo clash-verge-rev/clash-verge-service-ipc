@@ -1,7 +1,7 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
-use kode_bridge::{ClientConfig, IpcHttpClient};
+use kode_bridge::{ClientConfig, IpcHttpClient, pool::PoolConfig};
 use log::debug;
 use once_cell::sync::Lazy;
 use tokio::sync::{Mutex, MutexGuard};
@@ -23,20 +23,15 @@ pub struct IpcConfig {
 impl Default for IpcConfig {
     fn default() -> Self {
         Self {
-            default_timeout: Duration::from_millis(100),
-            max_retries: 3,
-            retry_delay: Duration::from_millis(50),
+            default_timeout: Duration::from_millis(50),
+            max_retries: 6,
+            retry_delay: Duration::from_millis(125),
         }
     }
 }
 
 pub async fn connect(config: Option<IpcConfig>) -> Result<()> {
     debug!("Connecting to IPC at {}", IPC_PATH);
-
-    if !Path::new(IPC_PATH).exists() {
-        return Err(anyhow::anyhow!("IPC path does not exist: {}", IPC_PATH));
-    }
-
     debug!("Using config: {:?}", config);
     let c = config.unwrap_or_default();
 
@@ -46,6 +41,10 @@ pub async fn connect(config: Option<IpcConfig>) -> Result<()> {
             default_timeout: c.default_timeout,
             max_retries: c.max_retries,
             retry_delay: c.retry_delay,
+            pool_config: PoolConfig {
+                max_retries: 1,
+                ..Default::default()
+            },
             ..Default::default()
         },
     )?;
