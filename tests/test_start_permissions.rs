@@ -40,7 +40,7 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(permissions.mode() & 0o777, 0o777, "IPC file permissions should be 777");
         #[cfg(windows)]
-        assert!(permissions.readonly() == false, "IPC file should not be readonly");
+        assert!(!permissions.readonly(), "IPC file should not be readonly");
 
         assert!(
             stop_ipc_server().await.is_ok(),
