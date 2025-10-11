@@ -17,7 +17,7 @@ mod tests {
     }
     #[tokio::test]
     #[serial]
-    async fn start_and_stop_ipc_server_helper() {
+    async fn start_and_check_permissions() {
         let server_handle = tokio::spawn(async {
             assert!(
                 run_ipc_server().await.is_ok(),
@@ -38,11 +38,15 @@ mod tests {
         let permision = std::fs::metadata(IPC_PATH).expect("Failed to get metadata");
         let permissions = permision.permissions();
         #[cfg(unix)]
-        assert_eq!(
-            permissions.mode() & 0o777,
-            0o777,
-            "IPC file permissions should be 777"
-        );
+        {
+            use libc::{S_IRWXU, S_IRWXG, S_IRWXO};
+            let mask = (S_IRWXU | S_IRWXG | S_IRWXO) as u32;
+            assert_eq!(
+                permissions.mode() & mask,
+                mask,
+                "IPC file permissions should be 777"
+            );
+        }
         #[cfg(windows)]
         assert!(!permissions.readonly(), "IPC file should not be readonly");
 
