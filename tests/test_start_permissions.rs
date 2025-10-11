@@ -40,11 +40,20 @@ mod tests {
         #[cfg(unix)]
         {
             use platform_lib::{S_IRWXU, S_IRWXG, S_IRWXO};
-            let mask = (S_IRWXU | S_IRWXG | S_IRWXO) as u32;
+            
+            let owner_perm = u32::from(S_IRWXU); // 用户权限 (rwx------ = 700)
+            let group_perm = u32::from(S_IRWXG); // 组权限   (---rwx--- = 070)
+            let other_perm = u32::from(S_IRWXO); // 其他权限 (------rwx = 007)
+            let full_mask = owner_perm | group_perm | other_perm; // 完整权限掩码 (rwxrwxrwx = 777)
+            
+            let actual_perms = permissions.mode() & full_mask;
+            
+            debug!("IPC file permissions: {:o}", permissions.mode());
             assert_eq!(
-                permissions.mode() & mask,
-                mask,
-                "IPC file permissions should be 777"
+                actual_perms,
+                full_mask,
+                "IPC file permissions should be 777 (actual: {:o})",
+                actual_perms
             );
         }
         #[cfg(windows)]
