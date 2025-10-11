@@ -39,19 +39,18 @@ mod tests {
         let permissions = permision.permissions();
         #[cfg(all(unix, target_os = "macos"))]
         {
-            use platform_lib::{S_IRWXU, S_IRWXG, S_IRWXO};
-            
+            use platform_lib::{S_IRWXG, S_IRWXO, S_IRWXU};
+
             let owner_perm = u32::from(S_IRWXU); // 用户权限 (rwx------ = 700)
             let group_perm = u32::from(S_IRWXG); // 组权限   (---rwx--- = 070)
             let other_perm = u32::from(S_IRWXO); // 其他权限 (------rwx = 007)
             let full_mask = owner_perm | group_perm | other_perm; // 完整权限掩码 (rwxrwxrwx = 777)
-            
+
             let actual_perms = permissions.mode() & full_mask;
-            
+
             debug!("macOS IPC file permissions: {:o}", permissions.mode());
             assert_eq!(
-                actual_perms,
-                full_mask,
+                actual_perms, full_mask,
                 "IPC file permissions should be 777 (actual: {:o})",
                 actual_perms
             );
@@ -59,25 +58,39 @@ mod tests {
 
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            use platform_lib::{S_IRWXU, S_IRWXG, S_IRWXO};
-            
+            use platform_lib::{S_IRWXG, S_IRWXO, S_IRWXU};
+
             let owner_perm = S_IRWXU; // 用户权限 (rwx------ = 700)
             let group_perm = S_IRWXG; // 组权限   (---rwx--- = 070)
             let other_perm = S_IRWXO; // 其他权限 (------rwx = 007)
             let full_mask = owner_perm | group_perm | other_perm; // 完整权限掩码 (rwxrwxrwx = 777)
-            
+
             let actual_perms = permissions.mode() & full_mask;
-            
+
             debug!("Linux IPC file permissions: {:o}", permissions.mode());
             assert_eq!(
-                actual_perms,
-                full_mask,
+                actual_perms, full_mask,
                 "IPC file permissions should be 777 (actual: {:o})",
                 actual_perms
             );
         }
         #[cfg(windows)]
         assert!(!permissions.readonly(), "IPC file should not be readonly");
+
+        let client = connect_ipc().await;
+        assert!(
+            client.is_ok(),
+            "Should be able to connect to IPC server after starting"
+        );
+        let version = client
+            .unwrap()
+            .get(IpcCommand::GetVersion.as_ref())
+            .send()
+            .await;
+        assert!(
+            version.is_ok(),
+            "Should receive a response from GetVersion command"
+        );
 
         assert!(
             stop_ipc_server().await.is_ok(),
