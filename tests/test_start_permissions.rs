@@ -39,7 +39,7 @@ mod tests {
         let permissions = permision.permissions();
         #[cfg(unix)]
         {
-            use libc::{S_IRWXU, S_IRWXG, S_IRWXO};
+            use platform_lib::{S_IRWXU, S_IRWXG, S_IRWXO};
             let mask = (S_IRWXU | S_IRWXG | S_IRWXO) as u32;
             assert_eq!(
                 permissions.mode() & mask,

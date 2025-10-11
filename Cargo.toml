@@ -89,9 +89,6 @@ kode-bridge = { version = "0.3.4", default-features = false, features = [
 ] }
 serial_test = "3.2.0"
 
-[target.'cfg(unix)'.dev-dependencies]
-libc = "0.2.177"
-
 [profile.release]
 panic = "abort"
 lto = "thin"
