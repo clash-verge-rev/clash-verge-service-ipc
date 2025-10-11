@@ -128,7 +128,7 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
     use platform_lib::{S_IRWXG, S_IRWXO, S_IRWXU, mode_t};
     let server = IpcHttpServer::new(IPC_PATH)?;
     #[cfg(unix)]
-    let mode = platform_lib::mode_t::from((S_IRWXU | S_IRWXG | S_IRWXO) as mode_t);
+    let mode: mode_t = platform_lib::mode_t::from(S_IRWXU | S_IRWXG | S_IRWXO);
     #[cfg(unix)]
     let server = server.with_listener_mode(mode);
     #[cfg(windows)]
