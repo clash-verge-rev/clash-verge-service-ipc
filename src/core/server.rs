@@ -35,7 +35,17 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
             let _ = done_tx.send(());
             res
         });
+        #[cfg(unix)]
+        {
+            use crate::IPC_PATH;
+            use std::fs::Permissions;
+            use std::os::unix::fs::PermissionsExt;
+            use std::time::Duration;
+            use tokio::fs;
 
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            fs::set_permissions(IPC_PATH, Permissions::from_mode(0o777)).await?;
+        }
         Ok(handle)
     } else {
         Err(kode_bridge::KodeBridgeError::configuration(
@@ -124,22 +134,14 @@ async fn init_ipc_state() -> Result<()> {
 
 fn create_ipc_server() -> Result<IpcHttpServer> {
     use crate::IPC_PATH;
-    
+
     let server = IpcHttpServer::new(IPC_PATH)?;
 
     #[cfg(unix)]
     {
-        use platform_lib::{S_IRWXG, S_IRWXO, S_IRWXU, mode_t, umask};
-
-        let old_mask: mode_t;
-        unsafe {
-            old_mask = umask(0);
-        }
+        use platform_lib::{S_IRWXG, S_IRWXO, S_IRWXU, mode_t};
         let mode: mode_t = platform_lib::mode_t::from(S_IRWXU | S_IRWXG | S_IRWXO);
         let server = server.with_listener_mode(mode);
-        unsafe {
-            umask(old_mask);
-        }
         Ok(server)
     }
 
