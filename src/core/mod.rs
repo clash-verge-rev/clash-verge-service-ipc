@@ -2,7 +2,7 @@ pub mod command;
 pub use command::IpcCommand;
 
 pub mod structure;
-pub use structure::{CoreConfig, ClashConfig, WriterConfig};
+pub use structure::{ClashConfig, CoreConfig, WriterConfig};
 
 #[cfg(feature = "standalone")]
 mod logger;

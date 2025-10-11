@@ -3,7 +3,7 @@ mod core;
 #[cfg(feature = "client")]
 mod client;
 
-pub use core::{CoreConfig, IpcCommand, ClashConfig, WriterConfig};
+pub use core::{ClashConfig, CoreConfig, IpcCommand, WriterConfig};
 
 #[cfg(feature = "standalone")]
 pub use core::{run_ipc_server, stop_ipc_server};

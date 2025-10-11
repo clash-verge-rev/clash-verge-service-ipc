@@ -4,14 +4,15 @@ use anyhow::Result;
 use kode_bridge::{ClientConfig, IpcHttpClient, pool::PoolConfig};
 use log::debug;
 use once_cell::sync::Lazy;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::RwLock;
 
 use crate::{
     ClashConfig, IPC_PATH, IpcCommand,
     core::structure::{JsonConvert, Response},
 };
 
-static CLIENT: Lazy<Arc<Mutex<Option<IpcHttpClient>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
+static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(None)));
 
 #[derive(Debug, Clone)]
 pub struct IpcConfig {
@@ -30,11 +31,15 @@ impl Default for IpcConfig {
     }
 }
 
-pub async fn connect(config: Option<IpcConfig>) -> Result<()> {
-    debug!("Connecting to IPC at {}", IPC_PATH);
-    debug!("Using config: {:?}", config);
-    let c = config.unwrap_or_default();
+pub async fn set_config(config: Option<IpcConfig>) {
+    let mut guard = CLIENT_CONFIG.write().await;
+    *guard = config;
+}
 
+async fn try_connect() -> Result<IpcHttpClient> {
+    debug!("Connecting to IPC at {}", IPC_PATH);
+    let c = { CLIENT_CONFIG.read().await.clone() }.unwrap_or_default();
+    debug!("Using config: {:?}", c);
     let client = kode_bridge::IpcHttpClient::with_config(
         IPC_PATH,
         ClientConfig {
@@ -48,27 +53,17 @@ pub async fn connect(config: Option<IpcConfig>) -> Result<()> {
             ..Default::default()
         },
     )?;
-
     client.get(IpcCommand::Magic.as_ref()).send().await?;
-    CLIENT.lock().await.replace(client);
-    Ok(())
+    Ok(client)
 }
 
-pub async fn get_client() -> Result<MutexGuard<'static, Option<IpcHttpClient>>> {
-    let guard = CLIENT.lock().await;
-    if guard.is_some() {
-        Ok(guard)
-    } else {
-        drop(guard);
-        Err(anyhow::anyhow!("IPC client not connected"))
-    }
+pub async fn connect() -> Result<IpcHttpClient> {
+    try_connect().await
 }
 
 pub async fn get_version() -> Result<Response<String>> {
-    let client = get_client().await?;
+    let client = connect().await?;
     let response = client
-        .as_ref()
-        .unwrap()
         .get(IpcCommand::GetVersion.as_ref())
         .send()
         .await?
@@ -77,10 +72,8 @@ pub async fn get_version() -> Result<Response<String>> {
 }
 
 pub async fn start_clash(body: &ClashConfig) -> Result<Response<()>> {
-    let client = get_client().await?;
+    let client = connect().await?;
     let response = client
-        .as_ref()
-        .unwrap()
         .post(IpcCommand::StartClash.as_ref())
         .json_body(&body.to_json_value()?)
         .send()
@@ -90,10 +83,8 @@ pub async fn start_clash(body: &ClashConfig) -> Result<Response<()>> {
 }
 
 pub async fn stop_clash() -> Result<Response<()>> {
-    let client = get_client().await?;
+    let client = connect().await?;
     let response = client
-        .as_ref()
-        .unwrap()
         .delete(IpcCommand::StopClash.as_ref())
         .send()
         .await?
