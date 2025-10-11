@@ -37,7 +37,7 @@ mod tests {
 
         let permision = std::fs::metadata(IPC_PATH).expect("Failed to get metadata");
         let permissions = permision.permissions();
-        #[cfg(unix)]
+        #[cfg(all(unix, target_os = "macos"))]
         {
             use platform_lib::{S_IRWXU, S_IRWXG, S_IRWXO};
             
@@ -48,7 +48,27 @@ mod tests {
             
             let actual_perms = permissions.mode() & full_mask;
             
-            debug!("IPC file permissions: {:o}", permissions.mode());
+            debug!("macOS IPC file permissions: {:o}", permissions.mode());
+            assert_eq!(
+                actual_perms,
+                full_mask,
+                "IPC file permissions should be 777 (actual: {:o})",
+                actual_perms
+            );
+        }
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use platform_lib::{S_IRWXU, S_IRWXG, S_IRWXO};
+            
+            let owner_perm = S_IRWXU; // 用户权限 (rwx------ = 700)
+            let group_perm = S_IRWXG; // 组权限   (---rwx--- = 070)
+            let other_perm = S_IRWXO; // 其他权限 (------rwx = 007)
+            let full_mask = owner_perm | group_perm | other_perm; // 完整权限掩码 (rwxrwxrwx = 777)
+            
+            let actual_perms = permissions.mode() & full_mask;
+            
+            debug!("Linux IPC file permissions: {:o}", permissions.mode());
             assert_eq!(
                 actual_perms,
                 full_mask,
