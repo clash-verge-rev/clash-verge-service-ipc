@@ -1,8 +1,8 @@
 #![cfg(feature = "standalone")]
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-
     use kode_bridge::IpcHttpClient;
     use serial_test::serial;
     use anyhow::Result;
