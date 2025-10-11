@@ -1,12 +1,12 @@
 #![cfg(feature = "standalone")]
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-    use kode_bridge::IpcHttpClient;
-    use serial_test::serial;
     use anyhow::Result;
     use clash_verge_service_ipc::{IPC_PATH, IpcCommand, run_ipc_server, stop_ipc_server};
+    use kode_bridge::IpcHttpClient;
+    use serial_test::serial;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tracing::debug;
 
     async fn connect_ipc() -> Result<IpcHttpClient> {
@@ -38,7 +38,11 @@ mod tests {
         let permision = std::fs::metadata(IPC_PATH).expect("Failed to get metadata");
         let permissions = permision.permissions();
         #[cfg(unix)]
-        assert_eq!(permissions.mode() & 0o777, 0o777, "IPC file permissions should be 777");
+        assert_eq!(
+            permissions.mode() & 0o777,
+            0o777,
+            "IPC file permissions should be 777"
+        );
         #[cfg(windows)]
         assert!(!permissions.readonly(), "IPC file should not be readonly");
 

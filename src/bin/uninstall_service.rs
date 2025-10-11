@@ -79,11 +79,11 @@ fn main() -> Result<(), Error> {
 /// stop and uninstall the service
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
-    use std::{thread, time::Duration};
-    use windows_service::{
+    use platform_lib::{
         service::{ServiceAccess, ServiceState},
         service_manager::{ServiceManager, ServiceManagerAccess},
     };
+    use std::{thread, time::Duration};
 
     let manager_access = ServiceManagerAccess::CONNECT;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;

@@ -11,10 +11,7 @@ use tracing_subscriber::FmtSubscriber;
 #[cfg(windows)]
 use {
     anyhow::Result,
-    std::ffi::OsString,
-    std::sync::mpsc,
-    std::time::Duration,
-    windows_service::{
+    platform_lib::{
         define_windows_service,
         service::{
             ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
@@ -23,6 +20,9 @@ use {
         service_control_handler::{self, ServiceControlHandlerResult},
         service_dispatcher,
     },
+    std::ffi::OsString,
+    std::sync::mpsc,
+    std::time::Duration,
 };
 
 // --- Main Entry Points ---
@@ -63,7 +63,7 @@ fn my_service_main(_args: Vec<OsString>) {
 
 /// Contains the core logic for running as a Windows service.
 #[cfg(windows)]
-fn run_service() -> windows_service::Result<()> {
+fn run_service() -> platform_lib::Result<()> {
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
 
     let event_handler = move |control_event| -> ServiceControlHandlerResult {

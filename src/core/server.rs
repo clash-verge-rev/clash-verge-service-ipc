@@ -124,9 +124,13 @@ async fn init_ipc_state() -> Result<()> {
 
 fn create_ipc_server() -> Result<IpcHttpServer> {
     use crate::IPC_PATH;
+    #[cfg(unix)]
+    use platform_lib::{S_IRWXG, S_IRWXO, S_IRWXU, mode_t};
     let server = IpcHttpServer::new(IPC_PATH)?;
     #[cfg(unix)]
-    let server = server.with_listener_mode(0o777);
+    let mode = platform_lib::mode_t::from((S_IRWXU | S_IRWXG | S_IRWXO) as mode_t);
+    #[cfg(unix)]
+    let server = server.with_listener_mode(mode);
     #[cfg(windows)]
     let server = server.with_listener_security_descriptor("D:(A;;GA;;;WD)");
 

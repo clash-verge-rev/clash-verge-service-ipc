@@ -169,15 +169,15 @@ fn main() -> Result<(), Error> {
 /// install and start the service
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
-    use std::env;
-    use std::ffi::{OsStr, OsString};
-    use windows_service::{
+    use platform_lib::{
         service::{
             ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceState,
             ServiceType,
         },
         service_manager::{ServiceManager, ServiceManagerAccess},
     };
+    use std::env;
+    use std::ffi::{OsStr, OsString};
 
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
