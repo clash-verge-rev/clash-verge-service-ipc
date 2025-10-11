@@ -124,19 +124,31 @@ async fn init_ipc_state() -> Result<()> {
 
 fn create_ipc_server() -> Result<IpcHttpServer> {
     use crate::IPC_PATH;
-    #[cfg(unix)]
-    use platform_lib::{S_IRWXG, S_IRWXO, S_IRWXU, mode_t};
+    
     let server = IpcHttpServer::new(IPC_PATH)?;
+
     #[cfg(unix)]
-    let mode: mode_t = platform_lib::mode_t::from(S_IRWXU | S_IRWXG | S_IRWXO);
-    #[cfg(unix)]
-    let server = server.with_listener_mode(mode);
+    {
+        use platform_lib::{S_IRWXG, S_IRWXO, S_IRWXU, mode_t, umask};
+
+        let old_mask: mode_t;
+        unsafe {
+            old_mask = umask(0);
+        }
+        let mode: mode_t = platform_lib::mode_t::from(S_IRWXU | S_IRWXG | S_IRWXO);
+        let server = server.with_listener_mode(mode);
+        unsafe {
+            umask(old_mask);
+        }
+        Ok(server)
+    }
+
     #[cfg(windows)]
-    let server = server.with_listener_security_descriptor("D:(A;;GA;;;WD)");
-
-    Ok(server)
+    {
+        let server = server.with_listener_security_descriptor("D:(A;;GA;;;WD)");
+        Ok(server)
+    }
 }
-
 fn create_ipc_router() -> Result<Router> {
     let router = Router::new()
         .get(IpcCommand::Magic.as_ref(), |_| async move {
