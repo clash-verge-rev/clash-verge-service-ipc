@@ -5,9 +5,11 @@ use anyhow::Result;
 use flexi_logger::writers::LogWriter;
 use flexi_logger::{DeferredNow, Record};
 use once_cell::sync::Lazy;
+use std::collections::VecDeque;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::io::AsyncBufReadExt;
+use tokio::sync::{RwLock, RwLockReadGuard};
 use tokio::{io::BufReader, process::Command};
 use tokio::{process::Child, sync::Mutex};
 use tracing::{info, warn};
@@ -33,6 +35,39 @@ impl Drop for ChildGuard {
 impl ChildGuard {
     fn inner(&mut self) -> Option<&mut Child> {
         self.0.as_mut()
+    }
+}
+
+const LOGS_QUEUE_LEN: usize = 100;
+
+pub struct ClashLogger {
+    logs: Arc<RwLock<VecDeque<String>>>,
+}
+
+impl ClashLogger {
+    pub fn global() -> &'static ClashLogger {
+        static LOGGER: OnceLock<ClashLogger> = OnceLock::new();
+
+        LOGGER.get_or_init(|| ClashLogger {
+            logs: Arc::new(RwLock::new(VecDeque::with_capacity(LOGS_QUEUE_LEN + 10))),
+        })
+    }
+
+    pub async fn get_logs(&self) -> RwLockReadGuard<'_, VecDeque<String>> {
+        self.logs.read().await
+    }
+
+    pub async fn append_log(&self, text: String) {
+        let mut logs = self.logs.write().await;
+        if logs.len() > LOGS_QUEUE_LEN {
+            logs.pop_front();
+        }
+        logs.push_back(text);
+    }
+
+    pub async fn clear_logs(&self) {
+        let mut logs = self.logs.write().await;
+        logs.clear();
     }
 }
 
@@ -81,6 +116,7 @@ impl CoreManager {
 
     pub async fn stop_core(&mut self) -> Result<()> {
         info!("Stopping core");
+        ClashLogger::global().clear_logs().await;
 
         let child_guard = self.running_child.lock().await.take();
         drop(child_guard);
@@ -176,6 +212,7 @@ pub async fn run_with_logging(
     tokio::spawn(async move {
         let w = shared_writer_clone.lock().await;
         while let Ok(Some(line)) = stdout_reader.next_line().await {
+            ClashLogger::global().append_log(line.clone()).await;
             let mut now = DeferredNow::default();
             let arg = format_args!("{}", line);
             let record = Record::builder()
@@ -192,6 +229,7 @@ pub async fn run_with_logging(
     tokio::spawn(async move {
         let w = shared_writer_clone.lock().await;
         while let Ok(Some(line)) = stderr_reader.next_line().await {
+            ClashLogger::global().append_log(line.clone()).await;
             let mut now = DeferredNow::default();
             let arg = format_args!("{}", line);
             let record = Record::builder()

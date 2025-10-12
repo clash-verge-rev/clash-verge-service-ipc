@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use kode_bridge::{ClientConfig, IpcHttpClient, pool::PoolConfig};
@@ -79,6 +79,16 @@ pub async fn start_clash(body: &ClashConfig) -> Result<Response<()>> {
         .send()
         .await?
         .json::<Response<()>>()?;
+    Ok(response)
+}
+
+pub async fn get_clash_logs() -> Result<Response<VecDeque<String>>> {
+    let client = connect().await?;
+    let response = client
+        .get(IpcCommand::GetClashLogs.as_ref())
+        .send()
+        .await?
+        .json::<Response<VecDeque<String>>>()?;
     Ok(response)
 }
 

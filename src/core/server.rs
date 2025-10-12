@@ -1,5 +1,5 @@
 use super::state::IpcState;
-use crate::core::manager::CORE_MANAGER;
+use crate::core::manager::{CORE_MANAGER, ClashLogger};
 use crate::core::structure::Response;
 use crate::{ClashConfig, IpcCommand, VERSION};
 use http::StatusCode;
@@ -199,6 +199,17 @@ fn create_ipc_router() -> Result<Router> {
                     .text(format!("Invalid JSON: {}", e))
                     .build()),
             }
+        })
+        .get(IpcCommand::GetClashLogs.as_ref(), |_| async move {
+            let json_value = Response {
+                code: 0,
+                message: "Success".to_string(),
+                data: Some(ClashLogger::global().get_logs().await.clone()),
+            };
+            Ok(HttpResponse::builder()
+                .status(StatusCode::OK)
+                .json(&json_value)?
+                .build())
         })
         .delete(IpcCommand::StopClash.as_ref(), |_| async move {
             match CORE_MANAGER.lock().await.stop_core().await {
