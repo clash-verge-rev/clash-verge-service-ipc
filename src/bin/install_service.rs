@@ -147,19 +147,17 @@ fn main() -> Result<(), Error> {
         _ => return Err(anyhow::anyhow!("Unexpected systemctl status code")),
     }
 
-    let home = env::var("HOME").map_err(|e| anyhow::anyhow!("Failed to get HOME dir: {}", e))?;
-    let home_dir = format!("{}/.config/systemd/user/", home);
-    if !Path::new(&home_dir).exists() {
-        fs::create_dir_all(&home_dir)
-            .map_err(|e| anyhow::anyhow!("Failed to create user config dir: {}", e))?;
-    }
-
     // Create and write unit file
-    let unit_file = format!("/etc/systemd/system/{}.service", home_dir, SERVICE_NAME);
+    let unit_file = format!("/etc/systemd/system/{}.service", SERVICE_NAME);
     let unit_file = Path::new(&unit_file);
+
+    let uid = unsafe { platform_lib::getuid() };
+    let gid = unsafe { platform_lib::getgid() };
 
     let unit_file_content = format!(
         include_str!("../../resources/systemd_service_unit.tmpl"),
+        uid,
+        gid,
         service_binary_path.to_str().unwrap()
     );
 
@@ -169,11 +167,7 @@ fn main() -> Result<(), Error> {
 
     // Reload and start service
     let _ = run_command("systemctl", &["daemon-reload"], debug);
-    let _ = run_command(
-        "systemctl",
-        &["enable", SERVICE_NAME, "--now"],
-        debug,
-    );
+    let _ = run_command("systemctl", &["enable", SERVICE_NAME, "--now"], debug);
 
     Ok(())
 }
