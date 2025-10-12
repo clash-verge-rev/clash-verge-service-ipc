@@ -112,6 +112,7 @@ fn main() -> Result<(), Error> {
 fn main() -> Result<(), Error> {
     const SERVICE_NAME: &str = "clash-verge-service";
     use std::env;
+    use std::fs;
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
@@ -154,7 +155,7 @@ fn main() -> Result<(), Error> {
     }
 
     // Create and write unit file
-    let unit_file = format!("{}/{}.service", home_dir, SERVICE_NAME);
+    let unit_file = format!("/etc/systemd/system/{}.service", home_dir, SERVICE_NAME);
     let unit_file = Path::new(&unit_file);
 
     let unit_file_content = format!(
@@ -170,7 +171,7 @@ fn main() -> Result<(), Error> {
     let _ = run_command("systemctl", &["daemon-reload"], debug);
     let _ = run_command(
         "systemctl",
-        &["enable", SERVICE_NAME, "--user", "--now"],
+        &["enable", SERVICE_NAME, "--now"],
         debug,
     );
 
