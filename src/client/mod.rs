@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use anyhow::Result;
+use compact_str::CompactString;
 use kode_bridge::{ClientConfig, IpcHttpClient, pool::PoolConfig};
 use log::debug;
 use once_cell::sync::Lazy;
@@ -82,13 +83,13 @@ pub async fn start_clash(body: &ClashConfig) -> Result<Response<()>> {
     Ok(response)
 }
 
-pub async fn get_clash_logs() -> Result<Response<VecDeque<String>>> {
+pub async fn get_clash_logs() -> Result<Response<VecDeque<CompactString>>> {
     let client = connect().await?;
     let response = client
         .get(IpcCommand::GetClashLogs.as_ref())
         .send()
         .await?
-        .json::<Response<VecDeque<String>>>()?;
+        .json::<Response<VecDeque<CompactString>>>()?;
     Ok(response)
 }
 

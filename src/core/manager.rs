@@ -2,6 +2,7 @@ use crate::WriterConfig;
 use crate::core::ClashConfig;
 use crate::core::logger::{get_writer, set_or_update_writer};
 use anyhow::Result;
+use compact_str::CompactString;
 use flexi_logger::writers::LogWriter;
 use flexi_logger::{DeferredNow, Record};
 use once_cell::sync::Lazy;
@@ -41,7 +42,7 @@ impl ChildGuard {
 const LOGS_QUEUE_LEN: usize = 100;
 
 pub struct ClashLogger {
-    logs: Arc<RwLock<VecDeque<String>>>,
+    logs: Arc<RwLock<VecDeque<CompactString>>>,
 }
 
 impl ClashLogger {
@@ -53,11 +54,11 @@ impl ClashLogger {
         })
     }
 
-    pub async fn get_logs(&self) -> RwLockReadGuard<'_, VecDeque<String>> {
+    pub async fn get_logs(&self) -> RwLockReadGuard<'_, VecDeque<CompactString>> {
         self.logs.read().await
     }
 
-    pub async fn append_log(&self, text: String) {
+    pub async fn append_log(&self, text: CompactString) {
         let mut logs = self.logs.write().await;
         if logs.len() > LOGS_QUEUE_LEN {
             logs.pop_front();
@@ -212,15 +213,18 @@ pub async fn run_with_logging(
     tokio::spawn(async move {
         let w = shared_writer_clone.lock().await;
         while let Ok(Some(line)) = stdout_reader.next_line().await {
-            ClashLogger::global().append_log(line.clone()).await;
-            let mut now = DeferredNow::default();
-            let arg = format_args!("{}", line);
-            let record = Record::builder()
-                .args(arg)
-                .level(log::Level::Info)
-                .target("service")
-                .build();
-            let _ = w.write(&mut now, &record);
+            let message = CompactString::from(line.as_str());
+            {
+                let mut now = DeferredNow::default();
+                let arg = format_args!("{}", line);
+                let record = Record::builder()
+                    .args(arg)
+                    .level(log::Level::Info)
+                    .target("service")
+                    .build();
+                let _ = w.write(&mut now, &record);
+            }
+            ClashLogger::global().append_log(message).await;
         }
     });
 
@@ -229,15 +233,18 @@ pub async fn run_with_logging(
     tokio::spawn(async move {
         let w = shared_writer_clone.lock().await;
         while let Ok(Some(line)) = stderr_reader.next_line().await {
-            ClashLogger::global().append_log(line.clone()).await;
-            let mut now = DeferredNow::default();
-            let arg = format_args!("{}", line);
-            let record = Record::builder()
-                .args(arg)
-                .level(log::Level::Error)
-                .target("service")
-                .build();
-            let _ = w.write(&mut now, &record);
+            let message = CompactString::from(line.as_str());
+            {
+                let mut now = DeferredNow::default();
+                let arg = format_args!("{}", line);
+                let record = Record::builder()
+                    .args(arg)
+                    .level(log::Level::Error)
+                    .target("service")
+                    .build();
+                let _ = w.write(&mut now, &record);
+            }
+            ClashLogger::global().append_log(message).await;
         }
     });
 
