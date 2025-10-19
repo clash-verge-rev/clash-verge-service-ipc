@@ -164,19 +164,16 @@ impl CoreManager {
             use std::path::Path;
             use tokio::fs;
 
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let target = Path::new("/tmp/verge/verge-mihomo.sock");
-                info!("Removing socket file {:?}", target);
-                if !target.exists() {
-                    info!("{:?} does not exist, no need to remove", target);
-                    return;
-                }
-                match fs::remove_file(target).await {
-                    Ok(_) => info!("Successfully removed {:?}", target),
-                    Err(e) => warn!("Failed to remove {:?}: {}", target, e),
-                }
-            });
+            let target = Path::new("/tmp/verge/verge-mihomo.sock");
+            info!("Removing socket file {:?}", target);
+            if !target.exists() {
+                info!("{:?} does not exist, no need to remove", target);
+                return;
+            }
+            match fs::remove_file(target).await {
+                Ok(_) => info!("Successfully removed {:?}", target),
+                Err(e) => warn!("Failed to remove {:?}: {}", target, e),
+            }
         }
     }
 }
