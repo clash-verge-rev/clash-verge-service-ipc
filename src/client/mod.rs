@@ -8,12 +8,14 @@ use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 
 use crate::{
-    ClashConfig, IPC_PATH, IpcCommand,
+    ClashConfig, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
     core::structure::{JsonConvert, Response},
 };
 
 static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> =
     Lazy::new(|| Arc::new(RwLock::new(None)));
+
+static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
 
 #[derive(Debug, Clone)]
 pub struct IpcConfig {
@@ -66,6 +68,7 @@ pub async fn get_version() -> Result<Response<String>> {
     let client = connect().await?;
     let response = client
         .get(IpcCommand::GetVersion.as_ref())
+        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
         .json::<Response<String>>()?;
@@ -77,6 +80,7 @@ pub async fn start_clash(body: &ClashConfig) -> Result<Response<()>> {
     let response = client
         .post(IpcCommand::StartClash.as_ref())
         .json_body(&body.to_json_value()?)
+        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
         .json::<Response<()>>()?;
@@ -87,6 +91,7 @@ pub async fn get_clash_logs() -> Result<Response<VecDeque<CompactString>>> {
     let client = connect().await?;
     let response = client
         .get(IpcCommand::GetClashLogs.as_ref())
+        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
         .json::<Response<VecDeque<CompactString>>>()?;
@@ -97,6 +102,7 @@ pub async fn stop_clash() -> Result<Response<()>> {
     let client = connect().await?;
     let response = client
         .delete(IpcCommand::StopClash.as_ref())
+        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
         .json::<Response<()>>()?;

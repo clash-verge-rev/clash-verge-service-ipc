@@ -2,11 +2,15 @@
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use clash_verge_service_ipc::{IPC_PATH, IpcCommand, VERSION, run_ipc_server, stop_ipc_server};
+    use clash_verge_service_ipc::{
+        IPC_AUTH_EXPECT, IPC_PATH, IpcCommand, VERSION, run_ipc_server, stop_ipc_server,
+    };
     use kode_bridge::IpcHttpClient;
     use serde_json::Value;
     use serial_test::serial;
     use tracing::debug;
+
+    static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
 
     async fn connect_ipc() -> Result<IpcHttpClient> {
         debug!("Connecting to IPC at {}", IPC_PATH);
@@ -36,6 +40,7 @@ mod tests {
         let version = client
             .unwrap()
             .get(IpcCommand::GetVersion.as_ref())
+            .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
             .send()
             .await;
         assert!(

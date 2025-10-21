@@ -1,4 +1,5 @@
 use super::state::IpcState;
+use crate::core::auth::ipc_request_context_to_auth_context;
 use crate::core::manager::{CORE_MANAGER, ClashLogger};
 use crate::core::structure::Response;
 use crate::{ClashConfig, IpcCommand, VERSION};
@@ -156,7 +157,8 @@ fn create_ipc_router() -> Result<Router> {
         .get(IpcCommand::Magic.as_ref(), |_| async move {
             Ok(HttpResponse::builder().text("Tunglies!").build())
         })
-        .get(IpcCommand::GetVersion.as_ref(), |_| async move {
+        .get(IpcCommand::GetVersion.as_ref(), |ctx| async move {
+            ipc_request_context_to_auth_context(&ctx)?;
             let json_value = Response {
                 code: 0,
                 message: "Success".to_string(),
@@ -167,8 +169,9 @@ fn create_ipc_router() -> Result<Router> {
                 .json(&json_value)?
                 .build())
         })
-        .post(IpcCommand::StartClash.as_ref(), |payload| async move {
-            match payload.json::<ClashConfig>() {
+        .post(IpcCommand::StartClash.as_ref(), |ctx| async move {
+            ipc_request_context_to_auth_context(&ctx)?;
+            match ctx.json::<ClashConfig>() {
                 Ok(start_clash) => {
                     match CORE_MANAGER.lock().await.start_core(start_clash).await {
                         Ok(_) => info!("Core started successfully"),
@@ -200,7 +203,8 @@ fn create_ipc_router() -> Result<Router> {
                     .build()),
             }
         })
-        .get(IpcCommand::GetClashLogs.as_ref(), |_| async move {
+        .get(IpcCommand::GetClashLogs.as_ref(), |ctx| async move {
+            ipc_request_context_to_auth_context(&ctx)?;
             let json_value = Response {
                 code: 0,
                 message: "Success".to_string(),
@@ -211,7 +215,8 @@ fn create_ipc_router() -> Result<Router> {
                 .json(&json_value)?
                 .build())
         })
-        .delete(IpcCommand::StopClash.as_ref(), |_| async move {
+        .delete(IpcCommand::StopClash.as_ref(), |ctx| async move {
+            ipc_request_context_to_auth_context(&ctx)?;
             match CORE_MANAGER.lock().await.stop_core().await {
                 Ok(_) => info!("Core stopped successfully"),
                 Err(e) => {

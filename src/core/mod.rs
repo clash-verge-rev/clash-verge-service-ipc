@@ -5,6 +5,8 @@ pub mod structure;
 pub use structure::{ClashConfig, CoreConfig, WriterConfig};
 
 #[cfg(feature = "standalone")]
+mod auth;
+#[cfg(feature = "standalone")]
 mod logger;
 #[cfg(feature = "standalone")]
 mod manager;
