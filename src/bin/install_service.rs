@@ -213,7 +213,7 @@ fn main() -> anyhow::Result<()> {
         name: OsString::from("clash_verge_service"),
         display_name: OsString::from("Clash Verge Service"),
         service_type: ServiceType::OWN_PROCESS,
-        start_type: ServiceStartType::AutoStart,
+        start_type: ServiceStartType::SystemStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: service_binary_path,
         launch_arguments: vec![],
