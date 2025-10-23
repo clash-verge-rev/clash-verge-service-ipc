@@ -176,12 +176,8 @@ fn main() -> anyhow::Result<()> {
         },
         service_manager::{ServiceManager, ServiceManagerAccess},
     };
-    use std::{
-        env,
-        ffi::{OsStr, OsString},
-        thread,
-        time::Duration,
-    };
+    use std::env;
+    use std::ffi::{OsStr, OsString};
 
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
@@ -198,12 +194,15 @@ fn main() -> anyhow::Result<()> {
                 service.start(&Vec::<&OsStr>::new())?;
             }
             _ => {}
-        }
+        };
 
         return Ok(());
     }
 
-    let service_binary_path = env::current_exe()?.with_file_name("clash-verge-service.exe");
+    let service_binary_path = env::current_exe()
+        .unwrap()
+        .with_file_name("clash-verge-service.exe");
+
     if !service_binary_path.exists() {
         eprintln!("clash-verge-service.exe not found");
         std::process::exit(2);
@@ -218,29 +217,17 @@ fn main() -> anyhow::Result<()> {
         executable_path: service_binary_path,
         launch_arguments: vec![],
         dependencies: vec![],
-        account_name: None,
+        account_name: None, // run as System
         account_password: None,
     };
 
     let start_access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
     let service = service_manager.create_service(&service_info, start_access)?;
+
     service.set_description("Clash Verge Service helps to launch clash core")?;
-    drop(service);
+    service.start(&Vec::<&OsStr>::new())?;
 
-    let service = service_manager.open_service("clash_verge_service", start_access)?;
-
-    let mut last_err = None;
-    for _ in 0..3 {
-        match service.start(&[] as &[&OsStr]) {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
-
-    Err(last_err.unwrap().into())
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
