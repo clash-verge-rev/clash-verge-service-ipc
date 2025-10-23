@@ -12,17 +12,9 @@ pub use core::{run_ipc_server, stop_ipc_server};
 pub use client::*;
 
 #[cfg(unix)]
-pub static IPC_PATH: &str = if cfg!(test) || cfg!(debug_assertions) {
-    "/tmp/verge/clash-verge-service-dev.sock"
-} else {
-    "/tmp/verge/clash-verge-service.sock"
-};
+pub static IPC_PATH: &str = "/tmp/verge/clash-verge-service.sock";
 #[cfg(windows)]
-pub static IPC_PATH: &str = if cfg!(test) || cfg!(debug_assertions) {
-    r"\\.\pipe\clash-verge-service-dev"
-} else {
-    r"\\.\pipe\clash-verge-service"
-};
+pub static IPC_PATH: &str = r"\\.\pipe\clash-verge-service";
 
 #[cfg(any(feature = "standalone", feature = "client"))]
 pub static IPC_AUTH_EXPECT: &str =
