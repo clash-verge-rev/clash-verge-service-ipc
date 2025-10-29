@@ -30,6 +30,35 @@ pub struct Response<T> {
     pub data: Option<T>,
 }
 
+impl Default for ClashConfig {
+    fn default() -> Self {
+        Self {
+            core_config: CoreConfig::default(),
+            log_config: WriterConfig::default(),
+        }
+    }
+}
+
+impl Default for CoreConfig {
+    fn default() -> Self {
+        Self {
+            core_path: "./clash".to_string(),
+            config_path: "./config.yaml".to_string(),
+            config_dir: "./configs".to_string(),
+        }
+    }
+}
+
+impl Default for WriterConfig {
+    fn default() -> Self {
+        Self {
+            directory: "./logs".to_string(),
+            max_log_size: 10 * 1024 * 1024, // 10 MB
+            max_log_files: 8,
+        }
+    }
+}
+
 #[cfg(feature = "client")]
 pub trait JsonConvert: Serialize + for<'de> Deserialize<'de> {
     /// 转换为 JSON Value

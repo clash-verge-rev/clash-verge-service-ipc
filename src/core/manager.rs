@@ -89,7 +89,6 @@ impl CoreManager {
         if self.running_child.lock().await.is_some() {
             info!("Core is already running");
             let _ = self.stop_core().await;
-            return Ok(());
         }
 
         info!("Starting core with config: {:?}", config);

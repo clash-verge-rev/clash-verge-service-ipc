@@ -7,7 +7,7 @@ use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, trace};
 
 pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     make_ipc_dir().await?;
@@ -155,6 +155,7 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
 fn create_ipc_router() -> Result<Router> {
     let router = Router::new()
         .get(IpcCommand::Magic.as_ref(), |_| async move {
+            trace!("Received Magic command");
             Ok(HttpResponse::builder().text("Tunglies!").build())
         })
         .get(IpcCommand::GetVersion.as_ref(), |ctx| async move {
@@ -170,6 +171,7 @@ fn create_ipc_router() -> Result<Router> {
                 .build())
         })
         .post(IpcCommand::StartClash.as_ref(), |ctx| async move {
+            trace!("Received StartClash command");
             ipc_request_context_to_auth_context(&ctx)?;
             match ctx.json::<ClashConfig>() {
                 Ok(start_clash) => {
@@ -204,6 +206,7 @@ fn create_ipc_router() -> Result<Router> {
             }
         })
         .get(IpcCommand::GetClashLogs.as_ref(), |ctx| async move {
+            trace!("Received GetClashLogs command");
             ipc_request_context_to_auth_context(&ctx)?;
             let json_value = Response {
                 code: 0,
@@ -216,6 +219,7 @@ fn create_ipc_router() -> Result<Router> {
                 .build())
         })
         .delete(IpcCommand::StopClash.as_ref(), |ctx| async move {
+            trace!("Received StopClash command");
             ipc_request_context_to_auth_context(&ctx)?;
             match CORE_MANAGER.lock().await.stop_core().await {
                 Ok(_) => info!("Core stopped successfully"),

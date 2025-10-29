@@ -1,6 +1,6 @@
 [package]
 name = "clash_verge_service_ipc"
-version = "2.0.17"
+version = "2.0.18"
 edition = "2024"
 authors = ["Tunglies"]
 license = "GPL-3.0"
@@ -52,7 +52,12 @@ client = [
     "compact_str",
 ]
 response = []
-test = []
+test = [
+    "flexi_logger",
+    "tracing",
+    "tracing-subscriber/env-filter",
+    "tracing-log",
+]
 default = []
 
 
@@ -78,6 +83,7 @@ tracing-subscriber = { version = "0.3.20", optional = true }
 clash_verge_logger = { git = "https://github.com/clash-verge-rev/clash-verge-logger.git", version = "0.1.0", optional = true }
 flexi_logger = { version = "0.31.7", optional = true }
 log = { version = "0.4.28", optional = true }
+tracing-log = { version = "0.2.0", optional = true }
 compact_str = { version = "0.9.0", features = ["serde"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
