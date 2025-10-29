@@ -40,14 +40,12 @@ impl ChildGuard {
 
 pub struct CoreManager {
     running_child: Arc<Mutex<Option<ChildGuard>>>,
-    running_config: Arc<Mutex<Option<ClashConfig>>>,
 }
 
 impl CoreManager {
     fn new() -> Self {
         CoreManager {
             running_child: Arc::new(Mutex::new(None)),
-            running_config: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -58,22 +56,19 @@ impl CoreManager {
         }
 
         info!("Starting core with config: {:?}", config);
-        self.running_config = Arc::new(Mutex::new(Some(config)));
 
-        if let Some(config) = self.running_config.lock().await.as_ref() {
-            let args = vec![
-                "-d",
-                config.core_config.config_dir.as_str(),
-                "-f",
-                config.core_config.config_path.as_str(),
-            ];
+        let args = vec![
+            "-d",
+            config.core_config.config_dir.as_str(),
+            "-f",
+            config.core_config.config_path.as_str(),
+        ];
 
-            let child_guard =
-                run_with_logging(&config.core_config.core_path, &args, &config.log_config).await?;
+        let child_guard =
+            run_with_logging(&config.core_config.core_path, &args, &config.log_config).await?;
 
-            let mut child_lock = self.running_child.lock().await;
-            *child_lock = Some(child_guard);
-        }
+        let mut child_lock = self.running_child.lock().await;
+        *child_lock = Some(child_guard);
 
         self.after_start().await;
 
@@ -86,13 +81,6 @@ impl CoreManager {
 
         let child_guard = self.running_child.lock().await.take();
         drop(child_guard);
-
-        let start_clash = self.running_config.lock().await.take();
-        if let Some(config) = start_clash {
-            info!("Clearing running config: {:?}", config);
-        } else {
-            info!("No running config to clear");
-        }
 
         self.after_stop().await;
 
