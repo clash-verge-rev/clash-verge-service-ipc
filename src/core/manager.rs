@@ -50,9 +50,9 @@ impl CoreManager {
     }
 
     pub async fn start_core(&mut self, config: ClashConfig) -> Result<()> {
-        if self.running_child.lock().await.is_some() {
-            info!("Core is already running");
-            let _ = self.stop_core().await;
+        if let Some(child) = self.running_child.lock().await.take() {
+            info!("Core is already running, stopping existing instance");
+            drop(child);
         }
 
         info!("Starting core with config: {:?}", config);
