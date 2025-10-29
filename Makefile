@@ -7,6 +7,15 @@ CARGO ?= cargo
 CARGO_FLAGS ?= --all-features
 TEST_BIN_ARGS ?= -- --nocapture
 
+# allow passing target and --no-run via environment variables
+ifdef TARGET
+CARGO_FLAGS += --target $(TARGET)
+endif
+
+ifdef NO_RUN
+CARGO_FLAGS += --no-run
+endif
+
 # default test target: if TEST_NAME is defined run that single test, otherwise run all
 ifdef TEST_NAME
 test: test_one
