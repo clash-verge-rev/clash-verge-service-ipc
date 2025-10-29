@@ -30,27 +30,28 @@ mod tests {
 
         #[cfg(unix)]
         {
-            if let Ok(out) = Command::new("pgrep").arg("-f").arg(&exe).output() {
-                if out.status.success() && !out.stdout.is_empty() {
-                    return true;
-                }
+            if let Ok(out) = Command::new("pgrep").arg("-f").arg(&exe).output()
+                && out.status.success()
+                && !out.stdout.is_empty()
+            {
+                return true;
             }
-            if let Ok(out) = Command::new("ps").arg("aux").output() {
-                if out.status.success() {
-                    return String::from_utf8_lossy(&out.stdout).contains(&exe);
-                }
+            if let Ok(out) = Command::new("ps").arg("aux").output()
+                && out.status.success()
+            {
+                return String::from_utf8_lossy(&out.stdout).contains(&exe);
             }
             false
         }
 
         #[cfg(windows)]
         {
-            if let Ok(out) = Command::new("tasklist").output() {
-                if out.status.success() {
-                    return String::from_utf8_lossy(&out.stdout)
-                        .to_lowercase()
-                        .contains(&exe.to_lowercase());
-                }
+            if let Ok(out) = Command::new("tasklist").output()
+                && out.status.success()
+            {
+                return String::from_utf8_lossy(&out.stdout)
+                    .to_lowercase()
+                    .contains(&exe.to_lowercase());
             }
             false
         }

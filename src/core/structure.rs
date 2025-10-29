@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "client")]
 use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClashConfig {
     pub core_config: CoreConfig,
     pub log_config: WriterConfig,
@@ -28,15 +28,6 @@ pub struct Response<T> {
     pub code: u16,
     pub message: String,
     pub data: Option<T>,
-}
-
-impl Default for ClashConfig {
-    fn default() -> Self {
-        Self {
-            core_config: CoreConfig::default(),
-            log_config: WriterConfig::default(),
-        }
-    }
 }
 
 impl Default for CoreConfig {

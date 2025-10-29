@@ -1,4 +1,4 @@
-#[cfg(feature = "test")]
+#![cfg(feature = "test")]
 
 fn main() {
     loop {
