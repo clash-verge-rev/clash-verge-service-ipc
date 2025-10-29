@@ -2,15 +2,14 @@ use crate::WriterConfig;
 use crate::core::ClashConfig;
 use crate::core::logger::{get_writer, set_or_update_writer};
 use anyhow::Result;
+use clash_verge_logger::AsyncLogger;
 use compact_str::CompactString;
 use flexi_logger::writers::LogWriter;
 use flexi_logger::{DeferredNow, Record};
 use once_cell::sync::Lazy;
-use std::collections::VecDeque;
 use std::process::Stdio;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{RwLock, RwLockReadGuard};
 use tokio::{io::BufReader, process::Command};
 use tokio::{process::Child, sync::Mutex};
 use tracing::{info, warn};
@@ -36,39 +35,6 @@ impl Drop for ChildGuard {
 impl ChildGuard {
     fn inner(&mut self) -> Option<&mut Child> {
         self.0.as_mut()
-    }
-}
-
-const LOGS_QUEUE_LEN: usize = 100;
-
-pub struct ClashLogger {
-    logs: Arc<RwLock<VecDeque<CompactString>>>,
-}
-
-impl ClashLogger {
-    pub fn global() -> &'static ClashLogger {
-        static LOGGER: OnceLock<ClashLogger> = OnceLock::new();
-
-        LOGGER.get_or_init(|| ClashLogger {
-            logs: Arc::new(RwLock::new(VecDeque::with_capacity(LOGS_QUEUE_LEN + 10))),
-        })
-    }
-
-    pub async fn get_logs(&self) -> RwLockReadGuard<'_, VecDeque<CompactString>> {
-        self.logs.read().await
-    }
-
-    pub async fn append_log(&self, text: CompactString) {
-        let mut logs = self.logs.write().await;
-        if logs.len() > LOGS_QUEUE_LEN {
-            logs.pop_front();
-        }
-        logs.push_back(text);
-    }
-
-    pub async fn clear_logs(&self) {
-        let mut logs = self.logs.write().await;
-        logs.clear();
     }
 }
 
@@ -116,7 +82,7 @@ impl CoreManager {
 
     pub async fn stop_core(&mut self) -> Result<()> {
         info!("Stopping core");
-        ClashLogger::global().clear_logs().await;
+        LOGGER_MANAGER.clear_logs().await;
 
         let child_guard = self.running_child.lock().await.take();
         drop(child_guard);
@@ -220,7 +186,7 @@ pub async fn run_with_logging(
                     .build();
                 let _ = w.write(&mut now, &record);
             }
-            ClashLogger::global().append_log(message).await;
+            LOGGER_MANAGER.append_log(message).await;
         }
     });
 
@@ -240,7 +206,7 @@ pub async fn run_with_logging(
                     .build();
                 let _ = w.write(&mut now, &record);
             }
-            ClashLogger::global().append_log(message).await;
+            LOGGER_MANAGER.append_log(message).await;
         }
     });
 
@@ -249,3 +215,5 @@ pub async fn run_with_logging(
 
 pub static CORE_MANAGER: Lazy<Arc<Mutex<CoreManager>>> =
     Lazy::new(|| Arc::new(Mutex::new(CoreManager::new())));
+
+pub static LOGGER_MANAGER: Lazy<Arc<AsyncLogger>> = Lazy::new(|| Arc::new(AsyncLogger::new()));
