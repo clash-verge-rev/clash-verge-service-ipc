@@ -24,6 +24,11 @@ name = "clash-verge-service-uninstall"
 path = "src/bin/uninstall_service.rs"
 required-features = ["standalone"]
 
+[[bin]]
+name = "mock_binary"
+path = "src/bin/mock_binary.rs"
+required-features = ["test"]
+
 [features]
 standalone = [
     "kode-bridge",
