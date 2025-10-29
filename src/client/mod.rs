@@ -7,12 +7,12 @@ use log::debug;
 use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 
-use crate::{
-    ClashConfig, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
-    core::structure::{JsonConvert, Response},
-};
+use crate::{ClashConfig, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand, core::structure::Response};
 
 static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(None)));
+
+static CACHED_CLIENT: Lazy<Arc<RwLock<Option<Arc<IpcHttpClient>>>>> =
     Lazy::new(|| Arc::new(RwLock::new(None)));
 
 static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
@@ -20,16 +20,16 @@ static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
 #[derive(Debug, Clone)]
 pub struct IpcConfig {
     pub default_timeout: Duration,
-    pub max_retries: usize,
     pub retry_delay: Duration,
+    pub max_retries: usize,
 }
 
 impl Default for IpcConfig {
     fn default() -> Self {
         Self {
             default_timeout: Duration::from_millis(50),
-            max_retries: 6,
             retry_delay: Duration::from_millis(125),
+            max_retries: 6,
         }
     }
 }
@@ -39,10 +39,15 @@ pub async fn set_config(config: Option<IpcConfig>) {
     *guard = config;
 }
 
-async fn try_connect() -> Result<IpcHttpClient> {
+async fn try_connect() -> Result<Arc<IpcHttpClient>> {
     debug!("Connecting to IPC at {}", IPC_PATH);
     let c = { CLIENT_CONFIG.read().await.clone() }.unwrap_or_default();
     debug!("Using config: {:?}", c);
+
+    if let Some(cached) = { CACHED_CLIENT.read().await.clone() } {
+        return Ok(cached);
+    }
+
     let client = kode_bridge::IpcHttpClient::with_config(
         IPC_PATH,
         ClientConfig {
@@ -57,10 +62,13 @@ async fn try_connect() -> Result<IpcHttpClient> {
         },
     )?;
     client.get(IpcCommand::Magic.as_ref()).send().await?;
-    Ok(client)
+
+    let arc_client = Arc::new(client);
+    *CACHED_CLIENT.write().await = Some(arc_client.clone());
+    Ok(arc_client)
 }
 
-pub async fn connect() -> Result<IpcHttpClient> {
+pub async fn connect() -> Result<Arc<IpcHttpClient>> {
     try_connect().await
 }
 
@@ -79,7 +87,7 @@ pub async fn start_clash(body: &ClashConfig) -> Result<Response<()>> {
     let client = connect().await?;
     let response = client
         .post(IpcCommand::StartClash.as_ref())
-        .json_body(&body.to_json_value()?)
+        .json_body(&serde_json::to_value(body)?)
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
