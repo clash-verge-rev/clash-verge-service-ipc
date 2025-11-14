@@ -1,25 +1,30 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-    <dict>
-        <key>AssociatedBundleIdentifiers</key>
+<dict>
+    <key>Label</key>
+    <string>io.github.clash-verge-rev.clash-verge-rev.service</string>
+
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
         <string>io.github.clash-verge-rev.clash-verge-rev</string>
-        <key>Label</key>
-        <string>io.github.clash-verge-rev.clash-verge-rev.service</string>
-        <key>MachServices</key>
-        <dict>
-            <key>io.github.clash-verge-rev.clash-verge-rev.service</key>
-            <true />
-        </dict>
-        <key>RunAtLoad</key>
-        <true />
-        <key>KeepAlive</key>
+    </array>
+
+    <key>MachServices</key>
+    <dict>
+        <key>io.github.clash-verge-rev.clash-verge-rev.service</key>
         <true/>
-        <key>Program</key>
-        <string>/Library/PrivilegedHelperTools/io.github.clash-verge-rev.clash-verge-rev.service.bundle/Contents/MacOS/clash-verge-service</string>
-        <key>ProgramArguments</key>
-        <array>
-            <string>/Library/PrivilegedHelperTools/io.github.clash-verge-rev.clash-verge-rev.service.bundle/Contents/MacOS/clash-verge-service</string>
-        </array>
     </dict>
-</plist> 
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/PrivilegedHelperTools/io.github.clash-verge-rev.clash-verge-rev.service.bundle/Contents/MacOS/clash-verge-service</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
