@@ -10,23 +10,8 @@ name = "clash_verge_service_ipc"
 path = "src/lib.rs"
 
 [[bin]]
-name = "clash-verge-service-cli"
-path = "src/bin/cli.rs"
-required-features = ["standalone"]
-
-[[bin]]
 name = "clash-verge-service"
-path = "src/bin/service.rs"
-required-features = ["standalone"]
-
-[[bin]]
-name = "clash-verge-service-install"
-path = "src/bin/install_service.rs"
-required-features = ["standalone"]
-
-[[bin]]
-name = "clash-verge-service-uninstall"
-path = "src/bin/uninstall_service.rs"
+path = "src/bin/cli.rs"
 required-features = ["standalone"]
 
 [[bin]]

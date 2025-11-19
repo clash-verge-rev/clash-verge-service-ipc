@@ -1,6 +1,0 @@
-use anyhow::Error;
-use clash_verge_service_ipc::cli::run;
-
-fn main() -> Result<(), Error> {
-    run::main()
-}
