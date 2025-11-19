@@ -216,7 +216,7 @@ pub fn main() -> anyhow::Result<()> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: service_binary_path,
-        launch_arguments: vec![],
+        launch_arguments: vec!["run"],
         dependencies: vec![],
         account_name: None, // run as System
         account_password: None,
