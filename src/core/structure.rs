@@ -11,6 +11,7 @@ pub struct ClashConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreConfig {
     pub core_path: String,
+    pub core_ipc_path: String,
     pub config_path: String,
     pub config_dir: String,
 }
@@ -32,8 +33,14 @@ pub struct Response<T> {
 
 impl Default for CoreConfig {
     fn default() -> Self {
+        let core_ipc_path = if cfg!(windows) {
+            r"\\.\pipe\verge-mihomo".to_string()
+        } else {
+            "/tmp/verge-mihomo.sock".to_string()
+        };
         Self {
             core_path: "./clash".to_string(),
+            core_ipc_path,
             config_path: "./config.yaml".to_string(),
             config_dir: "./configs".to_string(),
         }
