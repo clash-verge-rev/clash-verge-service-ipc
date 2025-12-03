@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use compact_str::CompactString;
@@ -42,13 +42,14 @@ pub async fn set_config(config: Option<IpcConfig>) {
 async fn try_connect() -> Result<IpcHttpClient> {
     debug!("Connecting to IPC at {}", IPC_PATH);
 
-    if let Err(e) = Path::metadata(IPC_PATH.as_ref()) {
-        warn!("Clash Verge Service IPC path does not exist: {}", e);
-        return Err(anyhow::anyhow!(
-            "Clash Verge Service IPC path does not exist: {}",
-            e
-        ));
-    }
+    // Disabled existence check, see in https://github.com/clash-verge-rev/clash-verge-service-ipc/pull/13#discussion_r2585472857
+    // if let Err(e) = Path::metadata(IPC_PATH.as_ref()) {
+    //     warn!("Clash Verge Service IPC path does not exist: {}", e);
+    //     return Err(anyhow::anyhow!(
+    //         "Clash Verge Service IPC path does not exist: {}",
+    //         e
+    //     ));
+    // }
 
     let c = { CLIENT_CONFIG.read().await.clone() }.unwrap_or_default();
     debug!("Using config: {:?}", c);
