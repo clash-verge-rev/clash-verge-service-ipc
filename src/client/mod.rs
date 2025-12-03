@@ -1,9 +1,9 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use compact_str::CompactString;
 use kode_bridge::{ClientConfig, IpcHttpClient, pool::PoolConfig};
-use log::debug;
+use log::{debug, warn};
 use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 
@@ -41,6 +41,15 @@ pub async fn set_config(config: Option<IpcConfig>) {
 
 async fn try_connect() -> Result<IpcHttpClient> {
     debug!("Connecting to IPC at {}", IPC_PATH);
+
+    if let Err(e) = Path::metadata(IPC_PATH.as_ref()) {
+        warn!("Clash Verge Service IPC path does not exist: {}", e);
+        return Err(anyhow::anyhow!(
+            "Clash Verge Service IPC path does not exist: {}",
+            e
+        ));
+    }
+
     let c = { CLIENT_CONFIG.read().await.clone() }.unwrap_or_default();
     debug!("Using config: {:?}", c);
     let client = kode_bridge::IpcHttpClient::with_config(
@@ -56,7 +65,12 @@ async fn try_connect() -> Result<IpcHttpClient> {
             ..Default::default()
         },
     )?;
-    client.get(IpcCommand::Magic.as_ref()).send().await?;
+
+    if let Err(e) = client.get(IpcCommand::Magic.as_ref()).send().await {
+        warn!("Failed to connect to IPC server: {}", e);
+        return Err(anyhow::anyhow!("Failed to connect to IPC server: {}", e));
+    }
+
     Ok(client)
 }
 
