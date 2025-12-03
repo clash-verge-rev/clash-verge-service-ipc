@@ -62,6 +62,12 @@ impl CoreManager {
             config.core_config.config_dir.as_str(),
             "-f",
             config.core_config.config_path.as_str(),
+            if cfg!(windows) {
+                "-ext-ctl-pipe"
+            } else {
+                "-ext-ctl-unix"
+            },
+            config.core_config.core_ipc_path.as_str(),
         ];
 
         let child_guard =

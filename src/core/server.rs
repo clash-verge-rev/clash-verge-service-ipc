@@ -154,8 +154,9 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
 }
 fn create_ipc_router() -> Result<Router> {
     let router = Router::new()
-        .get(IpcCommand::Magic.as_ref(), |_| async move {
+        .get(IpcCommand::Magic.as_ref(), |ctx| async move {
             trace!("Received Magic command");
+            ipc_request_context_to_auth_context(&ctx)?;
             Ok(HttpResponse::builder().text("Tunglies!").build())
         })
         .get(IpcCommand::GetVersion.as_ref(), |ctx| async move {
