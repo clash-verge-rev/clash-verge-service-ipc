@@ -17,7 +17,8 @@ pub static IPC_PATH: &str = "/tmp/verge/clash-verge-service.sock";
 pub static IPC_PATH: &str = r"\\.\pipe\clash-verge-service";
 
 #[cfg(all(feature = "test", unix))]
-pub static IPC_PATH: &str = "/tmp/verge/clash-verge-service-test.sock";
+pub static IPC_PATH: &str = "/tmp/verge/clash-verge-service.sock";
+// pub static IPC_PATH: &str = "/tmp/verge/clash-verge-service-test.sock";
 #[cfg(all(feature = "test", windows))]
 pub static IPC_PATH: &str = r"\\.\pipe\clash-verge-service-test";
 

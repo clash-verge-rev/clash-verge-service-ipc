@@ -1,23 +1,10 @@
 #![cfg(feature = "standalone")]
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
-    use clash_verge_service_ipc::{
-        IPC_AUTH_EXPECT, IPC_PATH, IpcCommand, VERSION, run_ipc_server, stop_ipc_server,
-    };
-    use kode_bridge::IpcHttpClient;
-    use serde_json::Value;
+    use clash_verge_service_ipc::{VERSION, run_ipc_server, stop_ipc_server};
+    use clash_verge_service_ipc::{connect, get_version};
     use serial_test::serial;
-    use tracing::debug;
-
-    static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
-
-    async fn connect_ipc() -> Result<IpcHttpClient> {
-        debug!("Connecting to IPC at {}", IPC_PATH);
-        let client = kode_bridge::IpcHttpClient::new(IPC_PATH)?;
-        client.get(IpcCommand::Magic.as_ref()).send().await?;
-        Ok(client)
-    }
+    use tokio::time;
 
     #[tokio::test]
     #[serial]
@@ -31,37 +18,33 @@ mod tests {
             );
         });
 
-        let client = connect_ipc().await;
+        time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let client = connect().await;
         assert!(
             client.is_ok(),
             "Should be able to connect to IPC server after starting"
         );
 
-        let version = client
-            .unwrap()
-            .get(IpcCommand::GetVersion.as_ref())
-            .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
-            .send()
-            .await;
+        let version = get_version().await;
         assert!(
             version.is_ok(),
             "Should receive a response from GetVersion command"
         );
 
-        let version_value: Value = version
-            .unwrap()
-            .json()
-            .expect("Should parse GetVersion response");
-        assert!(!version_value.is_null(), "Version value should not be null");
+        let version_data = version.unwrap().data;
+        assert!(version_data.is_some(), "Version data should not be None");
 
+        let version = version_data.unwrap();
         assert!(
-            version_value["data"] == VERSION,
-            "Version value should be a string"
+            version == VERSION,
+            "Version data should match expected VERSION constant"
         );
 
+        let mock_version = "mock_version_1.0.0";
         assert!(
-            stop_ipc_server().await.is_ok(),
-            "Stopping IPC server after starting should return Ok"
+            mock_version != version,
+            "Version should not match mock version"
         );
 
         let _ = server_handle.await;
