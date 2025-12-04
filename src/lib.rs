@@ -1,5 +1,8 @@
 mod core;
 
+#[cfg(feature = "standalone")]
+pub mod cli;
+
 #[cfg(feature = "client")]
 mod client;
 
