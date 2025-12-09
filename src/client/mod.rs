@@ -8,7 +8,7 @@ use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 
 use crate::{
-    ClashConfig, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
+    ClashConfig, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
@@ -120,6 +120,18 @@ pub async fn stop_clash() -> Result<Response<()>> {
     let client = connect().await?;
     let response = client
         .delete(IpcCommand::StopClash.as_ref())
+        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
+        .send()
+        .await?
+        .json::<Response<()>>()?;
+    Ok(response)
+}
+
+pub async fn update_writer(body: &WriterConfig) -> Result<Response<()>> {
+    let client = connect().await?;
+    let response = client
+        .post(IpcCommand::UpdateWriter.as_ref())
+        .json_body(&body.to_json_value()?)
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?

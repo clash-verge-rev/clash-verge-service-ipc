@@ -63,7 +63,7 @@ test = [
     "tracing-subscriber/env-filter",
     "tracing-log",
 ]
-default = []
+default = ["standalone", "client", "test"]
 
 
 [dependencies]
