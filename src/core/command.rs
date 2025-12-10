@@ -16,6 +16,8 @@ pub enum IpcCommand {
     StartClash,
     #[strum(serialize = "/clash/stop")]
     StopClash,
+    #[strum(serialize = "/writer")]
+    UpdateWriter,
     #[strum(serialize = "/magic")]
     Magic,
 }
