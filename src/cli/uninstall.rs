@@ -1,12 +1,13 @@
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn main() {
+pub fn main() {
     panic!("This program is not intended to run on this platform.");
 }
 
+use crate::cli::run_command;
 use anyhow::Error;
 
 #[cfg(target_os = "macos")]
-fn main() -> Result<(), Error> {
+pub fn main() -> Result<(), Error> {
     use std::env;
     use std::path::Path;
 
@@ -45,7 +46,7 @@ fn main() -> Result<(), Error> {
 }
 
 #[cfg(target_os = "linux")]
-fn main() -> Result<(), Error> {
+pub fn main() -> Result<(), Error> {
     const SERVICE_NAME: &str = "clash-verge-service";
     use std::env;
 
@@ -78,7 +79,7 @@ fn main() -> Result<(), Error> {
 
 /// stop and uninstall the service
 #[cfg(windows)]
-fn main() -> anyhow::Result<()> {
+pub fn main() -> anyhow::Result<()> {
     use platform_lib::{
         service::{ServiceAccess, ServiceState},
         service_manager::{ServiceManager, ServiceManagerAccess},
@@ -106,7 +107,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn uninstall_old_service() -> Result<(), Error> {
+fn uninstall_old_service() -> Result<(), Error> {
     use std::path::Path;
 
     let target_binary_path = "/Library/PrivilegedHelperTools/io.github.clashverge.helper";
@@ -133,37 +134,4 @@ pub fn uninstall_old_service() -> Result<(), Error> {
     }
 
     Ok(())
-}
-
-pub fn run_command(cmd: &str, args: &[&str], debug: bool) -> Result<(), Error> {
-    if debug {
-        println!("Executing: {} {}", cmd, args.join(" "));
-    }
-
-    let output = std::process::Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|e| anyhow::anyhow!("Failed to execute '{}': {}", cmd, e))?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    if debug {
-        eprintln!(
-            "Command failed (status: {}):\nstdout: {}\nstderr: {}",
-            output.status, stdout, stderr
-        );
-    }
-
-    Err(anyhow::anyhow!(
-        "Command '{}' failed (status: {}):\nstdout: {}\nstderr: {}",
-        cmd,
-        output.status,
-        stdout,
-        stderr
-    ))
 }
