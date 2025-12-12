@@ -1,8 +1,8 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use compact_str::CompactString;
-use kode_bridge::{ClientConfig, IpcHttpClient, pool::PoolConfig};
+use kode_bridge::{ClientConfig, IpcHttpClient};
 use log::{debug, warn};
 use once_cell::sync::Lazy;
 use tokio::sync::RwLock;

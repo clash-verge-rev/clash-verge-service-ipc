@@ -212,7 +212,7 @@ fn create_ipc_router() -> Result<Router> {
             let json_value = Response {
                 code: 0,
                 message: "Success".to_string(),
-                data: Some(LOGGER_MANAGER.get_logs().await.clone()),
+                data: Some(LOGGER_MANAGER.get_logs().await),
             };
             Ok(HttpResponse::builder()
                 .status(StatusCode::OK)

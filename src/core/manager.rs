@@ -49,7 +49,7 @@ impl CoreManager {
         }
     }
 
-    pub async fn start_core(&mut self, config: ClashConfig) -> Result<()> {
+    pub async fn start_core(&self, config: ClashConfig) -> Result<()> {
         if let Some(child) = self.running_child.lock().await.take() {
             info!("Core is already running, stopping existing instance");
             drop(child);
@@ -81,7 +81,7 @@ impl CoreManager {
         Ok(())
     }
 
-    pub async fn stop_core(&mut self) -> Result<()> {
+    pub async fn stop_core(&self) -> Result<()> {
         info!("Stopping core");
         LOGGER_MANAGER.clear_logs().await;
 
@@ -185,7 +185,7 @@ pub async fn run_with_logging(
     });
 
     let mut stderr_reader = BufReader::new(stderr).lines();
-    let shared_writer_clone = shared_writer.clone();
+    let shared_writer_clone = shared_writer;
     tokio::spawn(async move {
         let w = shared_writer_clone.lock().await;
         while let Ok(Some(line)) = stderr_reader.next_line().await {
