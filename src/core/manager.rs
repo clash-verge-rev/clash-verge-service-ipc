@@ -102,7 +102,7 @@ impl CoreManager {
             use tokio::fs;
 
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(125)).await;
                 let target = Path::new("/tmp/verge/verge-mihomo.sock");
                 info!("Setting permissions for {:?}", target);
                 if !target.exists() {

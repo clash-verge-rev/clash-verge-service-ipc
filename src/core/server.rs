@@ -44,7 +44,7 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
             use std::time::Duration;
             use tokio::fs;
 
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
             fs::set_permissions(IPC_PATH, Permissions::from_mode(0o777)).await?;
         }
         Ok(handle)
@@ -78,7 +78,7 @@ pub async fn stop_ipc_server() -> Result<()> {
     cleanup_ipc_path().await?;
 
     #[cfg(windows)]
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
 
     Ok(())
 }
