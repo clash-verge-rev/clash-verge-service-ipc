@@ -49,7 +49,7 @@ impl CoreManager {
         }
     }
 
-    pub async fn start_core(&mut self, config: ClashConfig) -> Result<()> {
+    pub async fn start_core(&self, config: ClashConfig) -> Result<()> {
         if let Some(child) = self.running_child.lock().await.take() {
             info!("Core is already running, stopping existing instance");
             drop(child);
@@ -81,7 +81,7 @@ impl CoreManager {
         Ok(())
     }
 
-    pub async fn stop_core(&mut self) -> Result<()> {
+    pub async fn stop_core(&self) -> Result<()> {
         info!("Stopping core");
         LOGGER_MANAGER.clear_logs().await;
 
@@ -102,7 +102,7 @@ impl CoreManager {
             use tokio::fs;
 
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(125)).await;
                 let target = Path::new("/tmp/verge/verge-mihomo.sock");
                 info!("Setting permissions for {:?}", target);
                 if !target.exists() {

@@ -1,6 +1,6 @@
 [package]
 name = "clash_verge_service_ipc"
-version = "2.0.24"
+version = "2.0.26"
 edition = "2024"
 authors = ["Tunglies"]
 license = "GPL-3.0"
@@ -67,7 +67,7 @@ default = []
 
 
 [dependencies]
-kode-bridge = { version = "0.3.4", features = ["server"], optional = true }
+kode-bridge = { version = "0.3.5", features = ["server"], optional = true }
 once_cell = { version = "1.21.3", features = ["parking_lot"], optional = true }
 anyhow = { version = "1.0.100", optional = true }
 http = { version = "1.3.1", optional = true }

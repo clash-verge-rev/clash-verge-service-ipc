@@ -1,8 +1,8 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use compact_str::CompactString;
-use kode_bridge::{ClientConfig, IpcHttpClient, pool::PoolConfig};
+use kode_bridge::{ClientConfig, IpcHttpClient};
 use log::{debug, warn};
 use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
@@ -41,13 +41,15 @@ pub async fn set_config(config: Option<IpcConfig>) {
 
 async fn try_connect() -> Result<IpcHttpClient> {
     debug!("Connecting to IPC at {}", IPC_PATH);
-    if let Err(e) = Path::metadata(IPC_PATH.as_ref()) {
-        warn!("Clash Verge Service IPC path does not exist: {}", e);
-        return Err(anyhow::anyhow!(
-            "Clash Verge Service IPC path does not exist: {}",
-            e
-        ));
-    }
+
+    //? Maybe we should check the path existence outside?
+    // if let Err(e) = Path::metadata(IPC_PATH.as_ref()) {
+    //     warn!("Clash Verge Service IPC path does not exist: {}", e);
+    //     return Err(anyhow::anyhow!(
+    //         "Clash Verge Service IPC path does not exist: {}",
+    //         e
+    //     ));
+    // }
 
     let c = { CLIENT_CONFIG.read().await.clone() }.unwrap_or_default();
     debug!("Using config: {:?}", c);
@@ -57,10 +59,7 @@ async fn try_connect() -> Result<IpcHttpClient> {
             default_timeout: c.default_timeout,
             max_retries: c.max_retries,
             retry_delay: c.retry_delay,
-            pool_config: PoolConfig {
-                max_retries: 1,
-                ..Default::default()
-            },
+            enable_pooling: false,
             ..Default::default()
         },
     )?;
