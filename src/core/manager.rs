@@ -53,6 +53,7 @@ impl CoreManager {
         if let Some(child) = self.running_child.lock().await.take() {
             info!("Core is already running, stopping existing instance");
             drop(child);
+            LOGGER_MANAGER.clear_logs().await;
         }
 
         info!("Starting core with config: {:?}", config);
@@ -134,6 +135,7 @@ impl CoreManager {
                 Err(e) => warn!("Failed to remove {:?}: {}", target, e),
             }
         }
+        LOGGER_MANAGER.clear_logs().await;
     }
 }
 
