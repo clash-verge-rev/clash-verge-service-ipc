@@ -3,7 +3,9 @@
 //! This service can run as a standalone process or as a Windows service.
 //! It listens for shutdown signals (Ctrl+C, SIGTERM, or service stop) to gracefully terminate.
 
-use clash_verge_service_ipc::{run_ipc_server, stop_ipc_server};
+use crate::{run_ipc_server, stop_ipc_server};
+#[cfg(not(windows))]
+use anyhow::Error;
 use kode_bridge::KodeBridgeError;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
@@ -30,15 +32,15 @@ use {
 /// Main entry point for non-Windows platforms (Linux, macOS).
 #[cfg(not(windows))]
 #[tokio::main]
-async fn main() -> Result<(), KodeBridgeError> {
+pub async fn main() -> Result<(), Error> {
     init_logger();
-    run_standalone().await
+    run_standalone().await.map_err(|e| e.into())
 }
 
 /// Main entry point for Windows.
 /// Tries to run as a service, falls back to standalone mode if that fails.
 #[cfg(windows)]
-fn main() -> Result<()> {
+pub fn main() -> Result<(), Error> {
     init_logger();
     if service_dispatcher::start("clash_verge_service", ffi_service_main).is_err() {
         info!("Not running as a service, starting in standalone mode.");
