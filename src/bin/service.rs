@@ -21,7 +21,6 @@ use {
         service_dispatcher,
     },
     std::ffi::OsString,
-    std::sync::mpsc,
     std::time::Duration,
 };
 
@@ -29,7 +28,7 @@ use {
 
 /// Main entry point for non-Windows platforms (Linux, macOS).
 #[cfg(not(windows))]
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), KodeBridgeError> {
     init_logger();
     run_standalone().await
@@ -64,12 +63,12 @@ fn my_service_main(_args: Vec<OsString>) {
 /// Contains the core logic for running as a Windows service.
 #[cfg(windows)]
 fn run_service() -> platform_lib::Result<()> {
-    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop => {
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.blocking_send(());
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -89,12 +88,15 @@ fn run_service() -> platform_lib::Result<()> {
         process_id: None,
     })?;
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         if let Ok(server_handle) = run_ipc_server().await {
             info!("IPC server started successfully in service mode.");
             // Wait for the shutdown signal
-            shutdown_rx.recv().unwrap();
+            shutdown_rx.recv().await;
 
             info!("Shutdown signal received. Stopping IPC server...");
             let _ = stop_ipc_server().await;
