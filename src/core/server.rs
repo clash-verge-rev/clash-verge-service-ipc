@@ -1,8 +1,9 @@
 use super::state::IpcState;
 use crate::core::auth::ipc_request_context_to_auth_context;
+use crate::core::logger::set_or_update_writer;
 use crate::core::manager::{CORE_MANAGER, LOGGER_MANAGER};
 use crate::core::structure::Response;
-use crate::{ClashConfig, IpcCommand, VERSION};
+use crate::{ClashConfig, IpcCommand, VERSION, WriterConfig};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
 use tokio::sync::oneshot;
@@ -245,6 +246,41 @@ fn create_ipc_router() -> Result<Router> {
                 .status(StatusCode::OK)
                 .json(&json_value)?
                 .build())
+        })
+        .put(IpcCommand::UpdateWriter.as_ref(), |ctx| async move {
+            trace!("Received UpdateWriter command");
+            ipc_request_context_to_auth_context(&ctx)?;
+            match ctx.json::<WriterConfig>() {
+                Ok(writer_config) => {
+                    match set_or_update_writer(&writer_config).await {
+                        Ok(_) => info!("Update writer successfully"),
+                        Err(e) => {
+                            let json_value: Response<()> = Response {
+                                code: 1,
+                                message: format!("Failed to update writer: {}", e),
+                                data: None,
+                            };
+                            return Ok(HttpResponse::builder()
+                                .status(StatusCode::SERVICE_UNAVAILABLE)
+                                .json(&json_value)?
+                                .build());
+                        }
+                    };
+                    let json_value: Response<()> = Response {
+                        code: 0,
+                        message: "Update Writer successfully".to_string(),
+                        data: None,
+                    };
+                    Ok(HttpResponse::builder()
+                        .status(StatusCode::OK)
+                        .json(&json_value)?
+                        .build())
+                }
+                Err(e) => Ok(HttpResponse::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .text(format!("Invalid JSON: {}", e))
+                    .build()),
+            }
         });
     Ok(router)
 }
