@@ -37,17 +37,6 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
             let _ = done_tx.send(());
             res
         });
-        #[cfg(unix)]
-        {
-            use crate::IPC_PATH;
-            use std::fs::Permissions;
-            use std::os::unix::fs::PermissionsExt;
-            use std::time::Duration;
-            use tokio::fs;
-
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            fs::set_permissions(IPC_PATH, Permissions::from_mode(0o777)).await?;
-        }
         Ok(handle)
     } else {
         Err(kode_bridge::KodeBridgeError::configuration(
@@ -93,11 +82,45 @@ async fn make_ipc_dir() -> Result<()> {
         use std::path::Path;
         use tokio::fs;
 
-        if let Some(dir_path) = Path::new(IPC_PATH).parent() {
-            if !dir_path.exists() {
-                fs::create_dir_all(dir_path).await?;
+        let Some(dir_path) = Path::new(IPC_PATH).parent() else {
+            return Ok(());
+        };
+
+        if !dir_path.exists() {
+            fs::create_dir_all(dir_path).await?;
+        }
+
+        fs::set_permissions(dir_path, Permissions::from_mode(0o750)).await?;
+
+        let mut target_gid: Option<platform_lib::gid_t> = None;
+        for group_name in &["admin", "wheel", "sudo"] {
+            if let Ok(c_group) = std::ffi::CString::new(*group_name) {
+                unsafe {
+                    let grp = platform_lib::getgrnam(c_group.as_ptr());
+                    if !grp.is_null() {
+                        target_gid = Some((*grp).gr_gid);
+                        break;
+                    }
+                }
             }
-            fs::set_permissions(dir_path, Permissions::from_mode(0o777)).await?;
+        }
+
+        if let Some(gid) = target_gid
+            && let Ok(c_path) = std::ffi::CString::new(dir_path.to_string_lossy().as_bytes())
+        {
+            unsafe {
+                if platform_lib::chown(c_path.as_ptr(), platform_lib::uid_t::MAX, gid) != 0 {
+                    let err = std::io::Error::last_os_error();
+                    log::warn!(
+                        "Failed to chown directory {:?} to gid {}: {}",
+                        dir_path,
+                        gid,
+                        err
+                    );
+                }
+            }
+        } else {
+            log::warn!("No suitable admin group found (tried admin, wheel, sudo)");
         }
     }
     #[cfg(windows)]
@@ -141,8 +164,9 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
 
     #[cfg(unix)]
     {
-        use platform_lib::{S_IRWXG, S_IRWXO, S_IRWXU, mode_t};
-        let mode: mode_t = platform_lib::mode_t::from(S_IRWXU | S_IRWXG | S_IRWXO);
+        use platform_lib::{S_IRGRP, S_IRUSR, S_IWGRP, S_IWUSR, mode_t};
+
+        let mode: mode_t = platform_lib::mode_t::from(S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
         let server = server.with_listener_mode(mode);
         Ok(server)
     }

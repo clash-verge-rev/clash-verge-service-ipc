@@ -135,7 +135,7 @@ pub async fn run_with_logging(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .pre_exec(|| {
-                platform_lib::umask(0o002);
+                platform_lib::umask(0o007);
                 Ok(())
             })
             .spawn()?
