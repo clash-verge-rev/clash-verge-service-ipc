@@ -21,6 +21,7 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
         let guard = IpcState::global().lock().await;
         guard.set_sender(shutdown_tx).await;
         guard.set_done(done_rx).await;
+        drop(guard);
     }
 
     let server_arc = IpcState::global().lock().await.get_server();

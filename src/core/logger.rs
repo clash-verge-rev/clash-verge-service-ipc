@@ -34,8 +34,7 @@ pub async fn set_or_update_writer(config: &WriterConfig) -> Result<()> {
     let new_writer = service_writer(config)?;
 
     if let Some(shared) = GLOBAL_WRITER.get() {
-        let mut guard = shared.lock().await;
-        *guard = new_writer;
+        *shared.lock().await = new_writer;
         Ok(())
     } else {
         GLOBAL_WRITER

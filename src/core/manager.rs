@@ -33,7 +33,7 @@ impl Drop for ChildGuard {
 }
 
 impl ChildGuard {
-    fn inner(&mut self) -> Option<&mut Child> {
+    const fn inner(&mut self) -> Option<&mut Child> {
         self.0.as_mut()
     }
 }
@@ -50,7 +50,8 @@ impl CoreManager {
     }
 
     pub async fn start_core(&self, config: ClashConfig) -> Result<()> {
-        if let Some(child) = self.running_child.lock().await.take() {
+        let value = self.running_child.lock().await.take();
+        if let Some(child) = value {
             info!("Core is already running, stopping existing instance");
             drop(child);
             LOGGER_MANAGER.clear_logs().await;
@@ -74,8 +75,7 @@ impl CoreManager {
         let child_guard =
             run_with_logging(&config.core_config.core_path, &args, &config.log_config).await?;
 
-        let mut child_lock = self.running_child.lock().await;
-        *child_lock = Some(child_guard);
+        *self.running_child.lock().await = Some(child_guard);
 
         self.after_start().await;
 
