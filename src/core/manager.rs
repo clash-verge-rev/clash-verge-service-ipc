@@ -77,8 +77,6 @@ impl CoreManager {
         let mut child_lock = self.running_child.lock().await;
         *child_lock = Some(child_guard);
 
-        self.after_start().await;
-
         Ok(())
     }
 
@@ -92,30 +90,6 @@ impl CoreManager {
         self.after_stop().await;
 
         Ok(())
-    }
-
-    pub async fn after_start(&self) {
-        #[cfg(unix)]
-        {
-            use std::fs::Permissions;
-            use std::os::unix::fs::PermissionsExt;
-            use std::path::Path;
-            use tokio::fs;
-
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(125)).await;
-                let target = Path::new("/tmp/verge/verge-mihomo.sock");
-                info!("Setting permissions for {:?}", target);
-                if !target.exists() {
-                    warn!("{:?} does not exist, skipping permission setting", target);
-                    return;
-                }
-                match fs::set_permissions(target, Permissions::from_mode(0o777)).await {
-                    Ok(_) => info!("Permissions set to 777 for {:?}", target),
-                    Err(e) => warn!("Failed to set permissions for {:?}: {}", target, e),
-                }
-            });
-        }
     }
 
     pub async fn after_stop(&self) {
@@ -147,11 +121,25 @@ pub async fn run_with_logging(
     set_or_update_writer(writer_config).await?;
     let shared_writer = get_writer().unwrap();
 
+    #[cfg(not(unix))]
     let child = Command::new(bin_path)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+
+    #[cfg(unix)]
+    let child = unsafe {
+        Command::new(bin_path)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .pre_exec(|| {
+                platform_lib::umask(0o002);
+                Ok(())
+            })
+            .spawn()?
+    };
 
     let mut child_guard = ChildGuard(Some(child));
 
