@@ -160,7 +160,13 @@ async fn init_ipc_state() -> Result<()> {
 fn create_ipc_server() -> Result<IpcHttpServer> {
     use crate::IPC_PATH;
 
+    #[cfg(unix)]
+    let prev_umask = unsafe { platform_lib::umask(0o007) };
     let server = IpcHttpServer::new(IPC_PATH)?;
+    #[cfg(unix)]
+    unsafe {
+        platform_lib::umask(prev_umask)
+    };
 
     #[cfg(unix)]
     {
