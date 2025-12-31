@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use compact_str::CompactString;
@@ -81,6 +81,10 @@ pub async fn connect() -> Result<IpcHttpClient> {
     try_connect().await
 }
 
+pub fn is_ipc_path_exists() -> bool {
+    Path::new(IPC_PATH).exists()
+}
+
 pub async fn get_version() -> Result<Response<String>> {
     let client = connect().await?;
     let response = client
@@ -90,6 +94,20 @@ pub async fn get_version() -> Result<Response<String>> {
         .await?
         .json::<Response<String>>()?;
     Ok(response)
+}
+
+pub async fn is_reinstall_service_needed() -> bool {
+    is_ipc_path_exists()
+        && match get_version().await {
+            Ok(resp) => {
+                if let Some(ver) = resp.data {
+                    ver != crate::VERSION
+                } else {
+                    true
+                }
+            }
+            Err(_) => true,
+        }
 }
 
 pub async fn start_clash(body: &ClashConfig) -> Result<Response<()>> {

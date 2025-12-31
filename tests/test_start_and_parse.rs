@@ -8,6 +8,36 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_reinstall_service_needed() {
+        #[cfg(unix)]
+        {
+            use std::fs::File;
+            use std::path::Path;
+
+            let _ = stop_ipc_server().await;
+
+            assert!(
+                !clash_verge_service_ipc::is_ipc_path_exists(),
+                "IPC path should not exist after stopping the server"
+            );
+
+            let ipc_path = Path::new(clash_verge_service_ipc::IPC_PATH);
+            File::create(ipc_path).unwrap();
+            assert!(
+                clash_verge_service_ipc::is_ipc_path_exists(),
+                "IPC path should exist after creating the file"
+            );
+
+            assert!(
+                clash_verge_service_ipc::is_reinstall_service_needed().await,
+                "Reinstall should be needed when IPC path exists but no server is running"
+            );
+            std::fs::remove_file(ipc_path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_start_and_parse() {
         let _ = stop_ipc_server().await;
 
