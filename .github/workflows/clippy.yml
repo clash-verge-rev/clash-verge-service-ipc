@@ -11,6 +11,7 @@ jobs:
   clippy:
     name: Clippy Check
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -58,6 +59,7 @@ jobs:
     needs: clippy
     name: Cargo Test
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
