@@ -29,6 +29,12 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
 
     if let Some(mut server) = guard.take() {
         let handle = tokio::spawn(async move {
+            #[cfg(unix)]
+            let res = tokio::select! {
+                res = unsafe{ platform_lib::umask(0o007); server.serve() } => res,
+                _ = &mut shutdown_rx => Ok(()),
+            };
+            #[cfg(not(unix))]
             let res = tokio::select! {
                 res = server.serve() => res,
                 _ = &mut shutdown_rx => Ok(()),
@@ -160,13 +166,7 @@ async fn init_ipc_state() -> Result<()> {
 fn create_ipc_server() -> Result<IpcHttpServer> {
     use crate::IPC_PATH;
 
-    #[cfg(unix)]
-    let prev_umask = unsafe { platform_lib::umask(0o007) };
     let server = IpcHttpServer::new(IPC_PATH)?;
-    #[cfg(unix)]
-    unsafe {
-        platform_lib::umask(prev_umask)
-    };
 
     #[cfg(unix)]
     {
