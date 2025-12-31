@@ -22,6 +22,7 @@ mod tests {
             );
 
             let ipc_path = Path::new(clash_verge_service_ipc::IPC_PATH);
+            std::fs::create_dir(ipc_path.parent().unwrap()).unwrap();
             File::create(ipc_path).unwrap();
             assert!(
                 clash_verge_service_ipc::is_ipc_path_exists(),
