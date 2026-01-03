@@ -119,7 +119,6 @@ pub async fn run_with_logging(
     writer_config: &WriterConfig,
 ) -> Result<ChildGuard> {
     set_or_update_writer(writer_config).await?;
-    let shared_writer = get_writer().unwrap();
 
     #[cfg(not(unix))]
     let child = Command::new(bin_path)
@@ -154,41 +153,43 @@ pub async fn run_with_logging(
         .and_then(|c| c.stderr.take())
         .unwrap();
 
-    let mut stdout_reader = BufReader::new(stdout).lines();
-    let shared_writer_clone = shared_writer.clone();
     tokio::spawn(async move {
-        let w = shared_writer_clone.lock().await;
+        let mut stdout_reader = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = stdout_reader.next_line().await {
             let message = CompactString::from(line.as_str());
             {
-                let mut now = DeferredNow::default();
-                let arg = format_args!("{}", line);
-                let record = Record::builder()
-                    .args(arg)
-                    .level(log::Level::Info)
-                    .target("service")
-                    .build();
-                let _ = w.write(&mut now, &record);
+                if let Some(shared_writer) = get_writer() {
+                    let w = shared_writer.lock().await;
+                    let mut now = DeferredNow::default();
+                    let arg = format_args!("{}", line);
+                    let record = Record::builder()
+                        .args(arg)
+                        .level(log::Level::Info)
+                        .target("service")
+                        .build();
+                    let _ = w.write(&mut now, &record);
+                }
             }
             LOGGER_MANAGER.append_log(message).await;
         }
     });
 
-    let mut stderr_reader = BufReader::new(stderr).lines();
-    let shared_writer_clone = shared_writer;
     tokio::spawn(async move {
-        let w = shared_writer_clone.lock().await;
+        let mut stderr_reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = stderr_reader.next_line().await {
             let message = CompactString::from(line.as_str());
             {
-                let mut now = DeferredNow::default();
-                let arg = format_args!("{}", line);
-                let record = Record::builder()
-                    .args(arg)
-                    .level(log::Level::Error)
-                    .target("service")
-                    .build();
-                let _ = w.write(&mut now, &record);
+                if let Some(shared_writer) = get_writer() {
+                    let w = shared_writer.lock().await;
+                    let mut now = DeferredNow::default();
+                    let arg = format_args!("{}", line);
+                    let record = Record::builder()
+                        .args(arg)
+                        .level(log::Level::Error)
+                        .target("service")
+                        .build();
+                    let _ = w.write(&mut now, &record);
+                }
             }
             LOGGER_MANAGER.append_log(message).await;
         }
