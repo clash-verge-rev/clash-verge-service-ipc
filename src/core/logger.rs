@@ -43,6 +43,6 @@ pub async fn set_or_update_writer(config: &WriterConfig) -> Result<()> {
     }
 }
 
-pub fn get_writer() -> Option<SharedWriter> {
-    GLOBAL_WRITER.get().cloned()
+pub fn get_writer() -> Option<&'static SharedWriter> {
+    GLOBAL_WRITER.get()
 }
