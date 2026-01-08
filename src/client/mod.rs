@@ -1,7 +1,6 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use compact_str::CompactString;
 use kode_bridge::{ClientConfig, IpcHttpClient};
 use log::{debug, warn};
 use once_cell::sync::Lazy;
@@ -119,17 +118,6 @@ pub async fn start_clash(body: &ClashConfig) -> Result<Response<()>> {
         .send()
         .await?
         .json::<Response<()>>()?;
-    Ok(response)
-}
-
-pub async fn get_clash_logs() -> Result<Response<Vec<CompactString>>> {
-    let client = connect().await?;
-    let response = client
-        .get(IpcCommand::GetClashLogs.as_ref())
-        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
-        .send()
-        .await?
-        .json::<Response<Vec<CompactString>>>()?;
     Ok(response)
 }
 

@@ -2,8 +2,6 @@ use crate::WriterConfig;
 use crate::core::ClashConfig;
 use crate::core::logger::{get_writer, set_or_update_writer};
 use anyhow::Result;
-use clash_verge_logger::AsyncLogger;
-use compact_str::CompactString;
 use flexi_logger::writers::LogWriter;
 use flexi_logger::{DeferredNow, Record};
 use once_cell::sync::Lazy;
@@ -54,7 +52,6 @@ impl CoreManager {
         if let Some(child) = value {
             info!("Core is already running, stopping existing instance");
             drop(child);
-            LOGGER_MANAGER.clear_logs().await;
         }
 
         info!("Starting core with config: {:?}", config);
@@ -82,7 +79,6 @@ impl CoreManager {
 
     pub async fn stop_core(&self) -> Result<()> {
         info!("Stopping core");
-        LOGGER_MANAGER.clear_logs().await;
 
         let child_guard = self.running_child.lock().await.take();
         drop(child_guard);
@@ -109,7 +105,6 @@ impl CoreManager {
                 Err(e) => warn!("Failed to remove {:?}: {}", target, e),
             }
         }
-        LOGGER_MANAGER.clear_logs().await;
     }
 }
 
@@ -156,42 +151,34 @@ pub async fn run_with_logging(
     tokio::spawn(async move {
         let mut stdout_reader = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = stdout_reader.next_line().await {
-            let message = CompactString::from(line.as_str());
-            {
-                if let Some(shared_writer) = get_writer() {
-                    let w = shared_writer.lock().await;
-                    let mut now = DeferredNow::default();
-                    let arg = format_args!("{}", line);
-                    let record = Record::builder()
-                        .args(arg)
-                        .level(log::Level::Info)
-                        .target("service")
-                        .build();
-                    let _ = w.write(&mut now, &record);
-                }
+            if let Some(shared_writer) = get_writer() {
+                let w = shared_writer.lock().await;
+                let mut now = DeferredNow::default();
+                let arg = format_args!("{}", line);
+                let record = Record::builder()
+                    .args(arg)
+                    .level(log::Level::Info)
+                    .target("service")
+                    .build();
+                let _ = w.write(&mut now, &record);
             }
-            LOGGER_MANAGER.append_log(message).await;
         }
     });
 
     tokio::spawn(async move {
         let mut stderr_reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = stderr_reader.next_line().await {
-            let message = CompactString::from(line.as_str());
-            {
-                if let Some(shared_writer) = get_writer() {
-                    let w = shared_writer.lock().await;
-                    let mut now = DeferredNow::default();
-                    let arg = format_args!("{}", line);
-                    let record = Record::builder()
-                        .args(arg)
-                        .level(log::Level::Error)
-                        .target("service")
-                        .build();
-                    let _ = w.write(&mut now, &record);
-                }
+            if let Some(shared_writer) = get_writer() {
+                let w = shared_writer.lock().await;
+                let mut now = DeferredNow::default();
+                let arg = format_args!("{}", line);
+                let record = Record::builder()
+                    .args(arg)
+                    .level(log::Level::Error)
+                    .target("service")
+                    .build();
+                let _ = w.write(&mut now, &record);
             }
-            LOGGER_MANAGER.append_log(message).await;
         }
     });
 
@@ -200,5 +187,3 @@ pub async fn run_with_logging(
 
 pub static CORE_MANAGER: Lazy<Arc<Mutex<CoreManager>>> =
     Lazy::new(|| Arc::new(Mutex::new(CoreManager::new())));
-
-pub static LOGGER_MANAGER: Lazy<Arc<AsyncLogger>> = Lazy::new(|| Arc::new(AsyncLogger::new()));

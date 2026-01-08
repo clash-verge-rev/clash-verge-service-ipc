@@ -1,7 +1,7 @@
 use super::state::IpcState;
 use crate::core::auth::ipc_request_context_to_auth_context;
 use crate::core::logger::set_or_update_writer;
-use crate::core::manager::{CORE_MANAGER, LOGGER_MANAGER};
+use crate::core::manager::CORE_MANAGER;
 use crate::core::structure::Response;
 use crate::{ClashConfig, IpcCommand, VERSION, WriterConfig};
 use http::StatusCode;
@@ -238,19 +238,6 @@ fn create_ipc_router() -> Result<Router> {
                     .text(format!("Invalid JSON: {}", e))
                     .build()),
             }
-        })
-        .get(IpcCommand::GetClashLogs.as_ref(), |ctx| async move {
-            trace!("Received GetClashLogs command");
-            ipc_request_context_to_auth_context(&ctx)?;
-            let json_value = Response {
-                code: 0,
-                message: "Success".to_string(),
-                data: Some(LOGGER_MANAGER.get_logs().await),
-            };
-            Ok(HttpResponse::builder()
-                .status(StatusCode::OK)
-                .json(&json_value)?
-                .build())
         })
         .delete(IpcCommand::StopClash.as_ref(), |ctx| async move {
             trace!("Received StopClash command");

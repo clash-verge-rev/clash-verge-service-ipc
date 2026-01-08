@@ -110,7 +110,6 @@ version = "2.0.29"
 dependencies = [
  "anyhow",
  "clash_verge_logger",
- "compact_str",
  "flexi_logger",
  "http",
  "kode-bridge",
@@ -141,7 +140,6 @@ dependencies = [
  "rkyv",
  "rustversion",
  "ryu",
- "serde",
  "smallvec",
  "static_assertions",
 ]
