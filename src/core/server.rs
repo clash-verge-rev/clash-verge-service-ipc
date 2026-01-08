@@ -97,8 +97,6 @@ async fn make_ipc_dir() -> Result<()> {
             fs::create_dir_all(dir_path).await?;
         }
 
-        fs::set_permissions(dir_path, Permissions::from_mode(0o750)).await?;
-
         let mut target_gid: Option<platform_lib::gid_t> = None;
         for group_name in &["admin", "wheel", "sudo"] {
             if let Ok(c_group) = std::ffi::CString::new(*group_name) {
@@ -129,6 +127,9 @@ async fn make_ipc_dir() -> Result<()> {
         } else {
             log::warn!("No suitable admin group found (tried admin, wheel, sudo)");
         }
+
+        // Ensure sockets inherit the directory group (setgid), so admin group access works.
+        fs::set_permissions(dir_path, Permissions::from_mode(0o2750)).await?;
     }
     #[cfg(windows)]
     {
