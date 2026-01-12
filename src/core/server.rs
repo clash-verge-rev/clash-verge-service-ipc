@@ -88,14 +88,19 @@ const ADMIN_GROUPS: [&str; 3] = ["sudo", "wheel", "admin"];
 
 #[cfg(unix)]
 fn resolve_ipc_gid() -> platform_lib::gid_t {
-    if let Ok(gid) = std::env::var("SUDO_GID").and_then(|v| v.parse::<u32>()) {
+    if let Some(gid) = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
         return gid as platform_lib::gid_t;
     }
 
-    if let Ok(uid) = std::env::var("SUDO_UID").and_then(|v| v.parse::<u32>()) {
-        if let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid)) {
-            return user.gid.as_raw() as platform_lib::gid_t;
-        }
+    if let Some(uid) = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        && let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid))
+    {
+        return user.gid.as_raw() as platform_lib::gid_t;
     }
 
     for group in ADMIN_GROUPS {
