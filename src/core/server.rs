@@ -143,8 +143,8 @@ async fn make_ipc_dir() -> Result<()> {
             }
         }
 
-        // Set the setgid bit so that created sockets inherit the group and remain accessible to admins.
-        fs::set_permissions(dir_path, Permissions::from_mode(0o2770)).await?;
+        // Ensure sockets inherit the directory group (setgid), so admin group access works.
+        fs::set_permissions(dir_path, Permissions::from_mode(0o2750)).await?;
     }
     #[cfg(windows)]
     {
