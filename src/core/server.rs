@@ -118,14 +118,14 @@ async fn make_ipc_dir() -> Result<()> {
                                 let entry = entry.ok()?;
                                 let name = entry.file_name().into_string().ok()?;
                                 let uid = name.parse::<u32>().ok()?;
-                                if uid >= 1000 && uid < 65534 {
+                                if (1000..65534).contains(&uid) {
                                     entry.metadata().ok().map(|m| m.gid())
                                 } else {
                                     None
                                 }
                             })
                         })
-                        .unwrap_or_else(|_| unsafe { platform_lib::getgid() })
+                        .unwrap_or_else(|| unsafe { platform_lib::getgid() })
                 }
             });
 
