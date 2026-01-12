@@ -110,7 +110,22 @@ async fn make_ipc_dir() -> Result<()> {
                 }
                 #[cfg(target_os = "linux")]
                 {
-                    unsafe { platform_lib::getgid() }
+                    use std::os::unix::fs::MetadataExt;
+                    std::fs::read_dir("/run/user")
+                        .ok()
+                        .and_then(|mut entries| {
+                            entries.find_map(|entry| {
+                                let entry = entry.ok()?;
+                                let name = entry.file_name().into_string().ok()?;
+                                let uid = name.parse::<u32>().ok()?;
+                                if uid >= 1000 && uid < 65534 {
+                                    entry.metadata().ok().map(|m| m.gid())
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .unwrap_or_else(|_| unsafe { platform_lib::getgid() })
                 }
             });
 
