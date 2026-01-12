@@ -10,6 +10,9 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{info, trace};
 
+#[cfg(unix)]
+use nix::unistd::{Group, Uid, User};
+
 pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     make_ipc_dir().await?;
     cleanup_ipc_path().await?;
@@ -80,6 +83,30 @@ pub async fn stop_ipc_server() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+const ADMIN_GROUPS: [&str; 3] = ["sudo", "wheel", "admin"];
+
+#[cfg(unix)]
+fn resolve_ipc_gid() -> platform_lib::gid_t {
+    if let Ok(gid) = std::env::var("SUDO_GID").and_then(|v| v.parse::<u32>()) {
+        return gid as platform_lib::gid_t;
+    }
+
+    if let Ok(uid) = std::env::var("SUDO_UID").and_then(|v| v.parse::<u32>()) {
+        if let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid)) {
+            return user.gid.as_raw() as platform_lib::gid_t;
+        }
+    }
+
+    for group in ADMIN_GROUPS {
+        if let Ok(Some(group)) = Group::from_name(group) {
+            return group.gid.as_raw() as platform_lib::gid_t;
+        }
+    }
+
+    unsafe { platform_lib::getgid() }
+}
+
 async fn make_ipc_dir() -> Result<()> {
     #[cfg(unix)]
     {
@@ -97,37 +124,7 @@ async fn make_ipc_dir() -> Result<()> {
             fs::create_dir_all(dir_path).await?;
         }
 
-        let gid = std::env::var("SUDO_GID")
-            .ok()
-            .and_then(|v| v.parse::<platform_lib::gid_t>().ok())
-            .unwrap_or_else(|| {
-                #[cfg(target_os = "macos")]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    std::fs::metadata("/dev/console")
-                        .map(|m| m.gid())
-                        .unwrap_or_else(|_| unsafe { platform_lib::getgid() })
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    std::fs::read_dir("/run/user")
-                        .ok()
-                        .and_then(|mut entries| {
-                            entries.find_map(|entry| {
-                                let entry = entry.ok()?;
-                                let name = entry.file_name().into_string().ok()?;
-                                let uid = name.parse::<u32>().ok()?;
-                                if (1000..65534).contains(&uid) {
-                                    entry.metadata().ok().map(|m| m.gid())
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                        .unwrap_or_else(|| unsafe { platform_lib::getgid() })
-                }
-            });
+        let gid = resolve_ipc_gid();
 
         if let Ok(c_path) = std::ffi::CString::new(dir_path.to_string_lossy().as_bytes()) {
             unsafe {
