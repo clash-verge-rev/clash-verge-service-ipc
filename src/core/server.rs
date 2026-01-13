@@ -97,7 +97,11 @@ async fn make_ipc_dir() -> Result<()> {
             fs::create_dir_all(dir_path).await?;
         }
 
-        let gid = unsafe { platform_lib::getgid() };
+        // We need to ensure compatibility with sudo GID through the terminal
+        let gid = std::env::var("SUDO_GID")
+            .ok()
+            .and_then(|s| s.parse::<platform_lib::gid_t>().ok())
+            .unwrap_or_else(|| unsafe { platform_lib::getgid() });
 
         if let Ok(c_path) = std::ffi::CString::new(dir_path.to_string_lossy().as_bytes()) {
             unsafe {
