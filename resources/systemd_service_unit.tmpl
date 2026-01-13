@@ -4,7 +4,8 @@ After=network-online.target nftables.service iptables.service
 
 [Service]
 Type=simple
-ExecStart={}
+ExecStart={exec_start}
+Group={group}
 Restart=always
 RestartSec=5
 

@@ -97,37 +97,11 @@ async fn make_ipc_dir() -> Result<()> {
             fs::create_dir_all(dir_path).await?;
         }
 
+        // We need to ensure compatibility with sudo GID through the terminal
         let gid = std::env::var("SUDO_GID")
             .ok()
-            .and_then(|v| v.parse::<platform_lib::gid_t>().ok())
-            .unwrap_or_else(|| {
-                #[cfg(target_os = "macos")]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    std::fs::metadata("/dev/console")
-                        .map(|m| m.gid())
-                        .unwrap_or_else(|_| unsafe { platform_lib::getgid() })
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    std::fs::read_dir("/run/user")
-                        .ok()
-                        .and_then(|mut entries| {
-                            entries.find_map(|entry| {
-                                let entry = entry.ok()?;
-                                let name = entry.file_name().into_string().ok()?;
-                                let uid = name.parse::<u32>().ok()?;
-                                if (1000..65534).contains(&uid) {
-                                    entry.metadata().ok().map(|m| m.gid())
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                        .unwrap_or_else(|| unsafe { platform_lib::getgid() })
-                }
-            });
+            .and_then(|s| s.parse::<platform_lib::gid_t>().ok())
+            .unwrap_or_else(|| unsafe { platform_lib::getgid() });
 
         if let Ok(c_path) = std::ffi::CString::new(dir_path.to_string_lossy().as_bytes()) {
             unsafe {
@@ -143,7 +117,7 @@ async fn make_ipc_dir() -> Result<()> {
             }
         }
 
-        // Ensure sockets inherit the directory group (setgid), so admin group access works.
+        // Ensure sockets inherit the directory group (setgid), so group access works.
         fs::set_permissions(dir_path, Permissions::from_mode(0o2750)).await?;
     }
     #[cfg(windows)]
