@@ -97,22 +97,13 @@ async fn make_ipc_dir() -> Result<()> {
             fs::create_dir_all(dir_path).await?;
         }
 
-        let mut target_gid: Option<platform_lib::gid_t> = None;
-        for group_name in &["admin", "wheel", "sudo"] {
-            if let Ok(c_group) = std::ffi::CString::new(*group_name) {
-                unsafe {
-                    let grp = platform_lib::getgrnam(c_group.as_ptr());
-                    if !grp.is_null() {
-                        target_gid = Some((*grp).gr_gid);
-                        break;
-                    }
-                }
-            }
-        }
+        // We need to ensure compatibility with sudo GID through the terminal
+        let gid = std::env::var("SUDO_GID")
+            .ok()
+            .and_then(|s| s.parse::<platform_lib::gid_t>().ok())
+            .unwrap_or_else(|| unsafe { platform_lib::getgid() });
 
-        if let Some(gid) = target_gid
-            && let Ok(c_path) = std::ffi::CString::new(dir_path.to_string_lossy().as_bytes())
-        {
+        if let Ok(c_path) = std::ffi::CString::new(dir_path.to_string_lossy().as_bytes()) {
             unsafe {
                 if platform_lib::chown(c_path.as_ptr(), platform_lib::uid_t::MAX, gid) != 0 {
                     let err = std::io::Error::last_os_error();
@@ -124,11 +115,9 @@ async fn make_ipc_dir() -> Result<()> {
                     );
                 }
             }
-        } else {
-            log::warn!("No suitable admin group found (tried admin, wheel, sudo)");
         }
 
-        // Ensure sockets inherit the directory group (setgid), so admin group access works.
+        // Ensure sockets inherit the directory group (setgid), so group access works.
         fs::set_permissions(dir_path, Permissions::from_mode(0o2750)).await?;
     }
     #[cfg(windows)]
