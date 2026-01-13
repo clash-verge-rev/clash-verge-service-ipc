@@ -10,8 +10,6 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{info, trace};
 
-#[cfg(unix)]
-use nix::unistd::{Group, Uid, User};
 
 pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     make_ipc_dir().await?;
@@ -83,35 +81,6 @@ pub async fn stop_ipc_server() -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-const ADMIN_GROUPS: [&str; 3] = ["sudo", "wheel", "admin"];
-
-#[cfg(unix)]
-fn resolve_ipc_gid() -> platform_lib::gid_t {
-    if let Some(gid) = std::env::var("SUDO_GID")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-    {
-        return gid as platform_lib::gid_t;
-    }
-
-    if let Some(uid) = std::env::var("SUDO_UID")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        && let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid))
-    {
-        return user.gid.as_raw() as platform_lib::gid_t;
-    }
-
-    for group in ADMIN_GROUPS {
-        if let Ok(Some(group)) = Group::from_name(group) {
-            return group.gid.as_raw() as platform_lib::gid_t;
-        }
-    }
-
-    unsafe { platform_lib::getgid() }
-}
-
 async fn make_ipc_dir() -> Result<()> {
     #[cfg(unix)]
     {
@@ -129,7 +98,7 @@ async fn make_ipc_dir() -> Result<()> {
             fs::create_dir_all(dir_path).await?;
         }
 
-        let gid = resolve_ipc_gid();
+        let gid = unsafe { platform_lib::getgid() };
 
         if let Ok(c_path) = std::ffi::CString::new(dir_path.to_string_lossy().as_bytes()) {
             unsafe {
@@ -145,7 +114,7 @@ async fn make_ipc_dir() -> Result<()> {
             }
         }
 
-        // Ensure sockets inherit the directory group (setgid), so admin group access works.
+        // Ensure sockets inherit the directory group (setgid), so group access works.
         fs::set_permissions(dir_path, Permissions::from_mode(0o2750)).await?;
     }
     #[cfg(windows)]

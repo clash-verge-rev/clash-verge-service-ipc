@@ -4,7 +4,11 @@ After=network-online.target nftables.service iptables.service
 
 [Service]
 Type=simple
-ExecStart={}
+ExecStart={exec_start}
+Group={group}
+UMask=007
+RuntimeDirectory=verge
+RuntimeDirectoryMode=2750
 Restart=always
 RestartSec=5
 
