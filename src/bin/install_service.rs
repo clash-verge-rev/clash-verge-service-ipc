@@ -10,8 +10,8 @@ fn env_u32(key: &str) -> Option<u32> {
     std::env::var(key).ok()?.parse().ok()
 }
 
-#[cfg(target_os = "macos")]
-fn resolve_launchd_group_name() -> String {
+#[cfg(unix)]
+fn resolve_service_group_name() -> String {
     use nix::unistd::{Gid, Group, Uid, User, getgid};
 
     if let Some(uid) = env_u32("SUDO_UID") {
@@ -32,7 +32,7 @@ fn resolve_launchd_group_name() -> String {
         return group.name;
     }
 
-    "wheel".to_string()
+    panic!("Please use sudo to install service.");
 }
 
 #[cfg(target_os = "macos")]
@@ -89,7 +89,7 @@ fn main() -> Result<(), Error> {
 
     let launchd_plist_content = format!(
         include_str!("../../resources/launchd.plist.tmpl"),
-        group_name = resolve_launchd_group_name()
+        group_name = resolve_service_group_name()
     );
 
     File::create(plist_file)
@@ -142,23 +142,6 @@ fn main() -> Result<(), Error> {
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_systemd_group_gid() -> u32 {
-    use nix::unistd::{Uid, User, getgid};
-
-    if let Some(uid) = env_u32("SUDO_UID")
-        && let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid))
-    {
-        return user.gid.as_raw();
-    }
-
-    if let Some(gid) = env_u32("SUDO_GID") {
-        return gid;
-    }
-
-    getgid().as_raw()
-}
-
-#[cfg(target_os = "linux")]
 fn main() -> Result<(), Error> {
     const SERVICE_NAME: &str = "clash-verge-service";
     use std::env;
@@ -203,7 +186,7 @@ fn main() -> Result<(), Error> {
     let unit_file_content = format!(
         include_str!("../../resources/systemd_service_unit.tmpl"),
         exec_start = service_binary_path.to_str().unwrap(),
-        group = resolve_systemd_group_gid()
+        group = resolve_service_group_name()
     );
 
     File::create(unit_file)
