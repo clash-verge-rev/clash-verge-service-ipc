@@ -12,7 +12,7 @@ fn env_u32(key: &str) -> Option<u32> {
 
 #[cfg(unix)]
 fn resolve_service_group_name() -> String {
-    use nix::unistd::{Gid, Group, Uid, User, getgid};
+    use nix::unistd::{Gid, Group, Uid, User};
 
     if let Some(uid) = env_u32("SUDO_UID") {
         if let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid)) {
@@ -26,10 +26,6 @@ fn resolve_service_group_name() -> String {
         if let Ok(Some(group)) = Group::from_gid(Gid::from_raw(gid)) {
             return group.name;
         }
-    }
-
-    if let Ok(Some(group)) = Group::from_gid(getgid()) {
-        return group.name;
     }
 
     panic!("Please use sudo to install service.");
