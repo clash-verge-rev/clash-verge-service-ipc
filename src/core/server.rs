@@ -10,7 +10,6 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{info, trace};
 
-
 pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     make_ipc_dir().await?;
     cleanup_ipc_path().await?;

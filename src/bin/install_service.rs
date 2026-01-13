@@ -12,7 +12,7 @@ fn env_u32(key: &str) -> Option<u32> {
 
 #[cfg(target_os = "macos")]
 fn resolve_launchd_group_name() -> String {
-    use nix::unistd::{getgid, Gid, Group, Uid, User};
+    use nix::unistd::{Gid, Group, Uid, User, getgid};
 
     if let Some(uid) = env_u32("SUDO_UID") {
         if let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid)) {
@@ -143,12 +143,12 @@ fn main() -> Result<(), Error> {
 
 #[cfg(target_os = "linux")]
 fn resolve_systemd_group_gid() -> u32 {
-    use nix::unistd::{getgid, Uid, User};
+    use nix::unistd::{Uid, User, getgid};
 
-    if let Some(uid) = env_u32("SUDO_UID") {
-        if let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid)) {
-            return user.gid.as_raw();
-        }
+    if let Some(uid) = env_u32("SUDO_UID")
+        && let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid))
+    {
+        return user.gid.as_raw();
     }
 
     if let Some(gid) = env_u32("SUDO_GID") {
