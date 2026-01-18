@@ -14,6 +14,12 @@ fn env_u32(key: &str) -> Option<u32> {
 fn resolve_service_group_name() -> String {
     use nix::unistd::{Gid, Group, Uid, User};
 
+    if let Some(gid) = env_u32("CLASH_VERGE_SERVICE_GID")
+        && let Ok(Some(group)) = Group::from_gid(Gid::from_raw(gid))
+    {
+        return group.name;
+    }
+
     if let Some(uid) = env_u32("SUDO_UID")
         && let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid))
         && let Ok(Some(group)) = Group::from_gid(user.gid)
