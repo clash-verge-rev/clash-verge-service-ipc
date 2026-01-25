@@ -117,8 +117,13 @@ async fn make_ipc_dir() -> Result<()> {
             }
         }
 
-        // Ensure sockets inherit the directory group (setgid), so group access works.
-        fs::set_permissions(dir_path, Permissions::from_mode(0o2750)).await?;
+        // See issues in https://github.com/clash-verge-rev/clash-verge-rev/issues/6149
+        // Apply the SetGID bit (0o2000) to ensure the IPC socket inherits the directory's group ID.
+        // The mode is set to 0o2770 (rwxrws---) to permit the designated user group (e.g., staff
+        // on macOS or the primary group on Linux) to manage the socket's lifecycle. This prevents
+        // permission denied errors when the GUI process, running with non-root privileges,
+        // attempts to recreate the socket during service initialization or sidecar fallbacks.
+        fs::set_permissions(dir_path, Permissions::from_mode(0o2770)).await?;
     }
     #[cfg(windows)]
     {
