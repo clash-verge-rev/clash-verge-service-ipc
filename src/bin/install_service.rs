@@ -20,7 +20,7 @@ fn resolve_service_group_name() -> String {
         return group.name;
     }
 
-    if let Some(uid) = env_u32("SUDO_UID")
+    if let Some(uid) = env_u32("SUDO_UID").or_else(|| env_u32("PKEXEC_UID"))
         && let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid))
         && let Ok(Some(group)) = Group::from_gid(user.gid)
     {
@@ -33,7 +33,7 @@ fn resolve_service_group_name() -> String {
         return group.name;
     }
 
-    panic!("Please use sudo to install service.");
+    panic!("Please use sudo or pkexec to install service.");
 }
 
 #[cfg(target_os = "macos")]
