@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "clash_verge_service_ipc"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "anyhow",
  "clash_verge_logger",
