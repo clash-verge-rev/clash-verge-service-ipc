@@ -11,14 +11,20 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 use tokio::{io::BufReader, process::Command};
-use tokio::{process::Child, sync::Mutex};
+use tokio::{process::Child, sync::Mutex, task::JoinHandle};
 use tracing::{info, warn};
 
-pub struct ChildGuard(Option<Child>);
+pub struct ChildGuard {
+    child: Option<Child>,
+    readers: Vec<JoinHandle<()>>,
+}
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        for reader in self.readers.drain(..) {
+            reader.abort();
+        }
+        if let Some(mut child) = self.child.take() {
             tokio::spawn(async move {
                 if let Err(e) = child.kill().await {
                     warn!("Failed to kill child ({:?}): {e}", child.id());
@@ -34,7 +40,7 @@ impl Drop for ChildGuard {
 
 impl ChildGuard {
     const fn inner(&mut self) -> Option<&mut Child> {
-        self.0.as_mut()
+        self.child.as_mut()
     }
 }
 
@@ -140,7 +146,10 @@ pub async fn run_with_logging(
             .spawn()?
     };
 
-    let mut child_guard = ChildGuard(Some(child));
+    let mut child_guard = ChildGuard {
+        child: Some(child),
+        readers: Vec::new(),
+    };
 
     let (Some(stdout), Some(stderr)) = (
         child_guard.inner().as_mut().and_then(|c| c.stdout.take()),
@@ -149,7 +158,7 @@ pub async fn run_with_logging(
         return Err(anyhow!("Failed to capture child output"));
     };
 
-    tokio::spawn(async move {
+    let stdout_handle = tokio::spawn(async move {
         let mut stdout_reader = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = stdout_reader.next_line().await {
             let message = CompactString::from(line.as_str());
@@ -170,7 +179,7 @@ pub async fn run_with_logging(
         }
     });
 
-    tokio::spawn(async move {
+    let stderr_handle = tokio::spawn(async move {
         let mut stderr_reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = stderr_reader.next_line().await {
             let message = CompactString::from(line.as_str());
@@ -190,6 +199,9 @@ pub async fn run_with_logging(
             LOGGER_MANAGER.append_log(message).await;
         }
     });
+
+    child_guard.readers.push(stdout_handle);
+    child_guard.readers.push(stderr_handle);
 
     Ok(child_guard)
 }

@@ -31,8 +31,8 @@ impl Default for IpcConfig {
     fn default() -> Self {
         Self {
             default_timeout: Duration::from_millis(50),
-            max_retries: 6,
-            retry_delay: Duration::from_millis(125),
+            max_retries: 8,
+            retry_delay: Duration::from_millis(150),
         }
     }
 }
@@ -60,7 +60,7 @@ async fn try_connect() -> Result<IpcHttpClient> {
             default_timeout: c.default_timeout,
             max_retries: c.max_retries,
             retry_delay: c.retry_delay,
-            enable_pooling: false,
+            enable_pooling: true,
             ..Default::default()
         },
     )?;
@@ -113,9 +113,10 @@ pub async fn is_reinstall_service_needed() -> bool {
 
 pub async fn start_clash(body: &ClashConfig) -> Result<Response<()>> {
     let client = connect().await?;
+    let payload = body.to_json_value()?;
     let response = client
         .post(IpcCommand::StartClash.as_ref())
-        .json_body(&body.to_json_value()?)
+        .json_body(&payload)
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
@@ -147,9 +148,10 @@ pub async fn stop_clash() -> Result<Response<()>> {
 
 pub async fn update_writer(body: &WriterConfig) -> Result<Response<()>> {
     let client = connect().await?;
+    let payload = body.to_json_value()?;
     let response = client
         .put(IpcCommand::UpdateWriter.as_ref())
-        .json_body(&body.to_json_value()?)
+        .json_body(&payload)
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
