@@ -5,6 +5,7 @@ mod tests {
     use clash_verge_service_ipc::{IPC_PATH, IpcCommand, run_ipc_server, stop_ipc_server};
     use kode_bridge::IpcHttpClient;
     use serial_test::serial;
+    use tokio::time::{Duration, sleep};
     use tracing::debug;
 
     async fn connect_ipc() -> Result<IpcHttpClient> {
@@ -43,10 +44,7 @@ mod tests {
             );
         });
 
-        let client = {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            connect_ipc().await
-        };
+        let client = wait_connect_with_retry().await;
 
         assert!(
             client.is_ok(),
@@ -82,7 +80,8 @@ mod tests {
 
             let handle = run_ipc_server().await.unwrap();
 
-            assert!(connect_ipc().await.is_ok(), "Should connect after starting");
+            let client = wait_connect_with_retry().await;
+            assert!(client.is_ok(), "Should connect after starting");
 
             stop_ipc_server().await.unwrap();
 
@@ -90,5 +89,19 @@ mod tests {
             let res = handle.await.unwrap();
             assert!(res.is_ok(), "server should exit cleanly");
         }
+    }
+
+    async fn wait_connect_with_retry() -> Result<IpcHttpClient> {
+        let mut last = None;
+        for _ in 0..10 {
+            match connect_ipc().await {
+                Ok(c) => return Ok(c),
+                Err(e) => {
+                    last = Some(e);
+                    sleep(Duration::from_millis(150)).await;
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("connect failed")))
     }
 }
