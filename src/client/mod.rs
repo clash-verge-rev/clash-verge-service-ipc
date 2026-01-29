@@ -1,5 +1,8 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
+#[cfg(windows)]
+use anyhow::Result;
+#[cfg(unix)]
 use anyhow::{Result, anyhow};
 use compact_str::CompactString;
 use kode_bridge::{ClientConfig, IpcHttpClient};
