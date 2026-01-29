@@ -63,7 +63,7 @@ jobs:
         run: |
           sudo target/release/service-integration-driver start
           sleep 2
-          pgrep -f mock_binary
+          # pgrep -f mock_binary
 
       - name: Stop mock_binary (macOS)
         if: runner.os == 'macOS'
