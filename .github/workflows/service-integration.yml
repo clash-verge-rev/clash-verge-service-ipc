@@ -61,13 +61,13 @@ jobs:
       - name: Run mock_binary (macOS)
         if: runner.os == 'macOS'
         run: |
-          target/release/service-integration-driver start
+          sudo target/release/service-integration-driver start
           sleep 2
           pgrep -f mock_binary
 
       - name: Stop mock_binary (macOS)
         if: runner.os == 'macOS'
-        run: target/release/service-integration-driver stop
+        run: sudo target/release/service-integration-driver stop
 
       - name: Uninstall service (macOS)
         if: runner.os == 'macOS'
@@ -91,7 +91,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & "$env:GITHUB_WORKSPACE\\target\\release\\service-integration-driver.exe" start
+          Start-Process "$env:GITHUB_WORKSPACE\\target\\release\\service-integration-driver.exe" -ArgumentList "start" -Wait
           Start-Sleep -Seconds 2
           Get-Process -Name mock_binary
 
@@ -99,7 +99,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & "$env:GITHUB_WORKSPACE\\target\\release\\service-integration-driver.exe" stop
+          Start-Process "$env:GITHUB_WORKSPACE\\target\\release\\service-integration-driver.exe" -ArgumentList "stop" -Wait
 
       - name: Uninstall service (Windows)
         if: runner.os == 'Windows'
