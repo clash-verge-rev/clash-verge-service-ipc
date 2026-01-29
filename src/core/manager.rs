@@ -1,7 +1,7 @@
 use crate::WriterConfig;
 use crate::core::ClashConfig;
 use crate::core::logger::{get_writer, set_or_update_writer};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clash_verge_logger::AsyncLogger;
 use compact_str::CompactString;
 use flexi_logger::writers::LogWriter;
@@ -142,16 +142,12 @@ pub async fn run_with_logging(
 
     let mut child_guard = ChildGuard(Some(child));
 
-    let stdout = child_guard
-        .inner()
-        .as_mut()
-        .and_then(|c| c.stdout.take())
-        .unwrap();
-    let stderr = child_guard
-        .inner()
-        .as_mut()
-        .and_then(|c| c.stderr.take())
-        .unwrap();
+    let (Some(stdout), Some(stderr)) = (
+        child_guard.inner().as_mut().and_then(|c| c.stdout.take()),
+        child_guard.inner().as_mut().and_then(|c| c.stderr.take()),
+    ) else {
+        return Err(anyhow!("Failed to capture child output"));
+    };
 
     tokio::spawn(async move {
         let mut stdout_reader = BufReader::new(stdout).lines();

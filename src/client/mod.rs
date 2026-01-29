@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use compact_str::CompactString;
 use kode_bridge::{ClientConfig, IpcHttpClient};
 use log::{debug, warn};
@@ -42,14 +42,12 @@ pub async fn set_config(config: Option<IpcConfig>) {
 async fn try_connect() -> Result<IpcHttpClient> {
     debug!("Connecting to IPC at {}", IPC_PATH);
 
-    //? Maybe we should check the path existence outside?
-    // if let Err(e) = Path::metadata(IPC_PATH.as_ref()) {
-    //     warn!("Clash Verge Service IPC path does not exist: {}", e);
-    //     return Err(anyhow::anyhow!(
-    //         "Clash Verge Service IPC path does not exist: {}",
-    //         e
-    //     ));
-    // }
+    #[cfg(unix)]
+    {
+        if let Err(err) = Path::metadata(IPC_PATH.as_ref()) {
+            return Err(anyhow!("IPC path unavailable: {err}"));
+        }
+    }
 
     let c = { CLIENT_CONFIG.read().await.clone() }.unwrap_or_default();
     debug!("Using config: {:?}", c);
