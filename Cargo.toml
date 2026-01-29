@@ -29,6 +29,11 @@ name = "mock_binary"
 path = "src/bin/mock_binary.rs"
 required-features = ["test"]
 
+[[bin]]
+name = "service-integration-driver"
+path = "src/bin/service_integration_driver.rs"
+required-features = ["client"]
+
 [features]
 standalone = [
     "kode-bridge",
