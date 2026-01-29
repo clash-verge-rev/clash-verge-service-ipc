@@ -73,6 +73,8 @@ pub async fn stop_ipc_server() -> Result<()> {
     }
 
     cleanup_ipc_path().await?;
+    #[cfg(windows)]
+    tokio::time::sleep(std::time::Duration::from_millis(70)).await;
 
     Ok(())
 }
