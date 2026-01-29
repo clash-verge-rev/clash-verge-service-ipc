@@ -1,0 +1,108 @@
+name: Service Integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  service-flow:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Build binaries
+        run: cargo build --release --features "standalone client test"
+
+      - name: Install service (Linux)
+        if: runner.os == 'Linux'
+        run: sudo target/release/clash-verge-service-install --debug
+
+      - name: Verify service (Linux)
+        if: runner.os == 'Linux'
+        run: sudo systemctl is-active clash-verge-service.service
+
+      - name: Run mock_binary (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          target/release/service-integration-driver start
+          sleep 2
+          pgrep -f mock_binary
+
+      - name: Stop mock_binary (Linux)
+        if: runner.os == 'Linux'
+        run: target/release/service-integration-driver stop
+
+      - name: Uninstall service (Linux)
+        if: runner.os == 'Linux'
+        run: sudo target/release/clash-verge-service-uninstall --debug
+
+      - name: Install service (macOS)
+        if: runner.os == 'macOS'
+        run: sudo target/release/clash-verge-service-install --debug
+
+      - name: Verify service (macOS)
+        if: runner.os == 'macOS'
+        run: sudo launchctl list | grep io.github.clash-verge-rev.clash-verge-rev.service
+
+      - name: Run mock_binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          target/release/service-integration-driver start
+          sleep 2
+          pgrep -f mock_binary
+
+      - name: Stop mock_binary (macOS)
+        if: runner.os == 'macOS'
+        run: target/release/service-integration-driver stop
+
+      - name: Uninstall service (macOS)
+        if: runner.os == 'macOS'
+        run: sudo target/release/clash-verge-service-uninstall --debug
+
+      - name: Install service (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\\target\\release\\clash-verge-service-install.exe"
+          Start-Sleep -Seconds 2
+
+      - name: Verify service (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $state = sc query clash_verge_service | Select-String "STATE"
+          if ($state -notmatch "RUNNING") { exit 1 }
+
+      - name: Run mock_binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\\target\\release\\service-integration-driver.exe" start
+          Start-Sleep -Seconds 2
+          Get-Process -Name mock_binary
+
+      - name: Stop mock_binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\\target\\release\\service-integration-driver.exe" stop
+
+      - name: Uninstall service (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\\target\\release\\clash-verge-service-uninstall.exe"
