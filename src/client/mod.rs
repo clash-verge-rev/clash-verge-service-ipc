@@ -42,7 +42,7 @@ pub async fn set_config(config: Option<IpcConfig>) {
     *guard = config;
 }
 
-async fn try_connect() -> Result<IpcHttpClient> {
+pub async fn connect() -> Result<IpcHttpClient> {
     debug!("Connecting to IPC at {}", IPC_PATH);
 
     #[cfg(unix)]
@@ -76,10 +76,6 @@ async fn try_connect() -> Result<IpcHttpClient> {
     }
 
     Ok(client)
-}
-
-pub async fn connect() -> Result<IpcHttpClient> {
-    try_connect().await
 }
 
 pub fn is_ipc_path_exists() -> bool {
