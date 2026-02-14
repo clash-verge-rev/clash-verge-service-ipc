@@ -1,12 +1,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
-#[cfg(windows)]
 use anyhow::Result;
-#[cfg(unix)]
-use anyhow::{Result, anyhow};
 use compact_str::CompactString;
-use kode_bridge::{ClientConfig, IpcHttpClient};
-use log::{debug, warn};
 use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 
@@ -15,6 +10,7 @@ use crate::{
     core::structure::{JsonConvert, Response},
 };
 
+static DEFAULT_IPC_CONFIG: Lazy<IpcConfig> = Lazy::new(IpcConfig::default);
 static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> =
     Lazy::new(|| Arc::new(RwLock::new(None)));
 
@@ -42,54 +38,23 @@ pub async fn set_config(config: Option<IpcConfig>) {
     *guard = config;
 }
 
-pub async fn connect() -> Result<IpcHttpClient> {
-    debug!("Connecting to IPC at {}", IPC_PATH);
-
-    #[cfg(unix)]
-    {
-        if let Err(err) = Path::metadata(IPC_PATH.as_ref()) {
-            return Err(anyhow!("IPC path unavailable: {err}"));
-        }
-    }
-
-    let c = { CLIENT_CONFIG.read().await.clone() }.unwrap_or_default();
-    debug!("Using config: {:?}", c);
-    let client = kode_bridge::IpcHttpClient::with_config(
-        IPC_PATH,
-        ClientConfig {
-            default_timeout: c.default_timeout,
-            max_retries: c.max_retries,
-            retry_delay: c.retry_delay,
-            enable_pooling: true,
-            ..Default::default()
-        },
-    )?;
-
-    if let Err(e) = client
-        .get(IpcCommand::Magic.as_ref())
-        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
-        .send()
-        .await
-    {
-        warn!("Failed to connect to IPC server: {}", e);
-        return Err(anyhow::anyhow!("Failed to connect to IPC server: {}", e));
-    }
-
-    Ok(client)
-}
-
 pub fn is_ipc_path_exists() -> bool {
     Path::new(IPC_PATH).exists()
 }
 
+pub async fn connect() -> Result<reqwest::Client> {
+    build_client().await.map_err(Into::into)
+}
+
 pub async fn get_version() -> Result<Response<String>> {
-    let client = connect().await?;
-    let response = client
+    let response = build_client()
+        .await?
         .get(IpcCommand::GetVersion.as_ref())
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
-        .json::<Response<String>>()?;
+        .json::<Response<String>>()
+        .await?;
     Ok(response)
 }
 
@@ -108,49 +73,92 @@ pub async fn is_reinstall_service_needed() -> bool {
 }
 
 pub async fn start_clash(body: &ClashConfig) -> Result<Response<()>> {
-    let client = connect().await?;
+    let client = build_client().await?;
     let payload = body.to_json_value()?;
     let response = client
         .post(IpcCommand::StartClash.as_ref())
-        .json_body(&payload)
+        .json(&payload)
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
-        .json::<Response<()>>()?;
+        .json::<Response<()>>()
+        .await?;
     Ok(response)
 }
 
 pub async fn get_clash_logs() -> Result<Response<Vec<CompactString>>> {
-    let client = connect().await?;
+    let client = build_client().await?;
     let response = client
         .get(IpcCommand::GetClashLogs.as_ref())
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
-        .json::<Response<Vec<CompactString>>>()?;
+        .json::<Response<Vec<CompactString>>>()
+        .await?;
     Ok(response)
 }
 
 pub async fn stop_clash() -> Result<Response<()>> {
-    let client = connect().await?;
+    let client = build_client().await?;
     let response = client
         .delete(IpcCommand::StopClash.as_ref())
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
-        .json::<Response<()>>()?;
+        .json::<Response<()>>()
+        .await?;
     Ok(response)
 }
 
 pub async fn update_writer(body: &WriterConfig) -> Result<Response<()>> {
-    let client = connect().await?;
+    let client = build_client().await?;
     let payload = body.to_json_value()?;
     let response = client
         .put(IpcCommand::UpdateWriter.as_ref())
-        .json_body(&payload)
+        .json(&payload)
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
-        .json::<Response<()>>()?;
+        .json::<Response<()>>()
+        .await?;
     Ok(response)
+}
+
+async fn build_client() -> reqwest::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+
+    #[cfg(unix)]
+    {
+        builder = builder.unix_socket(IPC_PATH);
+    }
+
+    #[cfg(windows)]
+    {
+        builder = builder.windows_named_pipe(IPC_PATH);
+    }
+
+    let config_guard = CLIENT_CONFIG.read().await;
+    let config = config_guard.as_ref().unwrap_or(&DEFAULT_IPC_CONFIG);
+
+    let retry_policy = reqwest::retry::for_host("localhost")
+        .max_retries_per_request(config.max_retries as u32)
+        .no_budget()
+        .classify_fn(|req_rep| {
+            if req_rep.error().is_some() {
+                return req_rep.retryable();
+            }
+
+            match req_rep.status() {
+                Some(s) if s.is_server_error() => req_rep.retryable(),
+                Some(http::StatusCode::REQUEST_TIMEOUT) => req_rep.retryable(),
+                Some(http::StatusCode::TOO_MANY_REQUESTS) => req_rep.retryable(),
+                Some(http::StatusCode::SERVICE_UNAVAILABLE) => req_rep.retryable(),
+                _ => req_rep.success(),
+            }
+        });
+
+    builder
+        .timeout(config.default_timeout)
+        .retry(retry_policy)
+        .build()
 }
