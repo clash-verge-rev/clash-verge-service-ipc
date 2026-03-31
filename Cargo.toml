@@ -53,7 +53,7 @@ standalone = [
     "compact_str",
 ]
 client = [
-    "kode-bridge/client",
+    "reqwest",
     "anyhow",
     "log",
     "tokio",
@@ -96,6 +96,7 @@ flexi_logger = { version = "0.31", optional = true }
 log = { version = "0.4.28", optional = true }
 tracing-log = { version = "0.2", optional = true }
 compact_str = { version = "0.9", features = ["serde"], optional = true }
+reqwest = { version = "0.13.2", default-features = false, features = ["json"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 platform_lib = { package = "libc", version = "0.2", optional = true }
