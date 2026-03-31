@@ -8,7 +8,7 @@ use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tracing::{info, trace, warn};
+use tracing::{info, trace};
 
 pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     make_ipc_dir().await?;
@@ -168,6 +168,7 @@ async fn cleanup_stale_ipc_socket() -> Result<()> {
     {
         use crate::IPC_PATH;
         use std::path::Path;
+        use tracing::warn;
 
         let socket_path = Path::new(IPC_PATH);
         if !socket_path.exists() {
@@ -202,6 +203,7 @@ async fn cleanup_stale_ipc_socket() -> Result<()> {
 pub fn spawn_socket_dir_watchdog() {
     use crate::IPC_PATH;
     use std::path::Path;
+    use tracing::warn;
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
