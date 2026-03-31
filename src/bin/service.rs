@@ -5,7 +5,8 @@
 
 use clash_verge_service_ipc::{run_ipc_server, stop_ipc_server};
 use kode_bridge::KodeBridgeError;
-use tracing::{Level, info};
+use std::path::PathBuf;
+use tracing::{Level, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 #[cfg(windows)]
@@ -129,11 +130,13 @@ fn init_logger() {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
-/// Runs the application as a standalone console process.
 async fn run_standalone() -> Result<(), KodeBridgeError> {
     let pid = std::process::id();
     info!("Clash Verge Service - Standalone Mode");
     info!("Current process PID: {}", pid);
+
+    let _pid_lock = acquire_pid_lock(pid);
+
     info!("Starting IPC server...");
 
     let server_handle = run_ipc_server().await?;
@@ -147,6 +150,69 @@ async fn run_standalone() -> Result<(), KodeBridgeError> {
 
     info!("Service shutdown complete.");
     Ok(())
+}
+
+fn pid_file_path() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp/verge/clash-verge-service.pid")
+    }
+    #[cfg(windows)]
+    {
+        std::env::temp_dir().join("clash-verge-service.pid")
+    }
+}
+
+fn acquire_pid_lock(pid: u32) -> Option<PidLockGuard> {
+    let path = pid_file_path();
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && let Ok(old_pid) = content.trim().parse::<u32>()
+        {
+            if is_process_alive(old_pid) {
+                warn!("Another instance (PID {}) may be running", old_pid);
+            } else {
+                info!("Stale PID file found (PID {}), removing", old_pid);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    match std::fs::write(&path, pid.to_string()) {
+        Ok(_) => {
+            info!("PID file created: {:?}", path);
+            Some(PidLockGuard(path))
+        }
+        Err(e) => {
+            warn!("Failed to create PID file: {}", e);
+            None
+        }
+    }
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { platform_lib::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        false
+    }
+}
+
+struct PidLockGuard(PathBuf);
+
+impl Drop for PidLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        info!("PID file removed: {:?}", self.0);
+    }
 }
 
 /// Waits for a shutdown signal appropriate for the current platform.

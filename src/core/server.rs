@@ -8,11 +8,11 @@ use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     make_ipc_dir().await?;
-    cleanup_ipc_path().await?;
+    cleanup_stale_ipc_socket().await?;
     init_ipc_state().await?;
 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
@@ -44,6 +44,19 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
             let _ = done_tx.send(());
             res
         });
+        #[cfg(unix)]
+        {
+            use crate::IPC_PATH;
+            use std::fs::Permissions;
+            use std::os::unix::fs::PermissionsExt;
+            use std::time::Duration;
+            use tokio::fs;
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            fs::set_permissions(IPC_PATH, Permissions::from_mode(0o777)).await?;
+
+            spawn_socket_dir_watchdog();
+        }
         Ok(handle)
     } else {
         Err(kode_bridge::KodeBridgeError::configuration(
@@ -150,6 +163,69 @@ async fn cleanup_ipc_path() -> Result<()> {
     Ok(())
 }
 
+async fn cleanup_stale_ipc_socket() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use crate::IPC_PATH;
+        use std::path::Path;
+
+        let socket_path = Path::new(IPC_PATH);
+        if !socket_path.exists() {
+            return Ok(());
+        }
+
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::UnixStream::connect(IPC_PATH),
+        )
+        .await
+        {
+            Ok(Ok(_stream)) => {
+                warn!(
+                    "Another instance listening on {}, removing stale socket",
+                    IPC_PATH
+                );
+                tokio::fs::remove_file(IPC_PATH).await?;
+            }
+            _ => {
+                info!("Cleaning up stale IPC socket: {}", IPC_PATH);
+                tokio::fs::remove_file(IPC_PATH).await?;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {}
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn spawn_socket_dir_watchdog() {
+    use crate::IPC_PATH;
+    use std::path::Path;
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+
+            let socket_path = Path::new(IPC_PATH);
+            if let Some(dir) = socket_path.parent()
+                && !dir.exists()
+            {
+                warn!("IPC socket directory {:?} was deleted, recreating", dir);
+                if let Err(e) = tokio::fs::create_dir_all(dir).await {
+                    warn!("Failed to recreate IPC socket directory: {}", e);
+                    continue;
+                }
+                use std::fs::Permissions;
+                use std::os::unix::fs::PermissionsExt;
+                let _ = tokio::fs::set_permissions(dir, Permissions::from_mode(0o777)).await;
+                info!("IPC socket directory {:?} recreated", dir);
+            }
+        }
+    });
+}
+
 async fn init_ipc_state() -> Result<()> {
     let server = create_ipc_server()?;
     let router = create_ipc_router()?;
@@ -178,6 +254,7 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
         Ok(server)
     }
 }
+
 fn create_ipc_router() -> Result<Router> {
     let router = Router::new()
         .get(IpcCommand::Magic.as_ref(), |ctx| async move {
