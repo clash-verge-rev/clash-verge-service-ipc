@@ -5,10 +5,12 @@ mod common;
 #[cfg(test)]
 mod tests {
     use anyhow::{Context, Result};
+    #[cfg(unix)]
+    use clash_verge_service_ipc::acquire_service_owner;
     use clash_verge_service_ipc::{
-        ClashConfig, CoreConfig, CoreWatchdogTestConfig, ServiceLifecycleState,
-        acquire_service_owner, connect, persist_core_stopped, reconcile_service_startup,
-        run_ipc_server, run_ipc_supervisor_until_shutdown, service_lifecycle_state, service_paths,
+        ClashConfig, CoreConfig, CoreWatchdogTestConfig, ServiceLifecycleState, connect,
+        persist_core_stopped, reconcile_service_startup, run_ipc_server,
+        run_ipc_supervisor_until_shutdown, service_lifecycle_state, service_paths,
         service_status_snapshot, set_core_watchdog_config_for_tests, start_clash, stop_ipc_server,
     };
     use serial_test::serial;
@@ -43,6 +45,7 @@ mod tests {
         Ok(path)
     }
 
+    #[cfg(unix)]
     async fn wait_until<F>(label: &str, timeout: Duration, mut condition: F) -> Result<()>
     where
         F: FnMut() -> bool,

@@ -15,7 +15,7 @@ const OWNER_REACQUIRE_ATTEMPTS: usize = 10;
 const OWNER_REACQUIRE_DELAY: Duration = Duration::from_millis(100);
 
 pub struct ServiceOwnerGuard {
-    file: File,
+    _file: File,
     paths: ServicePaths,
 }
 
@@ -23,7 +23,7 @@ impl ServiceOwnerGuard {
     fn new(mut file: File, paths: ServicePaths) -> Result<Self> {
         let pid = std::process::id();
         write_owner_metadata(&mut file, &paths, pid)?;
-        Ok(Self { file, paths })
+        Ok(Self { _file: file, paths })
     }
 }
 
@@ -34,7 +34,7 @@ impl Drop for ServiceOwnerGuard {
             use std::os::fd::AsRawFd;
 
             unsafe {
-                platform_lib::flock(self.file.as_raw_fd(), platform_lib::LOCK_UN);
+                platform_lib::flock(self._file.as_raw_fd(), platform_lib::LOCK_UN);
             }
         }
 
