@@ -33,7 +33,6 @@ pub static IPC_PATH: &str = "/tmp/clash-verge-service-ipc-test/service.sock";
 pub static IPC_PATH: &str = r"\\.\pipe\clash-verge-service-test";
 
 #[cfg(any(feature = "standalone", feature = "client"))]
-pub static IPC_AUTH_EXPECT: &str =
-    r#"Like as the waves make towards the pebbl'd shore, So do our minutes hasten to their end;"#;
+pub static IPC_AUTH_EXPECT: &str = r#"A thing of beauty is a joy for ever. Its loveliness increases; it will never pass into nothingness."#;
 
 pub static VERSION: &str = env!("CARGO_PKG_VERSION");
