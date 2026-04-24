@@ -1,14 +1,28 @@
 use super::state::IpcState;
 use crate::core::auth::ipc_request_context_to_auth_context;
+use crate::core::desired::{persist_core_started, persist_core_stopped, persist_writer_config};
 use crate::core::logger::set_or_update_writer;
 use crate::core::manager::{CORE_MANAGER, LOGGER_MANAGER};
-use crate::core::structure::Response;
+use crate::core::paths::service_paths;
+use crate::core::state::set_service_lifecycle_state;
+use crate::core::status::service_status_snapshot;
+use crate::core::structure::{Response, ServiceLifecycleState};
 use crate::{ClashConfig, IpcCommand, VERSION, WriterConfig};
+use anyhow::{Result as AnyResult, anyhow};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
+use serde::Serialize;
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
+
+const IPC_MAX_RESTARTS: u32 = 5;
+const IPC_RESTART_WINDOW: Duration = Duration::from_secs(60);
+const IPC_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     make_ipc_dir().await?;
@@ -18,17 +32,10 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let (done_tx, done_rx) = oneshot::channel::<()>();
 
-    {
-        let guard = IpcState::global().lock().await;
-        guard.set_sender(shutdown_tx).await;
-        guard.set_done(done_rx).await;
-        drop(guard);
-    }
+    IpcState::global().set_sender(shutdown_tx).await;
+    IpcState::global().set_done(done_rx).await;
 
-    let server_arc = IpcState::global().lock().await.get_server();
-    let mut guard = server_arc.lock().await;
-
-    if let Some(mut server) = guard.take() {
+    if let Some(mut server) = IpcState::global().take_server().await {
         let handle = tokio::spawn(async move {
             #[cfg(unix)]
             let res = tokio::select! {
@@ -46,14 +53,27 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
         });
         #[cfg(unix)]
         {
-            use crate::IPC_PATH;
             use std::fs::Permissions;
             use std::os::unix::fs::PermissionsExt;
-            use std::time::Duration;
             use tokio::fs;
 
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            fs::set_permissions(IPC_PATH, Permissions::from_mode(0o777)).await?;
+            let paths = service_paths();
+            let mut socket_ready = false;
+            for _ in 0..20 {
+                if paths.ipc_path().exists() {
+                    socket_ready = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            if socket_ready {
+                fs::set_permissions(paths.ipc_path(), Permissions::from_mode(0o777)).await?;
+            } else {
+                warn!(
+                    "IPC socket {:?} did not appear before permission update timeout",
+                    paths.ipc_path()
+                );
+            }
 
             spawn_socket_dir_watchdog();
         }
@@ -68,22 +88,15 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
 pub async fn stop_ipc_server() -> Result<()> {
     CORE_MANAGER.lock().await.stop_core().await.ok();
 
-    if let Some(sender) = IpcState::global().lock().await.take_sender().await {
+    if let Some(sender) = IpcState::global().take_sender().await {
         let _ = sender.send(());
     }
 
-    if let Some(done) = IpcState::global().lock().await.take_done().await {
+    if let Some(done) = IpcState::global().take_done().await {
         let _ = done.await;
     }
 
-    {
-        let server_arc = IpcState::global().lock().await.get_server();
-        let mut guard = server_arc.lock().await;
-        if let Some(server) = guard.as_mut() {
-            server.shutdown();
-        }
-        *guard = None;
-    }
+    IpcState::global().shutdown_server().await;
 
     cleanup_ipc_path().await?;
     #[cfg(windows)]
@@ -92,16 +105,98 @@ pub async fn stop_ipc_server() -> Result<()> {
     Ok(())
 }
 
+pub async fn run_ipc_supervisor_until_shutdown(
+    shutdown: impl Future<Output = ()>,
+) -> AnyResult<()> {
+    set_service_lifecycle_state(ServiceLifecycleState::Starting);
+    info!("Starting IPC server...");
+
+    let mut server_handle = match run_ipc_server().await {
+        Ok(handle) => handle,
+        Err(error) => {
+            set_service_lifecycle_state(ServiceLifecycleState::Fatal);
+            return Err(anyhow!("failed to start IPC server: {}", error));
+        }
+    };
+    set_service_lifecycle_state(ServiceLifecycleState::Running);
+    info!("IPC server started successfully. Waiting for shutdown signal...");
+
+    let mut restart_timestamps: Vec<Instant> = Vec::new();
+    let mut consecutive_attempt = 0u32;
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("Shutdown signal received. Stopping IPC server...");
+                break;
+            }
+            join_result = &mut server_handle => {
+                let reason = match join_result {
+                    Ok(Ok(())) => "IPC server exited cleanly".to_string(),
+                    Ok(Err(error)) => format!("IPC server returned error: {error}"),
+                    Err(error) => format!("IPC server task failed: {error}"),
+                };
+                warn!("{reason}; rebuilding IPC listener in-process");
+                set_service_lifecycle_state(ServiceLifecycleState::RecoveringIpc);
+
+                let now = Instant::now();
+                restart_timestamps.retain(|t| now.duration_since(*t) < IPC_RESTART_WINDOW);
+                if restart_timestamps.is_empty() {
+                    consecutive_attempt = 0;
+                }
+                restart_timestamps.push(now);
+
+                if restart_timestamps.len() as u32 > IPC_MAX_RESTARTS {
+                    set_service_lifecycle_state(ServiceLifecycleState::Fatal);
+                    return Err(anyhow!(
+                        "IPC server restarted {} times in {}s",
+                        restart_timestamps.len(),
+                        IPC_RESTART_WINDOW.as_secs()
+                    ));
+                }
+
+                let delay = ipc_backoff_delay(consecutive_attempt);
+                consecutive_attempt += 1;
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+
+                server_handle = match run_ipc_server().await {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        set_service_lifecycle_state(ServiceLifecycleState::Fatal);
+                        return Err(anyhow!("failed to rebuild IPC server: {}", error));
+                    }
+                };
+                set_service_lifecycle_state(ServiceLifecycleState::Running);
+                info!("IPC listener rebuilt successfully");
+            }
+        }
+    }
+
+    let _ = stop_ipc_server().await;
+    server_handle.abort();
+    Ok(())
+}
+
+fn ipc_backoff_delay(attempt: u32) -> Duration {
+    if attempt == 0 {
+        return Duration::ZERO;
+    }
+
+    Duration::from_secs(1u64 << (attempt - 1).min(3)).min(IPC_MAX_BACKOFF)
+}
+
 async fn make_ipc_dir() -> Result<()> {
     #[cfg(unix)]
     {
-        use crate::IPC_PATH;
         use std::fs::Permissions;
         use std::os::unix::fs::PermissionsExt;
-        use std::path::Path;
         use tokio::fs;
 
-        let Some(dir_path) = Path::new(IPC_PATH).parent() else {
+        let paths = service_paths();
+        let Some(dir_path) = paths.ipc_path().parent() else {
             return Ok(());
         };
 
@@ -147,12 +242,11 @@ async fn make_ipc_dir() -> Result<()> {
 async fn cleanup_ipc_path() -> Result<()> {
     #[cfg(unix)]
     {
-        use crate::IPC_PATH;
-        use std::path::Path;
         use tokio::fs;
 
-        if Path::new(IPC_PATH).exists() {
-            fs::remove_file(IPC_PATH).await?;
+        let paths = service_paths();
+        if paths.ipc_path().exists() {
+            fs::remove_file(paths.ipc_path()).await?;
         }
     }
     #[cfg(windows)]
@@ -166,31 +260,27 @@ async fn cleanup_ipc_path() -> Result<()> {
 async fn cleanup_stale_ipc_socket() -> Result<()> {
     #[cfg(unix)]
     {
-        use crate::IPC_PATH;
-        use std::path::Path;
-        use tracing::warn;
-
-        let socket_path = Path::new(IPC_PATH);
+        let paths = service_paths();
+        let socket_path = paths.ipc_path();
         if !socket_path.exists() {
             return Ok(());
         }
 
         match tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            tokio::net::UnixStream::connect(IPC_PATH),
+            tokio::net::UnixStream::connect(socket_path),
         )
         .await
         {
             Ok(Ok(_stream)) => {
                 warn!(
-                    "Another instance listening on {}, removing stale socket",
-                    IPC_PATH
+                    "IPC socket {:?} is reachable; leaving it in place",
+                    socket_path
                 );
-                tokio::fs::remove_file(IPC_PATH).await?;
             }
             _ => {
-                info!("Cleaning up stale IPC socket: {}", IPC_PATH);
-                tokio::fs::remove_file(IPC_PATH).await?;
+                info!("Cleaning up stale IPC socket: {:?}", socket_path);
+                tokio::fs::remove_file(socket_path).await?;
             }
         }
     }
@@ -201,16 +291,20 @@ async fn cleanup_stale_ipc_socket() -> Result<()> {
 
 #[cfg(unix)]
 pub fn spawn_socket_dir_watchdog() {
-    use crate::IPC_PATH;
-    use std::path::Path;
-    use tracing::warn;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
+    if WATCHDOG_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
 
     tokio::spawn(async move {
+        let paths = service_paths();
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
 
-            let socket_path = Path::new(IPC_PATH);
+            let socket_path = paths.ipc_path();
             if let Some(dir) = socket_path.parent()
                 && !dir.exists()
             {
@@ -232,21 +326,26 @@ async fn init_ipc_state() -> Result<()> {
     let server = create_ipc_server()?;
     let router = create_ipc_router()?;
     let server = server.router(router);
-    IpcState::global().lock().await.set_server(server).await;
+    IpcState::global().set_server(server).await;
     Ok(())
 }
 
 fn create_ipc_server() -> Result<IpcHttpServer> {
-    use crate::IPC_PATH;
+    let paths = service_paths();
 
-    let server = IpcHttpServer::new(IPC_PATH)?;
+    let server = IpcHttpServer::new(paths.ipc_path())?;
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         use platform_lib::{S_IRGRP, S_IRUSR, S_IWGRP, S_IWUSR, mode_t};
 
         let mode: mode_t = platform_lib::mode_t::from(S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
         let server = server.with_listener_mode(mode);
+        Ok(server)
+    }
+
+    #[cfg(all(unix, target_os = "macos"))]
+    {
         Ok(server)
     }
 
@@ -266,44 +365,41 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::GetVersion.as_ref(), |ctx| async move {
             ipc_request_context_to_auth_context(&ctx)?;
-            let json_value = Response {
-                code: 0,
-                message: "Success".to_string(),
-                data: Some(VERSION.to_string()),
-            };
-            Ok(HttpResponse::builder()
-                .status(StatusCode::OK)
-                .json(&json_value)?
-                .build())
+            ok_json(VERSION.to_string())
+        })
+        .get(IpcCommand::Status.as_ref(), |ctx| async move {
+            trace!("Received Status command");
+            ipc_request_context_to_auth_context(&ctx)?;
+            match service_status_snapshot().await {
+                Ok(status) => ok_json(status),
+                Err(error) => {
+                    service_unavailable(format!("Failed to collect service status: {}", error))
+                }
+            }
         })
         .post(IpcCommand::StartClash.as_ref(), |ctx| async move {
             trace!("Received StartClash command");
             ipc_request_context_to_auth_context(&ctx)?;
             match ctx.json::<ClashConfig>() {
                 Ok(start_clash) => {
-                    match CORE_MANAGER.lock().await.start_core(start_clash).await {
+                    match CORE_MANAGER
+                        .lock()
+                        .await
+                        .start_core(start_clash.clone())
+                        .await
+                    {
                         Ok(_) => info!("Core started successfully"),
                         Err(e) => {
-                            let json_value: Response<()> = Response {
-                                code: 1,
-                                message: format!("Failed to start core: {}", e),
-                                data: None,
-                            };
-                            return Ok(HttpResponse::builder()
-                                .status(StatusCode::SERVICE_UNAVAILABLE)
-                                .json(&json_value)?
-                                .build());
+                            return service_unavailable(format!("Failed to start core: {}", e));
                         }
                     }
-                    let json_value: Response<()> = Response {
-                        code: 0,
-                        message: "Core started successfully".to_string(),
-                        data: None,
-                    };
-                    Ok(HttpResponse::builder()
-                        .status(StatusCode::OK)
-                        .json(&json_value)?
-                        .build())
+                    if let Err(e) = persist_core_started(&start_clash).await {
+                        return service_unavailable(format!(
+                            "Failed to persist desired state: {}",
+                            e
+                        ));
+                    }
+                    ok_empty("Core started successfully")
                 }
                 Err(e) => Ok(HttpResponse::builder()
                     .status(StatusCode::BAD_REQUEST)
@@ -314,15 +410,7 @@ fn create_ipc_router() -> Result<Router> {
         .get(IpcCommand::GetClashLogs.as_ref(), |ctx| async move {
             trace!("Received GetClashLogs command");
             ipc_request_context_to_auth_context(&ctx)?;
-            let json_value = Response {
-                code: 0,
-                message: "Success".to_string(),
-                data: Some(LOGGER_MANAGER.get_logs().await),
-            };
-            Ok(HttpResponse::builder()
-                .status(StatusCode::OK)
-                .json(&json_value)?
-                .build())
+            ok_json(LOGGER_MANAGER.get_logs().await)
         })
         .delete(IpcCommand::StopClash.as_ref(), |ctx| async move {
             trace!("Received StopClash command");
@@ -330,26 +418,13 @@ fn create_ipc_router() -> Result<Router> {
             match CORE_MANAGER.lock().await.stop_core().await {
                 Ok(_) => info!("Core stopped successfully"),
                 Err(e) => {
-                    let json_value: Response<()> = Response {
-                        code: 1,
-                        message: format!("Failed to stop core: {}", e),
-                        data: None,
-                    };
-                    return Ok(HttpResponse::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .json(&json_value)?
-                        .build());
+                    return service_unavailable(format!("Failed to stop core: {}", e));
                 }
             }
-            let json_value: Response<()> = Response {
-                code: 0,
-                message: "Core stopped successfully".to_string(),
-                data: None,
-            };
-            Ok(HttpResponse::builder()
-                .status(StatusCode::OK)
-                .json(&json_value)?
-                .build())
+            if let Err(e) = persist_core_stopped().await {
+                return service_unavailable(format!("Failed to persist desired state: {}", e));
+            }
+            ok_empty("Core stopped successfully")
         })
         .put(IpcCommand::UpdateWriter.as_ref(), |ctx| async move {
             trace!("Received UpdateWriter command");
@@ -359,26 +434,16 @@ fn create_ipc_router() -> Result<Router> {
                     match set_or_update_writer(&writer_config).await {
                         Ok(_) => info!("Update writer successfully"),
                         Err(e) => {
-                            let json_value: Response<()> = Response {
-                                code: 1,
-                                message: format!("Failed to update writer: {}", e),
-                                data: None,
-                            };
-                            return Ok(HttpResponse::builder()
-                                .status(StatusCode::SERVICE_UNAVAILABLE)
-                                .json(&json_value)?
-                                .build());
+                            return service_unavailable(format!("Failed to update writer: {}", e));
                         }
                     };
-                    let json_value: Response<()> = Response {
-                        code: 0,
-                        message: "Update Writer successfully".to_string(),
-                        data: None,
-                    };
-                    Ok(HttpResponse::builder()
-                        .status(StatusCode::OK)
-                        .json(&json_value)?
-                        .build())
+                    if let Err(e) = persist_writer_config(&writer_config).await {
+                        return service_unavailable(format!(
+                            "Failed to persist writer config: {}",
+                            e
+                        ));
+                    }
+                    ok_empty("Update Writer successfully")
                 }
                 Err(e) => Ok(HttpResponse::builder()
                     .status(StatusCode::BAD_REQUEST)
@@ -387,4 +452,33 @@ fn create_ipc_router() -> Result<Router> {
             }
         });
     Ok(router)
+}
+
+fn ok_json<T: Serialize>(data: T) -> Result<HttpResponse> {
+    json_response(StatusCode::OK, 0, "Success", Some(data))
+}
+
+fn ok_empty(message: impl Into<String>) -> Result<HttpResponse> {
+    json_response::<()>(StatusCode::OK, 0, message, None)
+}
+
+fn service_unavailable(message: impl Into<String>) -> Result<HttpResponse> {
+    json_response::<()>(StatusCode::SERVICE_UNAVAILABLE, 1, message, None)
+}
+
+fn json_response<T: Serialize>(
+    status: StatusCode,
+    code: u16,
+    message: impl Into<String>,
+    data: Option<T>,
+) -> Result<HttpResponse> {
+    let json_value = Response {
+        code,
+        message: message.into(),
+        data,
+    };
+    Ok(HttpResponse::builder()
+        .status(status)
+        .json(&json_value)?
+        .build())
 }

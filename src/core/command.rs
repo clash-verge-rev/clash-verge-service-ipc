@@ -5,6 +5,8 @@ use strum_macros::{AsRefStr, EnumString};
 pub enum IpcCommand {
     #[strum(serialize = "/version")]
     GetVersion,
+    #[strum(serialize = "/status")]
+    Status,
     // #[strum(serialize = "/clash")]
     // GetClash,
 

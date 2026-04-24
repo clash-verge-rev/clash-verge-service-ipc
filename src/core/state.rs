@@ -1,22 +1,21 @@
+use crate::core::structure::ServiceLifecycleState;
 use kode_bridge::IpcHttpServer;
 use once_cell::sync::Lazy;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::{Mutex, oneshot};
 
 pub(super) struct IpcState {
-    pub(super) server: Arc<Mutex<Option<IpcHttpServer>>>,
-    pub(super) sender: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    pub(super) done: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    server: Mutex<Option<IpcHttpServer>>,
+    sender: Mutex<Option<oneshot::Sender<()>>>,
+    done: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl IpcState {
-    pub(super) fn global() -> &'static Arc<Mutex<IpcState>> {
-        static IPC_STATE: Lazy<Arc<Mutex<IpcState>>> = Lazy::new(|| {
-            Arc::new(Mutex::new(IpcState {
-                server: Arc::new(Mutex::new(None)),
-                sender: Arc::new(Mutex::new(None)),
-                done: Arc::new(Mutex::new(None)),
-            }))
+    pub(super) fn global() -> &'static IpcState {
+        static IPC_STATE: Lazy<IpcState> = Lazy::new(|| IpcState {
+            server: Mutex::new(None),
+            sender: Mutex::new(None),
+            done: Mutex::new(None),
         });
         &IPC_STATE
     }
@@ -26,8 +25,16 @@ impl IpcState {
         *guard = Some(server);
     }
 
-    pub(super) fn get_server(&self) -> Arc<Mutex<Option<IpcHttpServer>>> {
-        Arc::clone(&self.server)
+    pub(super) async fn take_server(&self) -> Option<IpcHttpServer> {
+        self.server.lock().await.take()
+    }
+
+    pub(super) async fn shutdown_server(&self) {
+        let mut guard = self.server.lock().await;
+        if let Some(server) = guard.as_mut() {
+            server.shutdown();
+        }
+        *guard = None;
     }
 
     pub(super) async fn set_sender(&self, sender: oneshot::Sender<()>) {
@@ -49,4 +56,18 @@ impl IpcState {
         let mut guard = self.done.lock().await;
         guard.take()
     }
+}
+
+pub fn set_service_lifecycle_state(state: ServiceLifecycleState) {
+    service_lifecycle_state_cell().store(state as u8, Ordering::Relaxed);
+}
+
+pub fn service_lifecycle_state() -> ServiceLifecycleState {
+    ServiceLifecycleState::from_u8(service_lifecycle_state_cell().load(Ordering::Relaxed))
+}
+
+fn service_lifecycle_state_cell() -> &'static AtomicU8 {
+    static SERVICE_STATE: Lazy<AtomicU8> =
+        Lazy::new(|| AtomicU8::new(ServiceLifecycleState::Starting as u8));
+    &SERVICE_STATE
 }

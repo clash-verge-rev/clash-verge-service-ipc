@@ -3,15 +3,16 @@
 //! This service can run as a standalone process or as a Windows service.
 //! It listens for shutdown signals (Ctrl+C, SIGTERM, or service stop) to gracefully terminate.
 
-use clash_verge_service_ipc::{run_ipc_server, stop_ipc_server};
-use kode_bridge::KodeBridgeError;
-use std::path::PathBuf;
-use tracing::{Level, info, warn};
+use anyhow::Result;
+use clash_verge_service_ipc::{
+    acquire_service_owner, reconcile_service_startup, restore_desired_state,
+    run_ipc_supervisor_until_shutdown,
+};
+use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
 #[cfg(windows)]
 use {
-    anyhow::Result,
     platform_lib::{
         define_windows_service,
         service::{
@@ -30,7 +31,7 @@ use {
 /// Main entry point for non-Windows platforms (Linux, macOS).
 #[cfg(not(windows))]
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), KodeBridgeError> {
+async fn main() -> Result<()> {
     init_logger();
     run_standalone().await
 }
@@ -93,27 +94,52 @@ fn run_service() -> platform_lib::Result<()> {
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(async {
-        if let Ok(server_handle) = run_ipc_server().await {
-            info!("IPC server started successfully in service mode.");
-            // Wait for the shutdown signal
-            shutdown_rx.recv().await;
+    let fatal = rt.block_on(async {
+        let owner_guard = match acquire_service_owner().await {
+            Ok(Some(owner_guard)) => owner_guard,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!("Failed to acquire service owner lock: {}", error);
+                return true;
+            }
+        };
 
-            info!("Shutdown signal received. Stopping IPC server...");
-            let _ = stop_ipc_server().await;
-            server_handle.abort();
+        if let Err(error) = reconcile_service_startup().await {
+            tracing::warn!("Service startup reconciliation failed: {}", error);
+            return true;
         }
+        if let Err(error) = restore_desired_state().await {
+            tracing::warn!("Desired state restoration failed: {}", error);
+            return true;
+        }
+
+        let result = run_ipc_supervisor_until_shutdown(async {
+            let _ = shutdown_rx.recv().await;
+        })
+        .await;
+        if let Err(error) = result {
+            tracing::warn!("IPC supervisor failed: {}", error);
+            drop(owner_guard);
+            return true;
+        }
+
+        drop(owner_guard);
+        false
     });
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
         controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(0),
+        exit_code: ServiceExitCode::Win32(if fatal { 1 } else { 0 }),
         checkpoint: 0,
         wait_hint: Duration::default(),
         process_id: None,
     })?;
+
+    if fatal {
+        std::process::exit(1);
+    }
 
     Ok(())
 }
@@ -130,89 +156,22 @@ fn init_logger() {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
-async fn run_standalone() -> Result<(), KodeBridgeError> {
+async fn run_standalone() -> Result<()> {
     let pid = std::process::id();
     info!("Clash Verge Service - Standalone Mode");
     info!("Current process PID: {}", pid);
 
-    let _pid_lock = acquire_pid_lock(pid);
+    let Some(_owner_guard) = acquire_service_owner().await? else {
+        return Ok(());
+    };
 
-    info!("Starting IPC server...");
+    reconcile_service_startup().await?;
+    restore_desired_state().await?;
 
-    let server_handle = run_ipc_server().await?;
-    info!("IPC server started successfully. Waiting for shutdown signal...");
-
-    shutdown_signal().await;
-
-    info!("Shutdown signal received. Stopping IPC server...");
-    let _ = stop_ipc_server().await;
-    server_handle.abort();
+    run_ipc_supervisor_until_shutdown(shutdown_signal()).await?;
 
     info!("Service shutdown complete.");
     Ok(())
-}
-
-fn pid_file_path() -> PathBuf {
-    #[cfg(unix)]
-    {
-        PathBuf::from("/tmp/verge/clash-verge-service.pid")
-    }
-    #[cfg(windows)]
-    {
-        std::env::temp_dir().join("clash-verge-service.pid")
-    }
-}
-
-fn acquire_pid_lock(pid: u32) -> Option<PidLockGuard> {
-    let path = pid_file_path();
-
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    if path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&path)
-            && let Ok(old_pid) = content.trim().parse::<u32>()
-        {
-            if is_process_alive(old_pid) {
-                warn!("Another instance (PID {}) may be running", old_pid);
-            } else {
-                info!("Stale PID file found (PID {}), removing", old_pid);
-            }
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    match std::fs::write(&path, pid.to_string()) {
-        Ok(_) => {
-            info!("PID file created: {:?}", path);
-            Some(PidLockGuard(path))
-        }
-        Err(e) => {
-            warn!("Failed to create PID file: {}", e);
-            None
-        }
-    }
-}
-
-fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { platform_lib::kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(windows)]
-    {
-        false
-    }
-}
-
-struct PidLockGuard(PathBuf);
-
-impl Drop for PidLockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-        info!("PID file removed: {:?}", self.0);
-    }
 }
 
 /// Waits for a shutdown signal appropriate for the current platform.

@@ -37,6 +37,7 @@ required-features = ["client"]
 [features]
 standalone = [
     "kode-bridge",
+    "kode-bridge/client",
     "http",
     "tracing",
     "tracing-subscriber",

@@ -23,6 +23,41 @@ pub struct WriterConfig {
     pub max_log_files: usize,
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceLifecycleState {
+    Starting = 0,
+    Running = 1,
+    RecoveringCore = 2,
+    RecoveringIpc = 3,
+    Fatal = 4,
+}
+
+impl ServiceLifecycleState {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Running,
+            2 => Self::RecoveringCore,
+            3 => Self::RecoveringIpc,
+            4 => Self::Fatal,
+            _ => Self::Starting,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceStatusSnapshot {
+    pub service_state: ServiceLifecycleState,
+    pub core_pid: Option<u32>,
+    pub core_started_at: Option<u64>,
+    pub last_core_exit_reason: Option<String>,
+    pub restart_count: u32,
+    pub last_recovery_at: Option<u64>,
+    pub desired_core_should_be_running: bool,
+    pub desired_generation: u64,
+    pub desired_updated_at: u64,
+}
+
 #[cfg(feature = "response")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response<T> {
@@ -35,8 +70,10 @@ impl Default for CoreConfig {
     fn default() -> Self {
         let core_ipc_path = if cfg!(windows) {
             r"\\.\pipe\verge-mihomo".to_string()
+        } else if cfg!(feature = "test") {
+            "/tmp/clash-verge-service-ipc-test/mihomo.sock".to_string()
         } else {
-            "/tmp/verge-mihomo.sock".to_string()
+            "/tmp/verge/verge-mihomo.sock".to_string()
         };
         Self {
             core_path: "./clash".to_string(),
