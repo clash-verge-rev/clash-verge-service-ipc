@@ -2,13 +2,68 @@ name: Release CI
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to release, for example v2.2.0"
+        required: true
   push:
-    branches:
-      - 'v*.*.*'
-permissions: write-all
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
 
 jobs:
-  release-update:
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      asset_prefix: ${{ steps.release.outputs.asset_prefix }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Validate release tag
+        id: release
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $tag" >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          cargo_version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          if [ "$cargo_version" != "$version" ]; then
+            echo "Cargo.toml version ($cargo_version) does not match release tag ($version)" >&2
+            exit 1
+          fi
+
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "asset_prefix=clash-verge-service-ipc-$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -27,17 +82,17 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
-          - os: macos-latest  # Apple Silicon
+          - os: macos-latest
             target: aarch64-apple-darwin
-            arch: arm64
-          - os: macos-15-intel  # Intel macOS
+          - os: macos-15-intel
             target: x86_64-apple-darwin
-            arch: x86_64
-
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
 
       - name: Install Rust
         if: matrix.os != 'ubuntu-latest'
@@ -45,50 +100,41 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Add Rust Target
+      - name: Add Rust target
         if: matrix.os != 'ubuntu-latest'
         run: rustup target add ${{ matrix.target }}
 
-      # macOS 特定的交叉编译设置
       - name: Setup macOS cross compilation
         if: startsWith(matrix.os, 'macos')
+        shell: bash
         run: |
-          echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr '[:lower:]' '[:upper:]' | tr '-' '_')_LINKER=clang" >> $GITHUB_ENV
-          echo "CC_$(echo ${{ matrix.target }} | tr '-' '_')=clang" >> $GITHUB_ENV
-          echo "CXX_$(echo ${{ matrix.target }} | tr '-' '_')=clang++" >> $GITHUB_ENV
-          
-          # 设置 SDK 路径
+          echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr '[:lower:]' '[:upper:]' | tr '-' '_')_LINKER=clang" >> "$GITHUB_ENV"
+          echo "CC_$(echo ${{ matrix.target }} | tr '-' '_')=clang" >> "$GITHUB_ENV"
+          echo "CXX_$(echo ${{ matrix.target }} | tr '-' '_')=clang++" >> "$GITHUB_ENV"
+
           if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
-            echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> $GITHUB_ENV
-            echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> $GITHUB_ENV
+            echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+            echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
           elif [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
-            echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> $GITHUB_ENV
-            echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> $GITHUB_ENV
+            echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+            echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
           fi
 
       - name: Build
         if: matrix.os != 'ubuntu-latest'
-        run: |
-          cargo build --release --target ${{ matrix.target }} --features standalone --verbose
+        run: cargo build --release --target ${{ matrix.target }} --features standalone --verbose
 
-      - name: Build
+      - name: Build Linux
         if: matrix.os == 'ubuntu-latest'
         uses: ./.github/build-for-linux
         with:
           target: ${{ matrix.target }}
           features: standalone
 
-      - name: Update Tag
-        uses: richardsimko/update-tag@v1
-        with:
-          tag_name: ${{ matrix.target }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: CodeSign
+      - name: CodeSign macOS binaries
         if: startsWith(matrix.os, 'macos')
+        shell: bash
         run: |
-          # 设置证书
           echo "${{ secrets.APPLE_CERTIFICATE }}" | base64 --decode > cert.p12
           security create-keychain -p github-actions github-actions.keychain
           security default-keychain -s github-actions.keychain
@@ -96,47 +142,82 @@ jobs:
           security import cert.p12 -k github-actions.keychain -P "${{ secrets.APPLE_CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k github-actions github-actions.keychain
 
-          echo "签名前验证架构:"
-          file target/${{ matrix.target }}/release/install-service
-          lipo -info target/${{ matrix.target }}/release/install-service || true
-
-          # 对所有服务程序进行签名
           for bin in clash-verge-service clash-verge-service-install clash-verge-service-uninstall; do
+            file "target/${{ matrix.target }}/release/$bin"
+            lipo -info "target/${{ matrix.target }}/release/$bin" || true
             codesign --force \
               -s "${{ secrets.APPLE_SIGNING_IDENTITY }}" \
               --keychain github-actions.keychain \
               --options runtime \
               --timestamp \
               --identifier "io.github.clash-verge-rev.clash-verge-rev-service-ipc" \
-              target/${{ matrix.target }}/release/$bin
+              "target/${{ matrix.target }}/release/$bin"
+            codesign -dvv "target/${{ matrix.target }}/release/$bin"
+            codesign -d --entitlements /dev/stdout "target/${{ matrix.target }}/release/$bin"
           done
 
-          # 验证签名
-          for bin in clash-verge-service clash-verge-service-install clash-verge-service-uninstall; do
-            codesign -dvv target/${{ matrix.target }}/release/$bin
-            codesign -d --entitlements /dev/stdout target/${{ matrix.target }}/release/$bin
-          done
+      - name: Package Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $asset = "${{ needs.prepare.outputs.asset_prefix }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path package -Force | Out-Null
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/clash-verge-service.exe" package/
+          Copy-Item "target/${{ matrix.target }}/release/clash-verge-service-install.exe" package/
+          Copy-Item "target/${{ matrix.target }}/release/clash-verge-service-uninstall.exe" package/
+          Copy-Item LICENSE package/
+          Compress-Archive -Path package/* -DestinationPath "dist/$asset.zip" -Force
 
-      - name: Release
-        if: matrix.os == 'windows-latest'
+      - name: Package Unix binaries
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          asset="${{ needs.prepare.outputs.asset_prefix }}-${{ matrix.target }}"
+          mkdir -p package dist
+          cp "target/${{ matrix.target }}/release/clash-verge-service" package/
+          cp "target/${{ matrix.target }}/release/clash-verge-service-install" package/
+          cp "target/${{ matrix.target }}/release/clash-verge-service-uninstall" package/
+          cp LICENSE package/
+          tar -czf "dist/$asset.tar.gz" -C package .
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ matrix.target }}
-          tag_name: ${{ matrix.target }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          files: |
-            target/${{ matrix.target }}/release/clash-verge-service.exe
-            target/${{ matrix.target }}/release/clash-verge-service-install.exe
-            target/${{ matrix.target }}/release/clash-verge-service-uninstall.exe
-
-      - name: Release
-        if: matrix.os != 'windows-latest'
-        uses: softprops/action-gh-release@v2
-        with:
-          name: ${{ matrix.target }}
-          tag_name: ${{ matrix.target }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          files: |
-            target/${{ matrix.target }}/release/clash-verge-service
-            target/${{ matrix.target }}/release/clash-verge-service-install
-            target/${{ matrix.target }}/release/clash-verge-service-uninstall
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: clash-verge-service-ipc ${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
