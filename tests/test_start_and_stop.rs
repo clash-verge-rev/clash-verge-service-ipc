@@ -2,7 +2,9 @@
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use clash_verge_service_ipc::{IPC_PATH, IpcCommand, run_ipc_server, stop_ipc_server};
+    use clash_verge_service_ipc::{
+        IPC_AUTH_EXPECT, IPC_PATH, IpcCommand, run_ipc_server, stop_ipc_server,
+    };
     use kode_bridge::IpcHttpClient;
     use serial_test::serial;
     use tracing::debug;
@@ -10,7 +12,11 @@ mod tests {
     async fn connect_ipc() -> Result<IpcHttpClient> {
         debug!("Connecting to IPC at {}", IPC_PATH);
         let client = kode_bridge::IpcHttpClient::new(IPC_PATH)?;
-        client.get(IpcCommand::Magic.as_ref()).send().await?;
+        client
+            .get(IpcCommand::Magic.as_ref())
+            .header("X-IPC-Magic", IPC_AUTH_EXPECT)
+            .send()
+            .await?;
         Ok(client)
     }
 
@@ -36,12 +42,9 @@ mod tests {
     async fn start_and_stop_ipc_server_helper() {
         let _ = stop_ipc_server().await;
 
-        let server_handle = tokio::spawn(async {
-            assert!(
-                run_ipc_server().await.is_ok(),
-                "Starting IPC server should return Ok"
-            );
-        });
+        let server_handle = run_ipc_server()
+            .await
+            .expect("Starting IPC server should return Ok");
 
         let client = {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -58,7 +61,8 @@ mod tests {
             "Stopping IPC server after starting should return Ok"
         );
 
-        let _ = server_handle.await;
+        let res = server_handle.await.unwrap();
+        assert!(res.is_ok(), "server should exit cleanly");
 
         assert!(
             connect_ipc().await.is_err(),

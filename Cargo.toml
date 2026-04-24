@@ -30,6 +30,16 @@ path = "src/bin/mock_binary.rs"
 required-features = ["test"]
 
 [[bin]]
+name = "crash_binary"
+path = "src/bin/crash_binary.rs"
+required-features = ["test"]
+
+[[bin]]
+name = "owner_lock_holder"
+path = "src/bin/owner_lock_holder.rs"
+required-features = ["standalone", "test"]
+
+[[bin]]
 name = "service-integration-driver"
 path = "src/bin/service_integration_driver.rs"
 required-features = ["client"]

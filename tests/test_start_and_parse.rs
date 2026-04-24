@@ -1,10 +1,28 @@
 #![cfg(feature = "standalone")]
 #[cfg(test)]
 mod tests {
-    use clash_verge_service_ipc::{VERSION, run_ipc_server, stop_ipc_server};
-    use clash_verge_service_ipc::{connect, get_version};
+    use clash_verge_service_ipc::{
+        IPC_AUTH_EXPECT, IpcCommand, VERSION, connect, get_version, run_ipc_server, stop_ipc_server,
+    };
     use serial_test::serial;
-    use tokio::time;
+    use tokio::task::JoinHandle;
+    use tokio::time::{Duration, sleep};
+
+    async fn wait_for_ipc_ready(
+        mut handle: JoinHandle<kode_bridge::Result<()>>,
+    ) -> JoinHandle<kode_bridge::Result<()>> {
+        for _ in 0..40 {
+            if connect().await.is_ok() {
+                return handle;
+            }
+            tokio::select! {
+                result = &mut handle => panic!("IPC server task exited before readiness: {:?}", result),
+                _ = sleep(Duration::from_millis(50)) => {}
+            }
+        }
+
+        panic!("IPC server did not become reachable before timeout");
+    }
 
     #[tokio::test]
     #[serial]
@@ -42,14 +60,11 @@ mod tests {
     async fn test_start_and_parse() {
         let _ = stop_ipc_server().await;
 
-        let server_handle = tokio::spawn(async {
-            assert!(
-                run_ipc_server().await.is_ok(),
-                "Starting IPC server should return Ok"
-            );
-        });
+        let mut server_handle = run_ipc_server()
+            .await
+            .expect("Starting IPC server should return Ok");
 
-        time::sleep(std::time::Duration::from_millis(100)).await;
+        server_handle = wait_for_ipc_ready(server_handle).await;
 
         let client = connect().await;
         assert!(
@@ -78,6 +93,19 @@ mod tests {
             "Version should not match mock version"
         );
 
-        let _ = server_handle.await;
+        let status = client
+            .unwrap()
+            .get(IpcCommand::Status.as_ref())
+            .header("X-IPC-Magic", IPC_AUTH_EXPECT)
+            .send()
+            .await;
+        assert!(
+            status.is_ok(),
+            "Should receive a response from Status command"
+        );
+
+        stop_ipc_server().await.unwrap();
+        let res = server_handle.await.unwrap();
+        assert!(res.is_ok(), "server should exit cleanly");
     }
 }
