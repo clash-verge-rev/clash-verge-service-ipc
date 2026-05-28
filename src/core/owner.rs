@@ -40,6 +40,11 @@ impl Drop for ServiceOwnerGuard {
 
         let _ = std::fs::remove_file(self.paths.pid_file_path());
 
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(self.paths.owner_lock_path());
+        }
+
         #[cfg(windows)]
         {
             let _ = std::fs::remove_file(self.paths.owner_lock_path());
@@ -242,6 +247,7 @@ fn cleanup_runtime_artifacts(paths: &ServicePaths) {
 
     #[cfg(unix)]
     {
+        let _ = std::fs::remove_file(paths.owner_lock_path());
         let _ = std::fs::remove_file(paths.ipc_path());
     }
 
