@@ -20,9 +20,9 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{info, trace, warn};
 
-const IPC_MAX_RESTARTS: u32 = 5;
-const IPC_RESTART_WINDOW: Duration = Duration::from_secs(60);
-const IPC_MAX_BACKOFF: Duration = Duration::from_secs(5);
+const IPC_MAX_RESTARTS: u32 = 10;
+const IPC_RESTART_WINDOW: Duration = Duration::from_secs(10);
+const IPC_MAX_BACKOFF: Duration = Duration::from_millis(500);
 
 pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     make_ipc_dir().await?;
@@ -185,7 +185,7 @@ fn ipc_backoff_delay(attempt: u32) -> Duration {
         return Duration::ZERO;
     }
 
-    Duration::from_secs(1u64 << (attempt - 1).min(3)).min(IPC_MAX_BACKOFF)
+    Duration::from_millis(100u64 << (attempt - 1).min(3)).min(IPC_MAX_BACKOFF)
 }
 
 async fn make_ipc_dir() -> Result<()> {
