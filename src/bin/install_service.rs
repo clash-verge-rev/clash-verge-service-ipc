@@ -214,13 +214,16 @@ fn main() -> anyhow::Result<()> {
     use std::env;
     use std::ffi::{OsStr, OsString};
 
+    const SERVICE_NAME: &str = "clash_verge_service";
+
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
-    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::START;
-    if let Ok(service) = service_manager.open_service("clash_verge_service", service_access)
-        && let Ok(status) = service.query_status()
-    {
+    let service_access =
+        ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::CHANGE_CONFIG;
+    if let Ok(service) = service_manager.open_service(SERVICE_NAME, service_access) {
+        configure_windows_service_recovery(&service)?;
+        let status = service.query_status()?;
         match status.current_state {
             ServiceState::StopPending
             | ServiceState::Stopped
@@ -244,7 +247,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let service_info = ServiceInfo {
-        name: OsString::from("clash_verge_service"),
+        name: OsString::from(SERVICE_NAME),
         display_name: OsString::from("Clash Verge Service"),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
@@ -260,7 +263,36 @@ fn main() -> anyhow::Result<()> {
     let service = service_manager.create_service(&service_info, start_access)?;
 
     service.set_description("Clash Verge Service helps to launch clash core")?;
+    configure_windows_service_recovery(&service)?;
     service.start(&Vec::<&OsStr>::new())?;
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn configure_windows_service_recovery(
+    service: &platform_lib::service::Service,
+) -> platform_lib::Result<()> {
+    use platform_lib::service::{
+        ServiceAction, ServiceActionType, ServiceFailureActions, ServiceFailureResetPeriod,
+    };
+    use std::time::Duration;
+
+    let actions = [5, 10, 30]
+        .into_iter()
+        .map(|delay_secs| ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: Duration::from_secs(delay_secs),
+        })
+        .collect();
+
+    service.update_failure_actions(ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 60 * 60)),
+        reboot_msg: None,
+        command: None,
+        actions: Some(actions),
+    })?;
+    service.set_failure_actions_on_non_crash_failures(true)?;
 
     Ok(())
 }

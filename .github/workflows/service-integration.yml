@@ -1,7 +1,30 @@
-name: Full Tests
+name: Service Integration
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+      - "resources/**"
+      - ".github/workflows/service-integration.yml"
+      - ".github/workflows/service-recovery.yml"
+  push:
+    branches:
+      - "**"
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+      - "resources/**"
+      - ".github/workflows/service-integration.yml"
+      - ".github/workflows/service-recovery.yml"
+
+permissions:
+  contents: read
 
 jobs:
   cargo-tests:

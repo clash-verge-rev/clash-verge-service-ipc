@@ -1,0 +1,176 @@
+name: Service Recovery
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+      - "resources/**"
+      - ".github/workflows/service-integration.yml"
+      - ".github/workflows/service-recovery.yml"
+  push:
+    branches:
+      - "**"
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+      - "resources/**"
+      - ".github/workflows/service-integration.yml"
+      - ".github/workflows/service-recovery.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    name: Verify service recovery (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Build service binaries
+        run: cargo build --release --features "standalone client"
+
+      - name: Install service (Unix)
+        if: runner.os != 'Windows'
+        run: sudo target/release/clash-verge-service-install --debug
+
+      - name: Kill service and verify recovery (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+
+          service="clash-verge-service.service"
+          target/release/service-integration-driver ping
+
+          old_pid="$(systemctl show "$service" --property=MainPID --value)"
+          if [ -z "$old_pid" ] || [ "$old_pid" = "0" ]; then
+            sudo systemctl status "$service" --no-pager
+            exit 1
+          fi
+
+          sudo kill -9 "$old_pid"
+
+          for _ in {1..40}; do
+            sleep 1
+            new_pid="$(systemctl show "$service" --property=MainPID --value)"
+            active_state="$(systemctl show "$service" --property=ActiveState --value)"
+            if [ "$active_state" = "active" ] && [ -n "$new_pid" ] && [ "$new_pid" != "0" ] && [ "$new_pid" != "$old_pid" ]; then
+              target/release/service-integration-driver ping
+              echo "Recovered service PID $old_pid -> $new_pid"
+              exit 0
+            fi
+          done
+
+          sudo systemctl status "$service" --no-pager
+          exit 1
+
+      - name: Kill service and verify recovery (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+
+          service_id="io.github.clash-verge-rev.clash-verge-rev.service"
+          target/release/service-integration-driver ping
+
+          get_pid() {
+            sudo launchctl print "system/$service_id" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = / { print $2; exit }' || true
+          }
+
+          old_pid="$(get_pid)"
+          if [ -z "$old_pid" ] || [ "$old_pid" = "-" ]; then
+            sudo launchctl print "system/$service_id"
+            exit 1
+          fi
+
+          sudo kill -9 "$old_pid"
+
+          for _ in {1..40}; do
+            sleep 1
+            new_pid="$(get_pid)"
+            if [ -n "$new_pid" ] && [ "$new_pid" != "-" ] && [ "$new_pid" != "$old_pid" ]; then
+              target/release/service-integration-driver ping
+              echo "Recovered service PID $old_pid -> $new_pid"
+              exit 0
+            fi
+          done
+
+          sudo launchctl print "system/$service_id"
+          exit 1
+
+      - name: Install service (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\target\release\clash-verge-service-install.exe"
+          Start-Sleep -Seconds 2
+
+      - name: Kill service and verify recovery (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $serviceName = "clash_verge_service"
+          $driver = "$env:GITHUB_WORKSPACE\target\release\service-integration-driver.exe"
+
+          & $driver ping
+          if ($LASTEXITCODE -ne 0) {
+            throw "IPC was not reachable before killing the service process"
+          }
+
+          $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
+          $oldPid = [int]$service.ProcessId
+          if ($oldPid -le 0) {
+            throw "Service is not running"
+          }
+
+          Stop-Process -Id $oldPid -Force
+
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 1
+            $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
+            $newPid = [int]$service.ProcessId
+            if ($service.State -eq "Running" -and $newPid -gt 0 -and $newPid -ne $oldPid) {
+              & $driver ping
+              if ($LASTEXITCODE -ne 0) {
+                throw "IPC did not respond after service restart"
+              }
+              Write-Host "Recovered service PID $oldPid -> $newPid"
+              exit 0
+            }
+          }
+
+          sc.exe queryex $serviceName
+          throw "Service did not restart after forced process exit"
+
+      - name: Uninstall service (Unix)
+        if: always() && runner.os != 'Windows'
+        run: |
+          if [ -x target/release/clash-verge-service-uninstall ]; then
+            sudo target/release/clash-verge-service-uninstall --debug
+          fi
+
+      - name: Uninstall service (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $service = Get-Service -Name "clash_verge_service" -ErrorAction SilentlyContinue
+          if ($null -ne $service) {
+            & "$env:GITHUB_WORKSPACE\target\release\clash-verge-service-uninstall.exe"
+          }

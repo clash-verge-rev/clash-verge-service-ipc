@@ -1,25 +1,30 @@
 #![cfg(feature = "client")]
 
 use clash_verge_service_ipc::{
-    ClashConfig, CoreConfig, WriterConfig, connect, start_clash, stop_clash, stop_ipc_server,
+    ClashConfig, CoreConfig, IpcConfig, WriterConfig, get_status, set_config, start_clash,
+    stop_clash, stop_ipc_server,
 };
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
+
+const IPC_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const IPC_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: service-integration-driver <start|stop>");
+        eprintln!("usage: service-integration-driver <ping|start|stop>");
         std::process::exit(1);
     }
 
     match args[1].as_str() {
+        "ping" => wait_ipc_ready().await?,
         "start" => start_flow().await?,
         "stop" => stop_flow().await?,
         _ => {
-            eprintln!("usage: service-integration-driver <start|stop>");
+            eprintln!("usage: service-integration-driver <ping|start|stop>");
             std::process::exit(1);
         }
     }
@@ -47,13 +52,27 @@ async fn stop_flow() -> anyhow::Result<()> {
 }
 
 async fn wait_ipc_ready() -> anyhow::Result<()> {
-    for _ in 0..20 {
-        if connect().await.is_ok() {
-            return Ok(());
+    set_config(Some(IpcConfig {
+        default_timeout: Duration::from_millis(250),
+        max_retries: 1,
+        retry_delay: Duration::from_millis(25),
+    }))
+    .await;
+
+    let result: anyhow::Result<()> = async {
+        let deadline = Instant::now() + IPC_READY_TIMEOUT;
+        while Instant::now() < deadline {
+            if get_status().await.is_ok() {
+                return Ok(());
+            }
+            sleep(IPC_PROBE_INTERVAL).await;
         }
-        sleep(Duration::from_millis(200)).await;
+        anyhow::bail!("IPC server not reachable within {:?}", IPC_READY_TIMEOUT)
     }
-    anyhow::bail!("IPC server not reachable");
+    .await;
+
+    set_config(None).await;
+    result
 }
 
 fn mock_binary_path() -> anyhow::Result<String> {
