@@ -1,4 +1,4 @@
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 fn main() {
     panic!("This program is not intended to run on this platform.");
 }
@@ -197,6 +197,67 @@ fn main() -> Result<(), Error> {
     // Reload and start service
     let _ = run_command("systemctl", &["daemon-reload"], debug);
     let _ = run_command("systemctl", &["enable", SERVICE_NAME, "--now"], debug);
+
+    Ok(())
+}
+
+#[cfg(target_os = "freebsd")]
+fn main() -> Result<(), Error> {
+    const SERVICE_NAME: &str = "clash_verge_service";
+    use std::env;
+    use std::fs::File;
+    use std::io::Write;
+    use std::path::Path;
+
+    let debug = env::args().any(|arg| arg == "--debug");
+
+    let service_binary_path = env::current_exe()
+        .unwrap()
+        .with_file_name("clash-verge-service");
+
+    if !service_binary_path.exists() {
+        return Err(anyhow::anyhow!("clash-verge-service binary not found"));
+    }
+
+    // If the service is already running, nothing to do.
+    let status_output = std::process::Command::new("service")
+        .args([SERVICE_NAME, "status"])
+        .output();
+    if let Ok(output) = status_output
+        && output.status.success()
+    {
+        return Ok(());
+    }
+
+    // Write the rc.d script under /usr/local/etc/rc.d (FreeBSD ports convention).
+    let rc_dir = Path::new("/usr/local/etc/rc.d");
+    if !rc_dir.exists() {
+        std::fs::create_dir_all(rc_dir)
+            .map_err(|e| anyhow::anyhow!("Failed to create rc.d directory: {}", e))?;
+    }
+    let rc_file = rc_dir.join(SERVICE_NAME);
+
+    let rc_content = format!(
+        include_str!("../../resources/rc_d_service.tmpl"),
+        exec_start = service_binary_path.to_str().unwrap(),
+        group = resolve_service_group_name()
+    );
+
+    File::create(&rc_file)
+        .and_then(|mut file| file.write_all(rc_content.as_bytes()))
+        .map_err(|e| anyhow::anyhow!("Failed to write rc.d script: {}", e))?;
+
+    // rc.d scripts must be executable.
+    let _ = run_command("chmod", &["755", rc_file.to_str().unwrap()], debug);
+    let _ = run_command("chown", &["root:wheel", rc_file.to_str().unwrap()], debug);
+
+    // Enable at boot and start now.
+    let _ = run_command(
+        "sysrc",
+        &[&format!("{}_enable=YES", SERVICE_NAME)],
+        debug,
+    );
+    let _ = run_command("service", &[SERVICE_NAME, "start"], debug);
 
     Ok(())
 }
