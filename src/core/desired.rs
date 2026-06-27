@@ -72,6 +72,9 @@ pub async fn persist_writer_config(config: &WriterConfig) -> Result<DesiredState
 }
 
 pub async fn restore_desired_state() -> Result<()> {
+    #[cfg(all(target_os = "macos", not(feature = "test")))]
+    cleanup_legacy_desired_state().await;
+
     let state = load_desired_state().await?;
 
     if let Some(writer_config) = state.last_writer_config.as_ref()
@@ -95,6 +98,42 @@ pub async fn restore_desired_state() -> Result<()> {
         state.generation
     );
     CORE_MANAGER.lock().await.start_core(config).await
+}
+
+/// 线程 B:macOS 状态目录迁到 `/Library/Application Support` 后,清理旧位置残留的
+/// desired-state(launchd 下曾用 `/var/lib`,或 HOME=/var/root 时的 `/var/root/.local/state`)。
+/// 不迁移(GUI 会在下次启动重建状态),仅备份移走避免遗留垃圾或被旧路径误读。
+#[cfg(all(target_os = "macos", not(feature = "test")))]
+async fn cleanup_legacy_desired_state() {
+    let legacy_files = [
+        "/var/lib/clash-verge-service/desired-state.json",
+        "/var/root/.local/state/clash-verge-service/desired-state.json",
+    ];
+    for legacy in legacy_files {
+        let legacy = std::path::Path::new(legacy);
+        match tokio::fs::try_exists(legacy).await {
+            Ok(true) => {
+                let backup = legacy.with_extension("json.legacy.bak");
+                match tokio::fs::rename(legacy, &backup).await {
+                    Ok(()) => info!(
+                        "Backed up legacy desired-state {:?} -> {:?}",
+                        legacy, backup
+                    ),
+                    Err(error) => {
+                        warn!(
+                            "Failed to back up legacy desired-state {:?}: {}",
+                            legacy, error
+                        )
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(error) => warn!(
+                "Failed to check legacy desired-state {:?}: {}",
+                legacy, error
+            ),
+        }
+    }
 }
 
 async fn update_desired_state(update: impl FnOnce(&mut DesiredState)) -> Result<DesiredState> {

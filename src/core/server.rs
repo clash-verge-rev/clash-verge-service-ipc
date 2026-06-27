@@ -188,49 +188,136 @@ fn ipc_backoff_delay(attempt: u32) -> Duration {
     Duration::from_millis(100u64 << (attempt - 1).min(3)).min(IPC_MAX_BACKOFF)
 }
 
+/// 解析 IPC 目录(`/tmp/verge`)应归属的组 GID。
+///
+/// launchd 下服务以 root:wheel 运行且 **没有 `SUDO_GID`**，若直接用 `getgid()`(=wheel)，
+/// 非 root 的 GUI 用户会被 0o2770 目录挡在外面(issue #7333：重启后服务连接失败、TUN
+/// 失效;而手动 `sudo` 因带 `SUDO_GID` 反而正常)。解析优先级：
+/// 1. `SUDO_GID`(终端 sudo 安装)
+/// 2. macOS 控制台登录用户的主组(运行期 GUI 在线时最准，覆盖非 staff 主组的账户)
+/// 3. macOS `staff` 组(GUI 账户默认主组，开机早于登录时仍可用，修掉开机竞态)
+/// 4. `getgid()` 兜底(保持原行为)
+#[cfg(unix)]
+fn resolve_ipc_dir_gid() -> platform_lib::gid_t {
+    if let Some(gid) = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|s| s.parse::<platform_lib::gid_t>().ok())
+    {
+        return gid;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(gid) = macos_console_user_gid() {
+            return gid;
+        }
+        if let Some(gid) = macos_group_gid(c"staff") {
+            return gid;
+        }
+    }
+
+    unsafe { platform_lib::getgid() }
+}
+
+/// macOS：控制台(GUI 登录)用户的主组 GID。`/dev/console` 的属主即当前 GUI 用户，
+/// 无人登录时其属主为 root，返回 `None`。
+#[cfg(target_os = "macos")]
+fn macos_console_user_gid() -> Option<platform_lib::gid_t> {
+    use std::os::unix::fs::MetadataExt;
+
+    let uid = std::fs::metadata("/dev/console").ok()?.uid();
+    if uid == 0 {
+        return None;
+    }
+    let pw = unsafe { platform_lib::getpwuid(uid) };
+    if pw.is_null() {
+        return None;
+    }
+    Some(unsafe { (*pw).pw_gid })
+}
+
+/// macOS：按名解析组 GID(如 "staff")。
+#[cfg(target_os = "macos")]
+fn macos_group_gid(name: &std::ffi::CStr) -> Option<platform_lib::gid_t> {
+    let grp = unsafe { platform_lib::getgrnam(name.as_ptr()) };
+    if grp.is_null() {
+        return None;
+    }
+    Some(unsafe { (*grp).gr_gid })
+}
+
+/// 确保 IPC 目录存在并设置属组与权限：属主保持 root、属组设为 GUI 用户可访问的组、
+/// 模式 0o2770。`make_ipc_dir` 与看门狗共用,保证一致。
+///
+/// 见 issue #6149：SetGID(0o2000)让 socket 继承目录组；0o2770(rwxrws---)让 root 与
+/// 目标用户组都能管理 socket 生命周期(GUI 进程以非 root 重建 socket / sidecar 回退时)。
+///
+/// 安全：`/tmp` 世界可写,攻击者可能预置 `/tmp/verge` 为指向任意目标的 symlink。故先用
+/// `symlink_metadata`(lstat)确认是真实目录(否则删除重建),再用 `O_DIRECTORY|O_NOFOLLOW`
+/// 打开后对 **fd** 做 `fchown`/`fchmod`：即便有人在创建后竞态替换成 symlink,`open` 也会
+/// 因 ELOOP 失败,绝不会以 root 跟随 symlink 对任意目标改属/改权。
+#[cfg(unix)]
+fn ensure_ipc_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // 1) 确保路径是真实目录(非 symlink/文件)
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Ok(_) => {
+            warn!(
+                "Unexpected non-directory at {:?}; removing and recreating",
+                dir
+            );
+            std::fs::remove_file(dir)?;
+            std::fs::create_dir_all(dir)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)?;
+        }
+        Err(e) => return Err(e),
+    }
+
+    // 2) no-follow 打开目录,再对 fd 改属/改权
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let fd = unsafe {
+        platform_lib::open(
+            c_path.as_ptr(),
+            platform_lib::O_DIRECTORY | platform_lib::O_NOFOLLOW | platform_lib::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let gid = resolve_ipc_dir_gid();
+    // 以 root 运行(生产/launchd)时强制属主为 root:若攻击者预置 `/tmp/verge` 为其拥有的
+    // 真实目录,必须夺回属主,否则其以 owner 身份保留对目录(及内部 socket)的管理权。
+    // 非 root(测试/开发)既无权设 root 属主也无攻击面,跳过 chown,仅设权限位。
+    // chown/chmod 失败即 fatal;`&&`/`||` 短路使 `last_os_error()` 为失败 syscall 的 errno。
+    let chown_ok =
+        unsafe { platform_lib::geteuid() } != 0 || unsafe { platform_lib::fchown(fd, 0, gid) } == 0;
+    let ok = chown_ok && unsafe { platform_lib::fchmod(fd, 0o2770 as platform_lib::mode_t) } == 0;
+    let result = if ok {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    };
+    unsafe {
+        platform_lib::close(fd);
+    }
+    result
+}
+
 async fn make_ipc_dir() -> Result<()> {
     #[cfg(unix)]
     {
-        use std::fs::Permissions;
-        use std::os::unix::fs::PermissionsExt;
-        use tokio::fs;
-
         let paths = service_paths();
         let Some(dir_path) = paths.ipc_path().parent() else {
             return Ok(());
         };
 
-        if !dir_path.exists() {
-            fs::create_dir_all(dir_path).await?;
-        }
-
-        // We need to ensure compatibility with sudo GID through the terminal
-        let gid = std::env::var("SUDO_GID")
-            .ok()
-            .and_then(|s| s.parse::<platform_lib::gid_t>().ok())
-            .unwrap_or_else(|| unsafe { platform_lib::getgid() });
-
-        if let Ok(c_path) = std::ffi::CString::new(dir_path.to_string_lossy().as_bytes()) {
-            unsafe {
-                if platform_lib::chown(c_path.as_ptr(), platform_lib::uid_t::MAX, gid) != 0 {
-                    let err = std::io::Error::last_os_error();
-                    log::warn!(
-                        "Failed to chown directory {:?} to gid {}: {}",
-                        dir_path,
-                        gid,
-                        err
-                    );
-                }
-            }
-        }
-
-        // See issues in https://github.com/clash-verge-rev/clash-verge-rev/issues/6149
-        // Apply the SetGID bit (0o2000) to ensure the IPC socket inherits the directory's group ID.
-        // The mode is set to 0o2770 (rwxrws---) to permit the designated user group (e.g., staff
-        // on macOS or the primary group on Linux) to manage the socket's lifecycle. This prevents
-        // permission denied errors when the GUI process, running with non-root privileges,
-        // attempts to recreate the socket during service initialization or sidecar fallbacks.
-        fs::set_permissions(dir_path, Permissions::from_mode(0o2770)).await?;
+        ensure_ipc_dir(dir_path)?;
     }
     #[cfg(windows)]
     {
@@ -305,18 +392,30 @@ pub fn spawn_socket_dir_watchdog() {
             interval.tick().await;
 
             let socket_path = paths.ipc_path();
-            if let Some(dir) = socket_path.parent()
-                && !dir.exists()
-            {
+            let Some(dir) = socket_path.parent() else {
+                continue;
+            };
+
+            if !dir.exists() {
                 warn!("IPC socket directory {:?} was deleted, recreating", dir);
-                if let Err(e) = tokio::fs::create_dir_all(dir).await {
-                    warn!("Failed to recreate IPC socket directory: {}", e);
+                if let Err(e) = ensure_ipc_dir(dir) {
+                    warn!("Failed to recreate IPC socket directory {:?}: {}", dir, e);
                     continue;
                 }
-                use std::fs::Permissions;
-                use std::os::unix::fs::PermissionsExt;
-                let _ = tokio::fs::set_permissions(dir, Permissions::from_mode(0o777)).await;
                 info!("IPC socket directory {:?} recreated", dir);
+                continue;
+            }
+
+            // 目录已存在：组属可能过期(开机落 staff、之后控制台用户主组不同)，或被替换为
+            // symlink/文件。用 lstat(no-follow)判断，必要时经 ensure_ipc_dir 安全收敛
+            // (issue #7333 开机竞态尾部 + /tmp symlink 防护)。一致则跳过，避免抖动。
+            use std::os::unix::fs::MetadataExt;
+            let needs_fix = match std::fs::symlink_metadata(dir) {
+                Ok(meta) if meta.file_type().is_dir() => meta.gid() != resolve_ipc_dir_gid(),
+                _ => true,
+            };
+            if needs_fix && let Err(e) = ensure_ipc_dir(dir) {
+                warn!("Failed to re-apply ownership on {:?}: {}", dir, e);
             }
         }
     });
@@ -481,4 +580,23 @@ fn json_response<T: Serialize>(
         .status(status)
         .json(&json_value)?
         .build())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staff_group_resolves_to_valid_gid() {
+        // macOS GUI 账户默认主组 staff 必须能解析；开机竞态兜底依赖它，
+        // 且其 gid(20)必须 != wheel(0)，否则又会把 GUI 用户挡在外面(issue #7333)。
+        let gid = macos_group_gid(c"staff").expect("staff group must exist on macOS");
+        assert_eq!(gid, 20, "staff 在 macOS 上固定为 gid 20");
+        assert_ne!(gid, 0, "解析出的组不能是 wheel(0)");
+    }
+
+    #[test]
+    fn unknown_group_resolves_to_none() {
+        assert!(macos_group_gid(c"clash-verge-no-such-group-zzz").is_none());
+    }
 }
