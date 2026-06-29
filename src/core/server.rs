@@ -192,14 +192,26 @@ fn ipc_backoff_delay(attempt: u32) -> Duration {
 ///
 /// launchd 下服务以 root:wheel 运行且 **没有 `SUDO_GID`**，若直接用 `getgid()`(=wheel)，
 /// 非 root 的 GUI 用户会被 0o2770 目录挡在外面(issue #7333：重启后服务连接失败、TUN
-/// 失效;而手动 `sudo` 因带 `SUDO_GID` 反而正常)。解析优先级：
+/// 失效;而手动 `sudo` 因带 `SUDO_GID` 反而正常)。Linux 上类似：systemd 以 root 启动
+/// 且未设 `Group=` 时 `getgid()` 返回 0，同样导致 GUI 用户无法访问(issue #6159)。
+/// 解析优先级：
 /// 1. `SUDO_GID`(终端 sudo 安装)
-/// 2. macOS 控制台登录用户的主组(运行期 GUI 在线时最准，覆盖非 staff 主组的账户)
-/// 3. macOS `staff` 组(GUI 账户默认主组，开机早于登录时仍可用，修掉开机竞态)
-/// 4. `getgid()` 兜底(保持原行为)
+/// 2. `CLASH_VERGE_SERVICE_GID`(GUI pkexec 安装时传入的组 GID)
+/// 3. macOS 控制台登录用户的主组(运行期 GUI 在线时最准，覆盖非 staff 主组的账户)
+/// 4. macOS `staff` 组(GUI 账户默认主组，开机早于登录时仍可用，修掉开机竞态)
+/// 5. Linux `clash-meta` 组(Clash Verge 服务专用 IPC 组)
+/// 6. SUDO_UID / PKEXEC_UID 对应用户的主组(兜底)
+/// 7. `getgid()` 兜底(保持原行为)
 #[cfg(unix)]
 fn resolve_ipc_dir_gid() -> platform_lib::gid_t {
     if let Some(gid) = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|s| s.parse::<platform_lib::gid_t>().ok())
+    {
+        return gid;
+    }
+
+    if let Some(gid) = std::env::var("CLASH_VERGE_SERVICE_GID")
         .ok()
         .and_then(|s| s.parse::<platform_lib::gid_t>().ok())
     {
@@ -213,6 +225,26 @@ fn resolve_ipc_dir_gid() -> platform_lib::gid_t {
         }
         if let Some(gid) = macos_group_gid(c"staff") {
             return gid;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(gid) = unix_group_gid(c"clash-meta") {
+            return gid;
+        }
+        if let Some(uid) = std::env::var("SUDO_UID")
+            .ok()
+            .and_then(|s| s.parse::<platform_lib::uid_t>().ok())
+            .or_else(|| {
+                std::env::var("PKEXEC_UID")
+                    .ok()
+                    .and_then(|s| s.parse::<platform_lib::uid_t>().ok())
+            })
+        {
+            if let Some(gid) = unix_user_primary_gid(uid) {
+                return gid;
+            }
         }
     }
 
@@ -236,14 +268,30 @@ fn macos_console_user_gid() -> Option<platform_lib::gid_t> {
     Some(unsafe { (*pw).pw_gid })
 }
 
-/// macOS：按名解析组 GID(如 "staff")。
-#[cfg(target_os = "macos")]
-fn macos_group_gid(name: &std::ffi::CStr) -> Option<platform_lib::gid_t> {
+/// 按名解析组 GID(通用 Unix，如 "staff", "clash-meta")。
+#[cfg(unix)]
+fn unix_group_gid(name: &std::ffi::CStr) -> Option<platform_lib::gid_t> {
     let grp = unsafe { platform_lib::getgrnam(name.as_ptr()) };
     if grp.is_null() {
         return None;
     }
     Some(unsafe { (*grp).gr_gid })
+}
+
+/// 按 UID 解析用户的主组 GID。
+#[cfg(unix)]
+fn unix_user_primary_gid(uid: platform_lib::uid_t) -> Option<platform_lib::gid_t> {
+    let pw = unsafe { platform_lib::getpwuid(uid) };
+    if pw.is_null() {
+        return None;
+    }
+    Some(unsafe { (*pw).pw_gid })
+}
+
+/// macOS：按名解析组 GID(如 "staff")。
+#[cfg(target_os = "macos")]
+fn macos_group_gid(name: &std::ffi::CStr) -> Option<platform_lib::gid_t> {
+    unix_group_gid(name)
 }
 
 /// 确保 IPC 目录存在并设置属组与权限：属主保持 root、属组设为 GUI 用户可访问的组、
