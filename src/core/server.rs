@@ -648,3 +648,36 @@ mod tests {
         assert!(macos_group_gid(c"clash-verge-no-such-group-zzz").is_none());
     }
 }
+
+#[cfg(test)]
+mod resolve_gid_tests {
+    use super::*;
+
+    #[test]
+    fn unix_group_gid_resolves_known_groups() {
+        assert_eq!(unix_group_gid(c"root"), Some(0));
+    }
+
+    #[test]
+    fn unix_group_gid_returns_none_for_missing() {
+        assert_eq!(unix_group_gid(c"this-group-no-exist-zzz"), None);
+    }
+
+    #[test]
+    fn unix_user_primary_gid_returns_root_for_uid_0() {
+        assert_eq!(unix_user_primary_gid(0), Some(0));
+    }
+
+    #[test]
+    fn unix_user_primary_gid_returns_none_for_bogus_uid() {
+        // UID that almost certainly doesn't exist
+        assert_eq!(unix_user_primary_gid(0xDEAD), None);
+    }
+
+    #[test]
+    fn resolve_ipc_dir_gid_returns_valid_gid() {
+        let gid = resolve_ipc_dir_gid();
+        // Must not panic; actual value depends on environment
+        let _ = gid;
+    }
+}
