@@ -8,7 +8,7 @@ use clash_verge_service_ipc::{
     acquire_service_owner, reconcile_service_startup, restore_desired_state,
     run_ipc_supervisor_until_shutdown,
 };
-use tracing::{Level, info};
+use tracing::{Level, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 #[cfg(windows)]
@@ -165,8 +165,17 @@ async fn run_standalone() -> Result<()> {
         return Ok(());
     };
 
-    reconcile_service_startup().await?;
-    restore_desired_state().await?;
+    // 启动恢复只做 best-effort；即使失败也要启动 IPC，让 GUI 重连后重推配置自愈。
+    // 否则失效的 desired-state 路径会导致进程退出并被 launchd 反复拉起。
+    if let Err(error) = reconcile_service_startup().await {
+        warn!("Service startup reconciliation failed; continuing to bring up IPC server: {error:#}");
+    }
+    if let Err(error) = restore_desired_state().await {
+        warn!(
+            "Failed to restore desired core state on startup; core will not be auto-started. \
+             Keeping the IPC server up so the GUI can reconnect and recover: {error:#}"
+        );
+    }
 
     run_ipc_supervisor_until_shutdown(shutdown_signal()).await?;
 

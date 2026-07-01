@@ -97,7 +97,31 @@ pub async fn restore_desired_state() -> Result<()> {
         "Restoring core from desired state generation {}",
         state.generation
     );
-    CORE_MANAGER.lock().await.start_core(config).await
+    if let Err(error) = CORE_MANAGER.lock().await.start_core(config).await {
+        // core 路径不存在通常表示 desired-state 已过期；清掉运行意图，避免重启时反复重试。
+        // 其它失败保留意图并交给上层记录。
+        if is_not_found_error(&error) {
+            warn!(
+                "Core binary not found while restoring desired state (stale/translocated path?); \
+                 clearing desired core-run state to stop retrying: {error:#}"
+            );
+            if let Err(clear_error) = persist_core_stopped().await {
+                warn!("Failed to clear stale desired state after not-found core path: {clear_error:#}");
+            }
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// 判断错误链中是否包含 NotFound I/O 错误，用于识别失效的 core 路径。
+fn is_not_found_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 /// 线程 B:macOS 状态目录迁到 `/Library/Application Support` 后,清理旧位置残留的
