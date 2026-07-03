@@ -106,7 +106,9 @@ pub async fn restore_desired_state() -> Result<()> {
                  clearing desired core-run state to stop retrying: {error:#}"
             );
             if let Err(clear_error) = persist_core_stopped().await {
-                warn!("Failed to clear stale desired state after not-found core path: {clear_error:#}");
+                warn!(
+                    "Failed to clear stale desired state after not-found core path: {clear_error:#}"
+                );
             }
             return Ok(());
         }

@@ -168,7 +168,9 @@ async fn run_standalone() -> Result<()> {
     // 启动恢复只做 best-effort；即使失败也要启动 IPC，让 GUI 重连后重推配置自愈。
     // 否则失效的 desired-state 路径会导致进程退出并被 launchd 反复拉起。
     if let Err(error) = reconcile_service_startup().await {
-        warn!("Service startup reconciliation failed; continuing to bring up IPC server: {error:#}");
+        warn!(
+            "Service startup reconciliation failed; continuing to bring up IPC server: {error:#}"
+        );
     }
     if let Err(error) = restore_desired_state().await {
         warn!(
