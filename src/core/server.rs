@@ -11,12 +11,13 @@ use crate::{ClashConfig, IpcCommand, VERSION, WriterConfig};
 use anyhow::{Result as AnyResult, anyhow};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
+use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::{
     future::Future,
     time::{Duration, Instant},
 };
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, trace, warn};
 
@@ -24,7 +25,12 @@ const IPC_MAX_RESTARTS: u32 = 10;
 const IPC_RESTART_WINDOW: Duration = Duration::from_secs(10);
 const IPC_MAX_BACKOFF: Duration = Duration::from_millis(500);
 
+// 防止旧 listener 的清理删除 supervisor 刚创建的新 socket。
+static IPC_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
 pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
+    let _lifecycle_guard = IPC_LIFECYCLE_LOCK.lock().await;
+
     make_ipc_dir().await?;
     cleanup_stale_ipc_socket().await?;
     init_ipc_state().await?;
@@ -86,6 +92,8 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
 }
 
 pub async fn stop_ipc_server() -> Result<()> {
+    let _lifecycle_guard = IPC_LIFECYCLE_LOCK.lock().await;
+
     CORE_MANAGER.lock().await.stop_core().await.ok();
 
     if let Some(sender) = IpcState::global().take_sender().await {
