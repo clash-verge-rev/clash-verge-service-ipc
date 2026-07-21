@@ -3,20 +3,28 @@ pub use command::IpcCommand;
 
 pub mod structure;
 pub use structure::{
-    AuthenticatedRequest, ClashConfig, CoreConfig, OwnerCredentials, OwnerIdentity, RuntimeAsset,
-    RuntimeBundle, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot, WriterConfig,
-    owner_key,
+    AuthenticatedRequest, ClashConfig, CoreConfig, OWNER_TOKEN_FILE_NAME, OwnerCredentials,
+    OwnerIdentity, RuntimeAsset, RuntimeBundle, ServiceErrorCode, ServiceLifecycleState,
+    ServiceStatusSnapshot, WriterConfig, owner_key,
 };
 
 pub mod paths;
-pub use paths::{ServicePaths, mihomo_ipc_path, service_paths};
+pub use paths::{OwnerPaths, ServicePaths, mihomo_ipc_path, service_paths};
 
+#[cfg(feature = "standalone")]
+mod assets;
+#[cfg(feature = "standalone")]
+mod atomic_file;
 #[cfg(feature = "standalone")]
 mod auth;
 #[cfg(feature = "standalone")]
 mod desired;
 #[cfg(feature = "standalone")]
+mod legacy_cleanup;
+#[cfg(feature = "standalone")]
 mod logger;
+#[cfg(feature = "standalone")]
+mod maintenance;
 #[cfg(feature = "standalone")]
 mod manager;
 #[cfg(feature = "standalone")]
@@ -33,21 +41,33 @@ mod server;
 mod state;
 #[cfg(feature = "standalone")]
 mod status;
+#[cfg(feature = "test")]
+mod test_credentials;
+#[cfg(all(feature = "standalone", unix))]
+mod unix_security;
+#[cfg(all(feature = "standalone", windows))]
+mod windows_legacy_cleanup;
+#[cfg(all(feature = "standalone", windows))]
+mod windows_security;
 
 #[cfg(feature = "standalone")]
 pub use desired::{
-    DesiredState, load_desired_state, persist_core_started, persist_core_stopped,
-    persist_writer_config, restore_desired_state,
+    ActiveOwnerState, DesiredState, load_active_owner, load_owner_desired_state,
+    restore_desired_state,
 };
+#[cfg(feature = "standalone")]
+pub use maintenance::cleanup_stale_owner_state;
 #[cfg(all(feature = "standalone", feature = "test"))]
 pub use manager::{CoreWatchdogTestConfig, set_core_watchdog_config_for_tests};
 #[cfg(feature = "standalone")]
 pub use owner::{ServiceOwnerGuard, acquire_service_owner};
 #[cfg(feature = "standalone")]
 pub use reconcile::reconcile_service_startup;
+#[cfg(all(feature = "standalone", feature = "test"))]
+pub use runtime::write_core_runtime_record_for_tests;
 #[cfg(feature = "standalone")]
 pub use server::{run_ipc_server, run_ipc_supervisor_until_shutdown, stop_ipc_server};
 #[cfg(feature = "standalone")]
 pub use state::{service_lifecycle_state, set_service_lifecycle_state};
-#[cfg(feature = "standalone")]
-pub use status::service_status_snapshot;
+#[cfg(feature = "test")]
+pub use test_credentials::test_owner_credentials;

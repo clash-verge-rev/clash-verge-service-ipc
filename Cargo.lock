@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "clash_verge_service_ipc"
-version = "2.3.3"
+version = "2.4.0"
 dependencies = [
  "anyhow",
  "clash_verge_logger",
@@ -155,6 +155,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "windows-service",
+ "windows-sys",
 ]
 
 [[package]]
@@ -613,8 +614,6 @@ dependencies = [
 [[package]]
 name = "kode-bridge"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c462fd5d0886cd98cd74ecafdb44dd3f2b52b30711f07d42cc0f5956f38e706d"
 dependencies = [
  "bytes",
  "futures",
@@ -636,6 +635,7 @@ dependencies = [
  "tracing",
  "url",
  "widestring",
+ "windows-sys",
 ]
 
 [[package]]

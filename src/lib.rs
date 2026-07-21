@@ -4,20 +4,25 @@ mod core;
 mod client;
 
 pub use core::{
-    AuthenticatedRequest, ClashConfig, CoreConfig, IpcCommand, OwnerCredentials, OwnerIdentity,
-    RuntimeAsset, RuntimeBundle, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot,
-    WriterConfig, mihomo_ipc_path, owner_key,
+    AuthenticatedRequest, ClashConfig, CoreConfig, IpcCommand, OWNER_TOKEN_FILE_NAME,
+    OwnerCredentials, OwnerIdentity, RuntimeAsset, RuntimeBundle, ServiceErrorCode,
+    ServiceLifecycleState, ServiceStatusSnapshot, WriterConfig, mihomo_ipc_path, owner_key,
 };
-pub use core::{ServicePaths, service_paths};
+pub use core::{OwnerPaths, ServicePaths, service_paths};
 
 #[cfg(feature = "standalone")]
 pub use core::{
-    DesiredState, ServiceOwnerGuard, acquire_service_owner, load_desired_state,
-    persist_core_started, persist_core_stopped, persist_writer_config, reconcile_service_startup,
-    restore_desired_state, run_ipc_server, run_ipc_supervisor_until_shutdown,
-    service_lifecycle_state, service_status_snapshot, set_service_lifecycle_state, stop_ipc_server,
+    ActiveOwnerState, DesiredState, ServiceOwnerGuard, acquire_service_owner,
+    cleanup_stale_owner_state, load_active_owner, load_owner_desired_state,
+    reconcile_service_startup, restore_desired_state, run_ipc_server,
+    run_ipc_supervisor_until_shutdown, service_lifecycle_state, set_service_lifecycle_state,
+    stop_ipc_server,
 };
 
+#[cfg(feature = "test")]
+pub use core::test_owner_credentials;
+#[cfg(all(feature = "standalone", feature = "test"))]
+pub use core::write_core_runtime_record_for_tests;
 #[cfg(all(feature = "standalone", feature = "test"))]
 pub use core::{CoreWatchdogTestConfig, set_core_watchdog_config_for_tests};
 

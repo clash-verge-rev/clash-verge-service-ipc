@@ -4,8 +4,8 @@ mod common;
 mod tests {
     use anyhow::Result;
     use clash_verge_service_ipc::{
-        ClashConfig, CoreConfig, connect, load_desired_state, persist_core_stopped, run_ipc_server,
-        service_status_snapshot, start_clash, stop_ipc_server,
+        RuntimeBundle, connect, get_status, load_owner_desired_state, owner_key, run_ipc_server,
+        start_clash, stop_clash, stop_ipc_server,
     };
     use serial_test::serial;
     use std::sync::OnceLock;
@@ -114,19 +114,20 @@ mod tests {
     }
 
     async fn step_start_mock_binary() {
-        let clash_config = ClashConfig {
-            core_config: CoreConfig {
-                core_path: bin_path().to_string_lossy().to_string(),
-                ..Default::default()
-            },
-            log_config: Default::default(),
+        let credentials = common::owner_credentials();
+        let runtime_bundle = RuntimeBundle {
+            yaml: "mode: rule\n".to_string(),
+            assets: vec![],
+            core_path: bin_path().to_string_lossy().to_string(),
         };
-        let start_result = start_clash(&clash_config).await;
+        let start_result = start_clash(&credentials, &runtime_bundle).await;
         assert!(
             start_result.is_ok(),
             "Starting clash with mock binary should return Ok"
         );
-        let desired_state = load_desired_state().await.unwrap();
+        let desired_state = load_owner_desired_state(&owner_key(&credentials.identity))
+            .await
+            .unwrap();
         assert!(
             desired_state.core_should_be_running,
             "Desired state should persist running core intent"
@@ -136,7 +137,8 @@ mod tests {
             "Desired state should persist last ClashConfig"
         );
 
-        let status = service_status_snapshot().await.unwrap();
+        let status = get_status(&credentials).await.unwrap().data.unwrap();
+        assert!(status.is_active, "Status should identify the active owner");
         assert!(
             status.core_pid.is_some(),
             "Status should include the running core PID"
@@ -179,7 +181,8 @@ mod tests {
         }
 
         info!("🎉 All IPC flow steps passed!");
-        persist_core_stopped().await.unwrap();
+        let stop = stop_clash(&common::owner_credentials()).await?;
+        assert_eq!(stop.code, 0);
         stop_ipc_server().await.unwrap();
         let res = server_handle.await.unwrap();
         assert!(res.is_ok(), "server should exit cleanly");

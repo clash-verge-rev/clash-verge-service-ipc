@@ -32,8 +32,16 @@ use {
 #[cfg(not(windows))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    set_secure_process_umask();
     init_logger();
     run_standalone().await
+}
+
+#[cfg(unix)]
+fn set_secure_process_umask() {
+    unsafe {
+        platform_lib::umask(0o077);
+    }
 }
 
 /// Main entry point for Windows.
@@ -104,13 +112,19 @@ fn run_service() -> platform_lib::Result<()> {
             }
         };
 
-        if let Err(error) = reconcile_service_startup().await {
-            tracing::warn!("Service startup reconciliation failed: {}", error);
-            return true;
-        }
-        if let Err(error) = restore_desired_state().await {
-            tracing::warn!("Desired state restoration failed: {}", error);
-            return true;
+        match reconcile_service_startup().await {
+            Ok(()) => {
+                if let Err(error) = restore_desired_state().await {
+                    tracing::warn!(
+                        "Desired state restoration failed; keeping IPC available for GUI recovery: {}",
+                        error
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                "Service startup reconciliation failed; core starts remain blocked while IPC is available: {}",
+                error
+            ),
         }
 
         let result = run_ipc_supervisor_until_shutdown(async {
@@ -167,16 +181,18 @@ async fn run_standalone() -> Result<()> {
 
     // 启动恢复只做 best-effort；即使失败也要启动 IPC，让 GUI 重连后重推配置自愈。
     // 否则失效的 desired-state 路径会导致进程退出并被 launchd 反复拉起。
-    if let Err(error) = reconcile_service_startup().await {
-        warn!(
-            "Service startup reconciliation failed; continuing to bring up IPC server: {error:#}"
-        );
-    }
-    if let Err(error) = restore_desired_state().await {
-        warn!(
-            "Failed to restore desired core state on startup; core will not be auto-started. \
-             Keeping the IPC server up so the GUI can reconnect and recover: {error:#}"
-        );
+    match reconcile_service_startup().await {
+        Ok(()) => {
+            if let Err(error) = restore_desired_state().await {
+                warn!(
+                    "Failed to restore desired core state on startup; core will not be auto-started. \
+                     Keeping the IPC server up so the GUI can reconnect and recover: {error:#}"
+                );
+            }
+        }
+        Err(error) => warn!(
+            "Service startup reconciliation failed; core starts remain blocked while IPC is available: {error:#}"
+        ),
     }
 
     run_ipc_supervisor_until_shutdown(shutdown_signal()).await?;

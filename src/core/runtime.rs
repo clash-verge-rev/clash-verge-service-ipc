@@ -1,13 +1,14 @@
 use crate::core::paths::service_paths;
+use crate::core::process::ProcessIdentity;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::warn;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct CoreRuntimeRecord {
     pub(super) pid: u32,
     pub(super) ipc_path: String,
+    pub(super) identity: ProcessIdentity,
 }
 
 pub(super) async fn write_core_runtime_record(record: &CoreRuntimeRecord) -> Result<()> {
@@ -18,17 +19,40 @@ pub(super) async fn write_core_runtime_record(record: &CoreRuntimeRecord) -> Res
             .with_context(|| format!("failed to create core runtime directory {:?}", parent))?;
     }
 
+    let destination = paths.core_runtime_path();
+    let temporary = destination.with_extension("json.tmp");
     let json = serde_json::to_vec_pretty(record)?;
-    tokio::fs::write(paths.core_runtime_path(), json)
+    let mut file = tokio::fs::File::create(&temporary).await.with_context(|| {
+        format!(
+            "failed to create temporary core runtime record {:?}",
+            temporary
+        )
+    })?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, &json).await?;
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    file.sync_all().await?;
+    drop(file);
+    crate::core::atomic_file::replace(&temporary, destination)
         .await
-        .with_context(|| {
-            format!(
-                "failed to write core runtime record {:?}",
-                paths.core_runtime_path()
-            )
-        })?;
+        .with_context(|| format!("failed to replace core runtime record {destination:?}"))?;
+    #[cfg(unix)]
+    if let Some(parent) = destination.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
 
     Ok(())
+}
+
+#[cfg(feature = "test")]
+pub async fn write_core_runtime_record_for_tests(pid: u32, ipc_path: String) -> Result<()> {
+    let identity = crate::core::process::process_identity(pid)?
+        .with_context(|| format!("test core process {pid} is not running"))?;
+    write_core_runtime_record(&CoreRuntimeRecord {
+        pid,
+        ipc_path,
+        identity,
+    })
+    .await
 }
 
 pub(super) async fn read_core_runtime_record() -> Result<Option<CoreRuntimeRecord>> {
@@ -46,17 +70,12 @@ pub(super) async fn read_core_runtime_record() -> Result<Option<CoreRuntimeRecor
         }
     };
 
-    match serde_json::from_slice(&content) {
-        Ok(record) => Ok(Some(record)),
-        Err(error) => {
-            warn!(
-                "Ignoring invalid core runtime record {:?}: {}",
-                paths.core_runtime_path(),
-                error
-            );
-            Ok(None)
-        }
-    }
+    serde_json::from_slice(&content).map(Some).with_context(|| {
+        format!(
+            "invalid core runtime record {:?}",
+            paths.core_runtime_path()
+        )
+    })
 }
 
 pub(super) async fn remove_core_runtime_record() {

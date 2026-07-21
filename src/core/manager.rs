@@ -1,12 +1,14 @@
-use crate::WriterConfig;
 use crate::core::ClashConfig;
 use crate::core::logger::{get_writer, set_or_update_writer};
+use crate::core::process::process_identity;
+use crate::core::reconcile::ensure_startup_reconciled;
 use crate::core::runtime::{
     CoreRuntimeRecord, remove_core_runtime_record, write_core_runtime_record,
 };
-use crate::core::state::set_service_lifecycle_state;
+use crate::core::state::set_core_lifecycle_state;
 use crate::core::structure::ServiceLifecycleState;
-use anyhow::{Result, anyhow};
+use crate::{OwnerIdentity, WriterConfig};
+use anyhow::{Context as _, Result, anyhow};
 use clash_verge_logger::AsyncLogger;
 use compact_str::CompactString;
 use flexi_logger::writers::LogWriter;
@@ -77,20 +79,23 @@ impl ChildGuard {
         self.child.take()
     }
 
-    async fn kill_now(mut self) {
+    async fn kill_now(&mut self) -> Result<()> {
         for reader in self.readers.drain(..) {
             reader.abort();
         }
 
-        if let Some(mut child) = self.child.take() {
-            if let Err(e) = child.kill().await {
-                warn!("Failed to kill child ({:?}): {e}", child.id());
-            } else {
-                info!("Successfully killed child ({:?})", child.id());
-            }
+        if let Some(child) = self.child.as_mut() {
+            let child_id = child.id();
+            child
+                .kill()
+                .await
+                .with_context(|| format!("failed to kill child {child_id:?}"))?;
+            self.child.take();
+            info!("Successfully killed child ({:?})", child_id);
         } else {
             info!("No running core process found");
         }
+        Ok(())
     }
 }
 
@@ -234,16 +239,17 @@ async fn write_runtime_record_for_config(
     pid: Option<u32>,
     config: &ClashConfig,
     context: &'static str,
-) {
-    if let Some(pid) = pid
-        && let Err(error) = write_core_runtime_record(&CoreRuntimeRecord {
-            pid,
-            ipc_path: config.core_config.core_ipc_path.clone(),
-        })
-        .await
-    {
-        warn!("Failed to write core runtime record {context}: {error}");
-    }
+) -> Result<()> {
+    let pid = pid.context("spawned core did not expose a process ID")?;
+    let identity = process_identity(pid)?
+        .with_context(|| format!("core process {pid} exited before runtime record {context}"))?;
+    write_core_runtime_record(&CoreRuntimeRecord {
+        pid,
+        ipc_path: config.core_config.core_ipc_path.clone(),
+        identity,
+    })
+    .await
+    .with_context(|| format!("failed to write core runtime record {context}"))
 }
 
 pub struct CoreManager {
@@ -255,7 +261,8 @@ pub struct CoreManager {
     restart_count: Arc<AtomicU32>,
     last_recovery_at: Arc<AtomicU64>,
     watchdog_shutdown: Mutex<Option<oneshot::Sender<()>>>,
-    watchdog_handle: Mutex<Option<JoinHandle<()>>>,
+    watchdog_handle: Mutex<Option<JoinHandle<Result<()>>>>,
+    failed_child: Arc<Mutex<Option<ChildGuard>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -279,10 +286,13 @@ impl CoreManager {
             last_recovery_at: Arc::new(AtomicU64::new(0)),
             watchdog_shutdown: Mutex::new(None),
             watchdog_handle: Mutex::new(None),
+            failed_child: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub async fn start_core(&self, config: ClashConfig) -> Result<()> {
+    pub async fn start_core(&self, config: ClashConfig, owner: OwnerIdentity) -> Result<()> {
+        ensure_startup_reconciled()?;
+        set_core_lifecycle_state(ServiceLifecycleState::Starting);
         if self.running_pid.load(Ordering::Relaxed) != 0 {
             info!("Core is already running, stopping existing instance");
             self.stop_core().await?;
@@ -290,11 +300,68 @@ impl CoreManager {
 
         info!("Starting core with config: {:?}", config);
 
+        prepare_core_ipc_socket(&config.core_config.core_ipc_path, &owner)?;
         let args = core_args(&config);
 
-        let child_guard =
-            run_with_logging(&config.core_config.core_path, &args, &config.log_config).await?;
+        let mut child_guard = run_with_logging(
+            &config.core_config.core_path,
+            &args,
+            &config.log_config,
+            &owner,
+        )
+        .await?;
         let child_pid = child_guard.id();
+
+        if let Err(error) = secure_core_ipc_socket(
+            config.core_config.core_ipc_path.clone(),
+            owner.clone(),
+            child_pid,
+        )
+        .await
+        {
+            if let Err(kill_error) = child_guard.kill_now().await {
+                let now_secs = unix_timestamp_secs();
+                self.running_pid
+                    .store(child_pid.unwrap_or_default(), Ordering::Relaxed);
+                *self.running_config.lock().await = Some(config.clone());
+                *self.core_start_time.lock().await = Some(Instant::now());
+                self.core_started_at.store(now_secs, Ordering::Relaxed);
+                if let Err(record_error) = write_runtime_record_for_config(
+                    child_pid,
+                    &config,
+                    "after failed initial cleanup",
+                )
+                .await
+                {
+                    warn!("Failed to record unconfirmed core cleanup: {record_error:#}");
+                }
+                *self.failed_child.lock().await = Some(child_guard);
+                set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                return Err(anyhow!(
+                    "failed to secure core IPC: {error:#}; failed to terminate spawned core: {kill_error:#}"
+                ));
+            }
+            return Err(error);
+        }
+
+        if let Err(record_error) =
+            write_runtime_record_for_config(child_pid, &config, "after start").await
+        {
+            if let Err(kill_error) = child_guard.kill_now().await {
+                let now_secs = unix_timestamp_secs();
+                self.running_pid
+                    .store(child_pid.unwrap_or_default(), Ordering::Relaxed);
+                *self.running_config.lock().await = Some(config.clone());
+                *self.core_start_time.lock().await = Some(Instant::now());
+                self.core_started_at.store(now_secs, Ordering::Relaxed);
+                *self.failed_child.lock().await = Some(child_guard);
+                set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                return Err(anyhow!(
+                    "{record_error:#}; failed to terminate unrecorded core: {kill_error:#}"
+                ));
+            }
+            return Err(record_error);
+        }
 
         *self.core_start_time.lock().await = Some(Instant::now());
         self.core_started_at
@@ -303,10 +370,8 @@ impl CoreManager {
             .store(child_pid.unwrap_or_default(), Ordering::Relaxed);
         *self.running_config.lock().await = Some(config.clone());
 
-        write_runtime_record_for_config(child_pid, &config, "after start").await;
-
-        self.after_start(config.core_config.core_ipc_path.clone());
-        self.start_watchdog(child_guard, config).await;
+        self.start_watchdog(child_guard, config, owner).await;
+        set_core_lifecycle_state(ServiceLifecycleState::Running);
 
         Ok(())
     }
@@ -315,7 +380,18 @@ impl CoreManager {
         info!("Stopping core");
         LOGGER_MANAGER.clear_logs().await;
 
-        self.stop_watchdog().await;
+        let watchdog_result = self.stop_watchdog().await;
+        let mut recovered_failed_child = false;
+        if let Some(mut child_guard) = self.failed_child.lock().await.take() {
+            if let Err(error) = child_guard.kill_now().await {
+                *self.failed_child.lock().await = Some(child_guard);
+                return Err(error.context("failed to retry termination of tracked core"));
+            }
+            recovered_failed_child = true;
+        }
+        if !recovered_failed_child {
+            watchdog_result?;
+        }
 
         self.running_pid.store(0, Ordering::Relaxed);
         *self.core_start_time.lock().await = None;
@@ -333,21 +409,29 @@ impl CoreManager {
 
         remove_core_runtime_record().await;
         self.after_stop(core_ipc_path).await;
+        set_core_lifecycle_state(ServiceLifecycleState::Running);
 
         Ok(())
     }
 
-    async fn start_watchdog(&self, child_guard: ChildGuard, config: ClashConfig) {
+    async fn start_watchdog(
+        &self,
+        child_guard: ChildGuard,
+        config: ClashConfig,
+        owner: OwnerIdentity,
+    ) {
         let running_pid_arc = Arc::clone(&self.running_pid);
         let start_time_arc = Arc::clone(&self.core_start_time);
         let started_at_arc = Arc::clone(&self.core_started_at);
         let last_exit_reason_arc = Arc::clone(&self.last_core_exit_reason);
         let restart_count_arc = Arc::clone(&self.restart_count);
         let last_recovery_at_arc = Arc::clone(&self.last_recovery_at);
+        let failed_child_arc = Arc::clone(&self.failed_child);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let watchdog_config = watchdog_config();
 
         let handle = tokio::spawn(async move {
+            let mut recovery_exhausted = false;
             let mut child_guard = Some(child_guard);
             let mut shutdown_rx = shutdown_rx;
             let mut restart_timestamps: Vec<Instant> = Vec::new();
@@ -366,7 +450,13 @@ impl CoreManager {
                     tokio::select! {
                         _ = &mut shutdown_rx => {
                             info!("Core watchdog received shutdown signal");
-                            current_guard.kill_now().await;
+                            if let Err(error) = current_guard.kill_now().await {
+                                *failed_child_arc.lock().await = Some(current_guard);
+                                set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                                return Err(error.context(
+                                    "failed to terminate core during watchdog shutdown",
+                                ));
+                            }
                             break 'watchdog;
                         }
                         wait_result = child.wait() => wait_result,
@@ -377,6 +467,7 @@ impl CoreManager {
                     Ok(status) => status,
                     Err(error) => {
                         warn!("Failed to wait for core process: {}", error);
+                        recovery_exhausted = true;
                         break;
                     }
                 };
@@ -388,7 +479,7 @@ impl CoreManager {
                     .unwrap_or_default();
                 let exit_reason = log_core_exit(&status, uptime);
                 *last_exit_reason_arc.lock().await = Some(exit_reason);
-                set_service_lifecycle_state(ServiceLifecycleState::RecoveringCore);
+                set_core_lifecycle_state(ServiceLifecycleState::RecoveringCore);
 
                 let _ = current_guard.take();
                 running_pid_arc.store(0, Ordering::Relaxed);
@@ -410,6 +501,7 @@ impl CoreManager {
                             restart_timestamps.len(),
                             watchdog_config.restart_window.as_secs()
                         );
+                        recovery_exhausted = true;
                         break 'watchdog;
                     }
 
@@ -427,27 +519,103 @@ impl CoreManager {
                         }
                     }
 
-                    let args = core_args(&config);
-                    match run_with_logging(&config.core_config.core_path, &args, &config.log_config)
-                        .await
+                    if let Err(error) =
+                        prepare_core_ipc_socket(&config.core_config.core_ipc_path, &owner)
                     {
-                        Ok(new_guard) => {
+                        error!("Failed to prepare core IPC before restart: {error:#}");
+                        consecutive_attempt += 1;
+                        let now = Instant::now();
+                        restart_timestamps.retain(|timestamp| {
+                            now.duration_since(*timestamp) < watchdog_config.restart_window
+                        });
+                        restart_timestamps.push(now);
+                        continue;
+                    }
+                    let args = core_args(&config);
+                    match run_with_logging(
+                        &config.core_config.core_path,
+                        &args,
+                        &config.log_config,
+                        &owner,
+                    )
+                    .await
+                    {
+                        Ok(mut new_guard) => {
                             let new_pid = new_guard.id();
+                            if let Err(error) = secure_core_ipc_socket(
+                                config.core_config.core_ipc_path.clone(),
+                                owner.clone(),
+                                new_pid,
+                            )
+                            .await
+                            {
+                                error!("Failed to secure restarted core IPC: {error:#}");
+                                if let Err(kill_error) = new_guard.kill_now().await {
+                                    error!(
+                                        "Failed to terminate core after IPC hardening failure: {kill_error:#}"
+                                    );
+                                    let now_secs = unix_timestamp_secs();
+                                    running_pid_arc
+                                        .store(new_pid.unwrap_or_default(), Ordering::Relaxed);
+                                    *start_time_arc.lock().await = Some(Instant::now());
+                                    started_at_arc.store(now_secs, Ordering::Relaxed);
+                                    if let Err(record_error) = write_runtime_record_for_config(
+                                        new_pid,
+                                        &config,
+                                        "after failed restart cleanup",
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            "Failed to record unconfirmed restarted core cleanup: {record_error:#}"
+                                        );
+                                    }
+                                    *failed_child_arc.lock().await = Some(new_guard);
+                                    set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                                    return Err(kill_error.context(
+                                        "failed to terminate restarted core after IPC hardening failure",
+                                    ));
+                                }
+                                consecutive_attempt += 1;
+                                let now = Instant::now();
+                                restart_timestamps.retain(|timestamp| {
+                                    now.duration_since(*timestamp) < watchdog_config.restart_window
+                                });
+                                restart_timestamps.push(now);
+                                continue;
+                            }
+                            if let Err(record_error) =
+                                write_runtime_record_for_config(new_pid, &config, "after restart")
+                                    .await
+                            {
+                                error!("Failed to commit restarted core runtime: {record_error:#}");
+                                if let Err(kill_error) = new_guard.kill_now().await {
+                                    let now_secs = unix_timestamp_secs();
+                                    running_pid_arc
+                                        .store(new_pid.unwrap_or_default(), Ordering::Relaxed);
+                                    *start_time_arc.lock().await = Some(Instant::now());
+                                    started_at_arc.store(now_secs, Ordering::Relaxed);
+                                    *failed_child_arc.lock().await = Some(new_guard);
+                                    set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                                    return Err(anyhow!(
+                                        "{record_error:#}; failed to terminate unrecorded restarted core: {kill_error:#}"
+                                    ));
+                                }
+                                recovery_exhausted = true;
+                                break 'watchdog;
+                            }
                             running_pid_arc.store(new_pid.unwrap_or_default(), Ordering::Relaxed);
                             *start_time_arc.lock().await = Some(Instant::now());
                             let now_secs = unix_timestamp_secs();
                             started_at_arc.store(now_secs, Ordering::Relaxed);
                             restart_count_arc.fetch_add(1, Ordering::Relaxed);
                             last_recovery_at_arc.store(now_secs, Ordering::Relaxed);
-                            write_runtime_record_for_config(new_pid, &config, "after restart")
-                                .await;
-
                             consecutive_attempt += 1;
                             info!(
                                 "Core restarted successfully (attempt #{})",
                                 consecutive_attempt
                             );
-                            set_service_lifecycle_state(ServiceLifecycleState::Running);
+                            set_core_lifecycle_state(ServiceLifecycleState::Running);
                             child_guard = Some(new_guard);
                             continue 'watchdog;
                         }
@@ -468,23 +636,27 @@ impl CoreManager {
             *start_time_arc.lock().await = None;
             started_at_arc.store(0, Ordering::Relaxed);
             remove_core_runtime_record().await;
+            if recovery_exhausted {
+                set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+            }
+            Ok(())
         });
 
         *self.watchdog_shutdown.lock().await = Some(shutdown_tx);
         *self.watchdog_handle.lock().await = Some(handle);
     }
 
-    async fn stop_watchdog(&self) {
+    async fn stop_watchdog(&self) -> Result<()> {
         if let Some(shutdown_tx) = self.watchdog_shutdown.lock().await.take() {
             let _ = shutdown_tx.send(());
         }
 
         if let Some(handle) = self.watchdog_handle.lock().await.take() {
-            if let Err(error) = handle.await {
-                warn!("Watchdog task failed to join: {}", error);
-            }
+            handle.await.context("watchdog task failed to join")??;
             info!("Watchdog stopped");
         }
+
+        Ok(())
     }
 
     pub(super) async fn status(&self) -> CoreStatusSnapshot {
@@ -494,34 +666,6 @@ impl CoreManager {
             last_core_exit_reason: self.last_core_exit_reason.lock().await.clone(),
             restart_count: self.restart_count.load(Ordering::Relaxed),
             last_recovery_at: non_zero_u64(self.last_recovery_at.load(Ordering::Relaxed)),
-        }
-    }
-
-    fn after_start(&self, core_ipc_path: String) {
-        #[cfg(unix)]
-        {
-            use std::fs::Permissions;
-            use std::os::unix::fs::PermissionsExt;
-            use std::path::Path;
-            use tokio::fs;
-
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                let target = Path::new(&core_ipc_path);
-                info!("Setting permissions for {:?}", target);
-                if !target.exists() {
-                    warn!("{:?} does not exist, skipping permission setting", target);
-                    return;
-                }
-                match fs::set_permissions(target, Permissions::from_mode(0o777)).await {
-                    Ok(_) => info!("Permissions set to 777 for {:?}", target),
-                    Err(e) => warn!("Failed to set permissions for {:?}: {}", target, e),
-                }
-            });
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = core_ipc_path;
         }
     }
 
@@ -556,18 +700,26 @@ pub async fn run_with_logging(
     bin_path: &str,
     args: &[String],
     writer_config: &WriterConfig,
+    owner: &OwnerIdentity,
 ) -> Result<ChildGuard> {
     set_or_update_writer(writer_config).await?;
 
-    #[cfg(not(unix))]
-    let child = Command::new(bin_path)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    #[cfg(windows)]
+    let child = {
+        let OwnerIdentity::Windows { sid } = owner else {
+            return Err(anyhow!("Windows core requires a Windows owner identity"));
+        };
+        Command::new(bin_path)
+            .args(args)
+            .env("LISTEN_NAMEDPIPE_SDDL", windows_owner_pipe_sddl(sid))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?
+    };
 
     #[cfg(unix)]
     let child = unsafe {
+        let _ = owner;
         Command::new(bin_path)
             .args(args)
             .stdout(Stdio::piped())
@@ -639,7 +791,345 @@ pub async fn run_with_logging(
     Ok(child_guard)
 }
 
+fn prepare_core_ipc_socket(core_ipc_path: &str, owner: &OwnerIdentity) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let OwnerIdentity::Unix { uid, .. } = owner else {
+            anyhow::bail!("Unix core IPC path received a non-Unix owner");
+        };
+        let target = std::path::Path::new(core_ipc_path);
+        let directory = target
+            .parent()
+            .context("core IPC path has no parent directory")?;
+        let directory_c = std::ffi::CString::new(directory.as_os_str().as_bytes())
+            .map_err(|_| anyhow::anyhow!("core IPC directory contains NUL"))?;
+        let fd = unsafe {
+            platform_lib::open(
+                directory_c.as_ptr(),
+                platform_lib::O_RDONLY
+                    | platform_lib::O_DIRECTORY
+                    | platform_lib::O_NOFOLLOW
+                    | platform_lib::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to open core IPC directory {directory:?}"));
+        }
+
+        let result = (|| -> Result<()> {
+            let mut stat = unsafe { std::mem::zeroed::<platform_lib::stat>() };
+            if unsafe { platform_lib::fstat(fd, &mut stat) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to inspect core IPC directory");
+            }
+            let effective_uid = unsafe { platform_lib::geteuid() };
+            if stat.st_mode & platform_lib::S_IFMT != platform_lib::S_IFDIR
+                || (stat.st_uid != 0 && stat.st_uid != *uid && stat.st_uid != effective_uid)
+            {
+                anyhow::bail!("core IPC directory has an unexpected owner or file type");
+            }
+            if unsafe { platform_lib::fchmod(fd, 0o700 as platform_lib::mode_t) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to make core IPC directory private");
+            }
+            if effective_uid == 0 && unsafe { platform_lib::fchown(fd, 0, 0) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to take ownership of core IPC directory");
+            }
+
+            let file_name = target
+                .file_name()
+                .context("core IPC path has no file name")?;
+            let file_name_c = std::ffi::CString::new(file_name.as_bytes())
+                .map_err(|_| anyhow::anyhow!("core IPC file name contains NUL"))?;
+            if unsafe { platform_lib::unlinkat(fd, file_name_c.as_ptr(), 0) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error).context("failed to clear stale core IPC entry");
+                }
+            }
+            Ok(())
+        })();
+        unsafe { platform_lib::close(fd) };
+        result
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = (core_ipc_path, owner);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn grant_core_ipc_directory_to_owner(target: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let directory = target
+        .parent()
+        .context("core IPC path has no parent directory")?;
+    let directory_c = std::ffi::CString::new(directory.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("core IPC directory contains NUL"))?;
+    let fd = unsafe {
+        platform_lib::open(
+            directory_c.as_ptr(),
+            platform_lib::O_RDONLY
+                | platform_lib::O_DIRECTORY
+                | platform_lib::O_NOFOLLOW
+                | platform_lib::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to reopen core IPC directory");
+    }
+    let result = if unsafe { platform_lib::geteuid() } == 0
+        && unsafe { platform_lib::fchown(fd, uid, gid) } != 0
+    {
+        Err(std::io::Error::last_os_error()).context("failed to grant core IPC directory to owner")
+    } else if unsafe { platform_lib::fchmod(fd, 0o700 as platform_lib::mode_t) } != 0 {
+        Err(std::io::Error::last_os_error()).context("failed to secure granted core IPC directory")
+    } else {
+        Ok(())
+    };
+    unsafe { platform_lib::close(fd) };
+    result
+}
+
+async fn secure_core_ipc_socket(
+    core_ipc_path: String,
+    owner: OwnerIdentity,
+    expected_pid: Option<u32>,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let _ = expected_pid;
+        let OwnerIdentity::Unix { uid, gid } = owner else {
+            anyhow::bail!("Unix core IPC path received a non-Unix owner");
+        };
+        let target = std::path::PathBuf::from(core_ipc_path);
+        let mut found = false;
+        for _ in 0..40 {
+            match tokio::fs::symlink_metadata(&target).await {
+                Ok(metadata) if metadata.file_type().is_socket() => {
+                    found = true;
+                    break;
+                }
+                Ok(_) => {
+                    anyhow::bail!("core IPC path {target:?} is not a socket");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => {
+                    return Err(error.into());
+                }
+            }
+        }
+        if !found {
+            anyhow::bail!("core IPC socket did not appear at {target:?}");
+        }
+        let path = std::ffi::CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| anyhow::anyhow!("core IPC socket path contains NUL"))?;
+        let chown_ok = unsafe { platform_lib::geteuid() } != 0
+            || unsafe { platform_lib::lchown(path.as_ptr(), uid, gid) } == 0;
+        let chmod_ok = unsafe {
+            platform_lib::fchmodat(
+                platform_lib::AT_FDCWD,
+                path.as_ptr(),
+                0o600 as platform_lib::mode_t,
+                platform_lib::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0;
+        let os_error = (!chown_ok || !chmod_ok).then(std::io::Error::last_os_error);
+        if !chown_ok || !chmod_ok {
+            return Err(os_error
+                .unwrap_or_else(std::io::Error::last_os_error)
+                .into());
+        }
+        grant_core_ipc_directory_to_owner(&target, uid, gid)?;
+        info!("Secured core IPC socket {:?} for uid {}", target, uid);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::io::FromRawHandle as _;
+        use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            SE_KERNEL_OBJECT, SetSecurityInfo,
+        };
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+        };
+        use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
+        let OwnerIdentity::Windows { sid } = owner else {
+            anyhow::bail!("Windows core IPC path received a non-Windows owner");
+        };
+        let mut pipe: Vec<u16> = std::ffi::OsStr::new(&core_ipc_path).encode_wide().collect();
+        pipe.push(0);
+        let mut handle_value = INVALID_HANDLE_VALUE as isize;
+        for _ in 0..40 {
+            handle_value = unsafe {
+                CreateFileW(
+                    pipe.as_ptr(),
+                    READ_CONTROL | WRITE_DAC,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            } as isize;
+            if handle_value != INVALID_HANDLE_VALUE as isize {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if handle_value == INVALID_HANDLE_VALUE as isize {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let handle = handle_value as *mut std::ffi::c_void;
+        let _pipe = unsafe { std::fs::File::from_raw_handle(handle) };
+        let mut server_pid = 0u32;
+        if unsafe { GetNamedPipeServerProcessId(handle_value as _, &mut server_pid) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to identify core IPC pipe server");
+        }
+        if Some(server_pid) != expected_pid {
+            anyhow::bail!(
+                "core IPC pipe server PID {server_pid} did not match spawned core PID {expected_pid:?}"
+            );
+        }
+
+        let sddl = windows_owner_pipe_sddl(&sid);
+        let mut wide: Vec<u16> = sddl.encode_utf16().collect();
+        wide.push(0);
+        let mut descriptor = std::ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        } == 0
+            || descriptor.is_null()
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        struct LocalDescriptor(*mut std::ffi::c_void);
+        impl Drop for LocalDescriptor {
+            fn drop(&mut self) {
+                unsafe { LocalFree(self.0) };
+            }
+        }
+        let descriptor_guard = LocalDescriptor(descriptor);
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = std::ptr::null_mut();
+        if unsafe {
+            GetSecurityDescriptorDacl(descriptor_guard.0, &mut present, &mut dacl, &mut defaulted)
+        } == 0
+            || present == 0
+            || dacl.is_null()
+        {
+            anyhow::bail!("failed to read owner core IPC DACL");
+        }
+        let status = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            )
+        };
+        if status != 0 {
+            anyhow::bail!("failed to secure core IPC pipe: Windows error {status}");
+        }
+        info!("Secured core IPC pipe for owner SID");
+        Ok(())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_owner_pipe_sddl(sid: &str) -> String {
+    format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)(A;;GA;;;BA)")
+}
+
 pub static CORE_MANAGER: Lazy<Arc<Mutex<CoreManager>>> =
     Lazy::new(|| Arc::new(Mutex::new(CoreManager::new())));
 
 pub static LOGGER_MANAGER: Lazy<Arc<AsyncLogger>> = Lazy::new(|| Arc::new(AsyncLogger::new()));
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{prepare_core_ipc_socket, secure_core_ipc_socket};
+    use crate::OwnerIdentity;
+    use serial_test::serial;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Duration;
+
+    #[tokio::test]
+    #[serial]
+    async fn owner_core_socket_is_private() -> anyhow::Result<()> {
+        let directory = std::env::temp_dir().join(format!("cvs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory)?;
+        let path = directory.join("verge-mihomo.sock");
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        let owner = OwnerIdentity::Unix {
+            uid: unsafe { platform_lib::geteuid() },
+            gid: unsafe { platform_lib::getegid() },
+        };
+
+        prepare_core_ipc_socket(&path.to_string_lossy(), &owner)?;
+        drop(listener);
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        secure_core_ipc_socket(path.to_string_lossy().into_owned(), owner, None).await?;
+
+        let mut mode = 0;
+        for _ in 0..40 {
+            mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+            if mode == 0o600 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(mode, 0o600);
+        drop(listener);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod windows_pipe_tests {
+    use super::windows_owner_pipe_sddl;
+
+    #[test]
+    fn windows_owner_pipe_dacl_excludes_everyone_and_authenticated_users() {
+        let sddl = windows_owner_pipe_sddl("S-1-5-21-1-2-3-1001");
+
+        assert!(sddl.contains(";;;S-1-5-21-1-2-3-1001)"));
+        assert!(sddl.contains(";;;SY)"));
+        assert!(sddl.contains(";;;BA)"));
+        assert!(!sddl.contains(";;;WD)"));
+        assert!(!sddl.contains(";;;AU)"));
+    }
+}

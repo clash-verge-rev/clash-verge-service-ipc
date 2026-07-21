@@ -1,8 +1,11 @@
 #![cfg(feature = "standalone")]
+
+mod common;
+
 #[cfg(test)]
 mod tests {
     use clash_verge_service_ipc::{
-        IPC_AUTH_EXPECT, IpcCommand, VERSION, connect, get_version, run_ipc_server, stop_ipc_server,
+        VERSION, connect, get_status, get_version, run_ipc_server, stop_ipc_server,
     };
     use serial_test::serial;
     use tokio::task::JoinHandle;
@@ -58,6 +61,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_start_and_parse() {
+        crate::common::init_tracing_for_tests();
         let _ = stop_ipc_server().await;
 
         let mut server_handle = run_ipc_server()
@@ -93,12 +97,7 @@ mod tests {
             "Version should not match mock version"
         );
 
-        let status = client
-            .unwrap()
-            .get(IpcCommand::Status.as_ref())
-            .header("X-IPC-Magic", IPC_AUTH_EXPECT)
-            .send()
-            .await;
+        let status = get_status(&crate::common::owner_credentials()).await;
         assert!(
             status.is_ok(),
             "Should receive a response from Status command"

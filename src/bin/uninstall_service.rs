@@ -5,11 +5,23 @@ fn main() {
 
 use anyhow::Error;
 
+fn run_maintenance_if_requested() -> Result<bool, Error> {
+    if !std::env::args().any(|argument| argument == "--cleanup-stale-owners") {
+        return Ok(false);
+    }
+    let removed = clash_verge_service_ipc::cleanup_stale_owner_state()?;
+    println!("Removed {} stale owner state directories", removed.len());
+    Ok(true)
+}
+
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Error> {
     use std::env;
     use std::path::Path;
 
+    if run_maintenance_if_requested()? {
+        return Ok(());
+    }
     let debug = env::args().any(|arg| arg == "--debug");
 
     let _ = uninstall_old_service();
@@ -49,6 +61,9 @@ fn main() -> Result<(), Error> {
     const SERVICE_NAME: &str = "clash-verge-service";
     use std::env;
 
+    if run_maintenance_if_requested()? {
+        return Ok(());
+    }
     let debug = env::args().any(|arg| arg == "--debug");
 
     // Stop and disable service
@@ -85,6 +100,9 @@ fn main() -> anyhow::Result<()> {
     };
     use std::{thread, time::Duration};
 
+    if run_maintenance_if_requested()? {
+        return Ok(());
+    }
     let manager_access = ServiceManagerAccess::CONNECT;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 

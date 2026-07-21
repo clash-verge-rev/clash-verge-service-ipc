@@ -14,6 +14,11 @@ pub struct ServicePaths {
     desired_state_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct OwnerPaths {
+    root: PathBuf,
+}
+
 impl ServicePaths {
     pub fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
@@ -42,6 +47,38 @@ impl ServicePaths {
     pub fn desired_state_path(&self) -> &Path {
         &self.desired_state_path
     }
+
+    pub fn active_owner_path(&self) -> PathBuf {
+        self.persistent_state_dir.join("active-owner.json")
+    }
+
+    pub fn for_owner(&self, identity: &OwnerIdentity) -> OwnerPaths {
+        self.for_owner_key(&owner_key(identity))
+    }
+
+    pub fn for_owner_key(&self, owner_key: &str) -> OwnerPaths {
+        OwnerPaths {
+            root: self.persistent_state_dir.join("users").join(owner_key),
+        }
+    }
+}
+
+impl OwnerPaths {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn desired_state_path(&self) -> PathBuf {
+        self.root.join("desired-state.json")
+    }
+
+    pub fn runtime_dir(&self) -> PathBuf {
+        self.root.join("runtime")
+    }
+
+    pub fn logs_dir(&self) -> PathBuf {
+        self.root.join("logs")
+    }
 }
 
 pub fn service_paths() -> ServicePaths {
@@ -58,6 +95,40 @@ pub fn service_paths() -> ServicePaths {
     }
 }
 
+#[cfg(feature = "standalone")]
+pub(crate) fn ensure_persistent_state_layout() -> anyhow::Result<()> {
+    let paths = service_paths();
+    let root = paths.persistent_state_dir();
+    #[cfg(unix)]
+    crate::core::unix_security::ensure_private_service_directory(root)?;
+    #[cfg(windows)]
+    crate::core::windows_security::ensure_private_service_directory(root)?;
+
+    let users = root.join("users");
+    #[cfg(unix)]
+    crate::core::unix_security::ensure_private_service_directory(&users)?;
+    #[cfg(windows)]
+    crate::core::windows_security::ensure_private_service_directory(&users)?;
+    #[cfg(unix)]
+    crate::core::unix_security::secure_service_file_if_exists(&paths.active_owner_path())?;
+    #[cfg(windows)]
+    crate::core::windows_security::secure_private_service_file_if_exists(
+        &paths.active_owner_path(),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "standalone")]
+pub(crate) fn ensure_owner_state_directory(identity: &OwnerIdentity) -> anyhow::Result<OwnerPaths> {
+    ensure_persistent_state_layout()?;
+    let owner = service_paths().for_owner(identity);
+    #[cfg(unix)]
+    crate::core::unix_security::ensure_private_service_directory(owner.root())?;
+    #[cfg(windows)]
+    crate::core::windows_security::ensure_private_service_directory(owner.root())?;
+    Ok(owner)
+}
+
 fn runtime_dir() -> PathBuf {
     #[cfg(unix)]
     {
@@ -69,7 +140,7 @@ fn runtime_dir() -> PathBuf {
 
     #[cfg(windows)]
     {
-        std::env::temp_dir().join(SERVICE_NAME)
+        persistent_state_dir().join("runtime")
     }
 }
 
@@ -107,6 +178,7 @@ fn persistent_state_dir() -> PathBuf {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn unix_mihomo_ipc_path(runtime_root: &Path, uid: u32) -> PathBuf {
     runtime_root
         .join("users")
@@ -116,17 +188,25 @@ pub(crate) fn unix_mihomo_ipc_path(runtime_root: &Path, uid: u32) -> PathBuf {
 
 pub fn mihomo_ipc_path(identity: &OwnerIdentity) -> String {
     match identity {
-        OwnerIdentity::Unix { uid, .. } => {
-            #[cfg(feature = "test")]
-            let runtime_root = std::env::temp_dir().join("clash-verge-service-ipc-test");
-            #[cfg(all(target_os = "macos", not(feature = "test")))]
-            let runtime_root = PathBuf::from("/var/run/clash-verge-service");
-            #[cfg(all(unix, not(target_os = "macos"), not(feature = "test")))]
-            let runtime_root = PathBuf::from("/run/clash-verge-service");
+        OwnerIdentity::Unix { uid: _uid, .. } => {
+            #[cfg(windows)]
+            {
+                format!(r"\\.\pipe\verge-mihomo-{}", owner_key(identity))
+            }
 
-            unix_mihomo_ipc_path(&runtime_root, *uid)
-                .to_string_lossy()
-                .into_owned()
+            #[cfg(unix)]
+            {
+                #[cfg(feature = "test")]
+                let runtime_root = PathBuf::from("/tmp/clash-verge-service-ipc-test");
+                #[cfg(all(target_os = "macos", not(feature = "test")))]
+                let runtime_root = PathBuf::from("/var/run/clash-verge-service");
+                #[cfg(all(unix, not(target_os = "macos"), not(feature = "test")))]
+                let runtime_root = PathBuf::from("/run/clash-verge-service");
+
+                unix_mihomo_ipc_path(&runtime_root, *_uid)
+                    .to_string_lossy()
+                    .into_owned()
+            }
         }
         OwnerIdentity::Windows { .. } => {
             format!(r"\\.\pipe\verge-mihomo-{}", owner_key(identity))
@@ -136,9 +216,14 @@ pub fn mihomo_ipc_path(identity: &OwnerIdentity) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::service_paths;
+    #[cfg(unix)]
     use super::unix_mihomo_ipc_path;
+    use crate::OwnerIdentity;
+    #[cfg(unix)]
     use std::path::Path;
 
+    #[cfg(unix)]
     #[test]
     fn unix_mihomo_ipc_path_is_owner_scoped_and_below_sun_path_limit() {
         let path = unix_mihomo_ipc_path(Path::new("/var/run/clash-verge-service"), 501);
@@ -148,5 +233,23 @@ mod tests {
             Path::new("/var/run/clash-verge-service/users/501/verge-mihomo.sock")
         );
         assert!(path.as_os_str().as_encoded_bytes().len() < 104);
+    }
+
+    #[test]
+    fn owner_paths_isolate_state_runtime_and_logs() {
+        let paths = service_paths();
+        let owner = paths.for_owner(&OwnerIdentity::Unix { uid: 501, gid: 20 });
+
+        assert!(owner.root().ends_with("users/501"));
+        assert_eq!(
+            owner.desired_state_path(),
+            owner.root().join("desired-state.json")
+        );
+        assert_eq!(owner.runtime_dir(), owner.root().join("runtime"));
+        assert_eq!(owner.logs_dir(), owner.root().join("logs"));
+        assert_eq!(
+            paths.active_owner_path(),
+            paths.persistent_state_dir().join("active-owner.json")
+        );
     }
 }

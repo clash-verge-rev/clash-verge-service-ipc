@@ -1,7 +1,9 @@
+use crate::core::auth::AuthenticatedOwner;
 use crate::core::logger::set_or_update_writer;
 use crate::core::manager::CORE_MANAGER;
 use crate::core::paths::service_paths;
-use crate::{ClashConfig, WriterConfig};
+use crate::core::state::set_core_lifecycle_state;
+use crate::{ClashConfig, OwnerIdentity, ServiceLifecycleState, WriterConfig};
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -20,33 +22,35 @@ pub struct DesiredState {
     pub updated_at: u64,
 }
 
-pub async fn load_desired_state() -> Result<DesiredState> {
-    let paths = service_paths();
-    let content = match tokio::fs::read(paths.desired_state_path()).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DesiredState::default());
-        }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to read desired state {:?}",
-                    paths.desired_state_path()
-                )
-            });
-        }
-    };
-
-    serde_json::from_slice(&content).with_context(|| {
-        format!(
-            "failed to parse desired state {:?}",
-            paths.desired_state_path()
-        )
-    })
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveOwnerState {
+    pub owner_key: String,
+    pub identity: OwnerIdentity,
+    pub app_data_root: String,
 }
 
-pub async fn persist_core_started(config: &ClashConfig) -> Result<DesiredState> {
-    update_desired_state(|state| {
+impl From<&AuthenticatedOwner> for ActiveOwnerState {
+    fn from(owner: &AuthenticatedOwner) -> Self {
+        Self {
+            owner_key: owner.key.clone(),
+            identity: owner.identity.clone(),
+            app_data_root: owner.app_data_root.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+pub async fn load_owner_desired_state(owner_key: &str) -> Result<DesiredState> {
+    let path = service_paths()
+        .for_owner_key(owner_key)
+        .desired_state_path();
+    read_json_or_default(&path).await
+}
+
+pub async fn persist_owner_core_started(
+    owner: &AuthenticatedOwner,
+    config: &ClashConfig,
+) -> Result<DesiredState> {
+    update_owner_desired_state(&owner.key, |state| {
         state.core_should_be_running = true;
         state.last_clash_config = Some(config.clone());
         state.last_writer_config = Some(config.log_config.clone());
@@ -54,15 +58,22 @@ pub async fn persist_core_started(config: &ClashConfig) -> Result<DesiredState> 
     .await
 }
 
-pub async fn persist_core_stopped() -> Result<DesiredState> {
-    update_desired_state(|state| {
+pub async fn persist_owner_core_stopped(owner: &AuthenticatedOwner) -> Result<DesiredState> {
+    persist_owner_core_stopped_by_key(&owner.key).await
+}
+
+pub async fn persist_owner_core_stopped_by_key(owner_key: &str) -> Result<DesiredState> {
+    update_owner_desired_state(owner_key, |state| {
         state.core_should_be_running = false;
     })
     .await
 }
 
-pub async fn persist_writer_config(config: &WriterConfig) -> Result<DesiredState> {
-    update_desired_state(|state| {
+pub async fn persist_owner_writer_config(
+    owner: &AuthenticatedOwner,
+    config: &WriterConfig,
+) -> Result<DesiredState> {
+    update_owner_desired_state(&owner.key, |state| {
         state.last_writer_config = Some(config.clone());
         if let Some(clash_config) = state.last_clash_config.as_mut() {
             clash_config.log_config = config.clone();
@@ -71,11 +82,43 @@ pub async fn persist_writer_config(config: &WriterConfig) -> Result<DesiredState
     .await
 }
 
-pub async fn restore_desired_state() -> Result<()> {
-    #[cfg(all(target_os = "macos", not(feature = "test")))]
-    cleanup_legacy_desired_state().await;
+pub async fn load_active_owner() -> Result<Option<ActiveOwnerState>> {
+    let path = service_paths().active_owner_path();
+    secure_state_file_if_exists(&path)?;
+    match tokio::fs::read(&path).await {
+        Ok(content) => serde_json::from_slice(&content)
+            .map(Some)
+            .with_context(|| format!("failed to parse active owner {path:?}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read active owner {path:?}")),
+    }
+}
 
-    let state = load_desired_state().await?;
+pub async fn persist_active_owner(owner: &AuthenticatedOwner) -> Result<ActiveOwnerState> {
+    let _guard = DESIRED_STATE_LOCK.lock().await;
+    let state = ActiveOwnerState::from(owner);
+    write_json_atomic(&service_paths().active_owner_path(), &state).await?;
+    Ok(state)
+}
+
+pub async fn clear_active_owner() -> Result<()> {
+    let _guard = DESIRED_STATE_LOCK.lock().await;
+    let path = service_paths().active_owner_path();
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove active owner {path:?}")),
+    }
+}
+
+pub async fn restore_desired_state() -> Result<()> {
+    backup_legacy_desired_states().await;
+
+    let Some(active_owner) = load_active_owner().await? else {
+        info!("No active owner to restore");
+        return Ok(());
+    };
+    let state = load_owner_desired_state(&active_owner.owner_key).await?;
 
     if let Some(writer_config) = state.last_writer_config.as_ref()
         && let Err(error) = set_or_update_writer(writer_config).await
@@ -97,7 +140,12 @@ pub async fn restore_desired_state() -> Result<()> {
         "Restoring core from desired state generation {}",
         state.generation
     );
-    if let Err(error) = CORE_MANAGER.lock().await.start_core(config).await {
+    if let Err(error) = CORE_MANAGER
+        .lock()
+        .await
+        .start_core(config, active_owner.identity.clone())
+        .await
+    {
         // core 路径不存在通常表示 desired-state 已过期；清掉运行意图，避免重启时反复重试。
         // 其它失败保留意图并交给上层记录。
         if is_not_found_error(&error) {
@@ -105,13 +153,17 @@ pub async fn restore_desired_state() -> Result<()> {
                 "Core binary not found while restoring desired state (stale/translocated path?); \
                  clearing desired core-run state to stop retrying: {error:#}"
             );
-            if let Err(clear_error) = persist_core_stopped().await {
+            if let Err(clear_error) =
+                persist_owner_core_stopped_by_key(&active_owner.owner_key).await
+            {
                 warn!(
                     "Failed to clear stale desired state after not-found core path: {clear_error:#}"
                 );
             }
+            set_core_lifecycle_state(ServiceLifecycleState::Running);
             return Ok(());
         }
+        set_core_lifecycle_state(ServiceLifecycleState::Fatal);
         return Err(error);
     }
     Ok(())
@@ -126,74 +178,110 @@ fn is_not_found_error(error: &anyhow::Error) -> bool {
     })
 }
 
-/// 线程 B:macOS 状态目录迁到 `/Library/Application Support` 后,清理旧位置残留的
-/// desired-state(launchd 下曾用 `/var/lib`,或 HOME=/var/root 时的 `/var/root/.local/state`)。
-/// 不迁移(GUI 会在下次启动重建状态),仅备份移走避免遗留垃圾或被旧路径误读。
-#[cfg(all(target_os = "macos", not(feature = "test")))]
-async fn cleanup_legacy_desired_state() {
-    let legacy_files = [
-        "/var/lib/clash-verge-service/desired-state.json",
-        "/var/root/.local/state/clash-verge-service/desired-state.json",
-    ];
+async fn backup_legacy_desired_states() {
+    let legacy_files = vec![service_paths().desired_state_path().to_path_buf()];
+    #[cfg(target_os = "macos")]
+    let legacy_files = legacy_files
+        .into_iter()
+        .chain([
+            std::path::PathBuf::from("/var/lib/clash-verge-service/desired-state.json"),
+            std::path::PathBuf::from(
+                "/var/root/.local/state/clash-verge-service/desired-state.json",
+            ),
+        ])
+        .collect::<Vec<_>>();
+
     for legacy in legacy_files {
-        let legacy = std::path::Path::new(legacy);
-        match tokio::fs::try_exists(legacy).await {
-            Ok(true) => {
-                let backup = legacy.with_extension("json.legacy.bak");
-                match tokio::fs::rename(legacy, &backup).await {
-                    Ok(()) => info!(
-                        "Backed up legacy desired-state {:?} -> {:?}",
-                        legacy, backup
-                    ),
-                    Err(error) => {
-                        warn!(
-                            "Failed to back up legacy desired-state {:?}: {}",
-                            legacy, error
-                        )
-                    }
-                }
-            }
-            Ok(false) => {}
+        match backup_legacy_state_file(&legacy).await {
+            Ok(Some(backup)) => info!(
+                "Backed up legacy desired-state {:?} -> {:?}",
+                legacy, backup
+            ),
+            Ok(None) => {}
             Err(error) => warn!(
-                "Failed to check legacy desired-state {:?}: {}",
+                "Failed to back up legacy desired-state {:?}: {}",
                 legacy, error
             ),
         }
     }
 }
 
-async fn update_desired_state(update: impl FnOnce(&mut DesiredState)) -> Result<DesiredState> {
+async fn backup_legacy_state_file(path: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+    match tokio::fs::try_exists(path).await {
+        Ok(false) => return Ok(None),
+        Ok(true) => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect legacy state {path:?}"));
+        }
+    }
+
+    let backup = path.with_extension("json.legacy.bak");
+    tokio::fs::rename(path, &backup)
+        .await
+        .with_context(|| format!("failed to back up legacy state {path:?} to {backup:?}"))?;
+    Ok(Some(backup))
+}
+
+async fn update_owner_desired_state(
+    owner_key: &str,
+    update: impl FnOnce(&mut DesiredState),
+) -> Result<DesiredState> {
     let _guard = DESIRED_STATE_LOCK.lock().await;
-    let mut state = load_desired_state().await?;
+    let path = service_paths()
+        .for_owner_key(owner_key)
+        .desired_state_path();
+    let mut state = read_json_or_default(&path).await?;
     update(&mut state);
     state.generation = state.generation.saturating_add(1);
     state.updated_at = unix_timestamp_secs();
-    write_desired_state(&state).await?;
+    write_json_atomic(&path, &state).await?;
     Ok(state)
 }
 
-async fn write_desired_state(state: &DesiredState) -> Result<()> {
-    let paths = service_paths();
-    if let Some(parent) = paths.desired_state_path().parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create desired state directory {:?}", parent))?;
+async fn read_json_or_default<T>(path: &std::path::Path) -> Result<T>
+where
+    T: for<'de> Deserialize<'de> + Default,
+{
+    secure_state_file_if_exists(path)?;
+    match tokio::fs::read(path).await {
+        Ok(content) => serde_json::from_slice(&content)
+            .with_context(|| format!("failed to parse state {path:?}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(error) => Err(error).with_context(|| format!("failed to read state {path:?}")),
+    }
+}
+
+async fn write_json_atomic<T>(path: &std::path::Path, value: &T) -> Result<()>
+where
+    T: Serialize,
+{
+    crate::core::paths::ensure_persistent_state_layout()?;
+    if let Some(parent) = path.parent() {
+        #[cfg(unix)]
+        crate::core::unix_security::ensure_private_service_directory(parent)?;
+        #[cfg(windows)]
+        crate::core::windows_security::ensure_private_service_directory(parent)?;
     }
 
-    let temp_path = paths.desired_state_path().with_extension("json.tmp");
-    let json = serde_json::to_vec_pretty(state)?;
+    let temp_path = path.with_extension("json.tmp");
+    let json = serde_json::to_vec_pretty(value)?;
     tokio::fs::write(&temp_path, json)
         .await
-        .with_context(|| format!("failed to write desired state temp file {:?}", temp_path))?;
-    tokio::fs::rename(&temp_path, paths.desired_state_path())
+        .with_context(|| format!("failed to write state temp file {temp_path:?}"))?;
+    secure_state_file_if_exists(&temp_path)?;
+    crate::core::atomic_file::replace(&temp_path, path)
         .await
-        .with_context(|| {
-            format!(
-                "failed to move desired state into {:?}",
-                paths.desired_state_path()
-            )
-        })?;
+        .with_context(|| format!("failed to move state into {path:?}"))?;
+    secure_state_file_if_exists(path)?;
 
+    Ok(())
+}
+
+fn secure_state_file_if_exists(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    crate::core::unix_security::secure_service_file_if_exists(path)?;
+    #[cfg(windows)]
+    crate::core::windows_security::secure_private_service_file_if_exists(path)?;
     Ok(())
 }
 
@@ -202,4 +290,102 @@ fn unix_timestamp_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::{
+        backup_legacy_state_file, clear_active_owner, load_active_owner, load_owner_desired_state,
+        persist_active_owner, persist_owner_core_started, persist_owner_core_stopped,
+    };
+    use crate::core::auth::AuthenticatedOwner;
+    use crate::{ClashConfig, CoreConfig, OwnerIdentity};
+    use serial_test::serial;
+
+    fn test_owner(uid: u32) -> AuthenticatedOwner {
+        AuthenticatedOwner {
+            key: uid.to_string(),
+            identity: OwnerIdentity::Unix { uid, gid: 20 },
+            app_data_root: std::env::temp_dir(),
+        }
+    }
+
+    #[tokio::test]
+    async fn desired_state_is_scoped_by_owner_key() -> anyhow::Result<()> {
+        let owner_a = test_owner(90_001);
+        let owner_b = test_owner(90_002);
+        let config = ClashConfig {
+            core_config: CoreConfig {
+                core_path: "/tmp/mock-core-a".to_string(),
+                ..Default::default()
+            },
+            log_config: Default::default(),
+        };
+
+        persist_owner_core_started(&owner_a, &config).await?;
+        persist_owner_core_stopped(&owner_b).await?;
+
+        assert!(
+            load_owner_desired_state(&owner_a.key)
+                .await?
+                .core_should_be_running
+        );
+        assert!(
+            !load_owner_desired_state(&owner_b.key)
+                .await?
+                .core_should_be_running
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn active_owner_can_be_atomically_replaced_and_cleared() -> anyhow::Result<()> {
+        let owner_a = test_owner(90_003);
+        let owner_b = test_owner(90_004);
+
+        persist_active_owner(&owner_a).await?;
+        assert_eq!(
+            load_active_owner()
+                .await?
+                .as_ref()
+                .map(|state| state.owner_key.as_str()),
+            Some("90003")
+        );
+
+        persist_active_owner(&owner_b).await?;
+        assert_eq!(
+            load_active_owner()
+                .await?
+                .as_ref()
+                .map(|state| state.owner_key.as_str()),
+            Some("90004")
+        );
+
+        clear_active_owner().await?;
+        assert!(load_active_owner().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_global_state_is_backed_up_without_becoming_owner_state() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "legacy-desired-state-backup-{}",
+            std::process::id()
+        ));
+        let legacy = root.join("desired-state.json");
+        let backup = root.join("desired-state.json.legacy.bak");
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(&legacy, br#"{"core_should_be_running":true}"#)?;
+
+        backup_legacy_state_file(&legacy).await?;
+
+        assert!(!legacy.exists());
+        assert_eq!(
+            std::fs::read(&backup)?,
+            br#"{"core_should_be_running":true}"#
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }

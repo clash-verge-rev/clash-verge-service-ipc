@@ -8,10 +8,10 @@ mod tests {
     #[cfg(unix)]
     use clash_verge_service_ipc::acquire_service_owner;
     use clash_verge_service_ipc::{
-        ClashConfig, CoreConfig, CoreWatchdogTestConfig, ServiceLifecycleState, connect,
-        persist_core_stopped, reconcile_service_startup, run_ipc_server,
-        run_ipc_supervisor_until_shutdown, service_lifecycle_state, service_paths,
-        service_status_snapshot, set_core_watchdog_config_for_tests, start_clash, stop_ipc_server,
+        CoreWatchdogTestConfig, RuntimeBundle, ServiceLifecycleState, connect, get_status,
+        reconcile_service_startup, run_ipc_server, run_ipc_supervisor_until_shutdown,
+        service_lifecycle_state, service_paths, set_core_watchdog_config_for_tests, start_clash,
+        stop_clash, stop_ipc_server, write_core_runtime_record_for_tests,
     };
     use serial_test::serial;
     use std::path::PathBuf;
@@ -226,11 +226,11 @@ mod tests {
         tokio::fs::create_dir_all(paths.runtime_dir()).await?;
 
         let core_socket = paths.runtime_dir().join("reconcile-core.sock");
-        let record = serde_json::json!({
-            "pid": old_core.id(),
-            "ipc_path": core_socket.to_string_lossy(),
-        });
-        tokio::fs::write(paths.core_runtime_path(), serde_json::to_vec(&record)?).await?;
+        write_core_runtime_record_for_tests(
+            old_core.id(),
+            core_socket.to_string_lossy().into_owned(),
+        )
+        .await?;
 
         reconcile_service_startup().await?;
 
@@ -270,29 +270,38 @@ mod tests {
         let crash_binary = ensure_test_bin("crash_binary")?;
         let server_handle = run_ipc_server().await?;
         wait_for_ipc_ready().await?;
+        let credentials = common::owner_credentials();
 
-        let baseline_restart_count = service_status_snapshot().await?.restart_count;
-        let clash_config = ClashConfig {
-            core_config: CoreConfig {
-                core_path: crash_binary.to_string_lossy().to_string(),
-                ..Default::default()
-            },
-            log_config: Default::default(),
+        let baseline_restart_count = get_status(&credentials)
+            .await?
+            .data
+            .map_or(0, |status| status.restart_count);
+        let runtime_bundle = RuntimeBundle {
+            yaml: "mode: rule\n".to_string(),
+            assets: vec![],
+            core_path: crash_binary.to_string_lossy().to_string(),
         };
-        let response = start_clash(&clash_config).await?;
+        let response = start_clash(&credentials, &runtime_bundle).await?;
         assert_eq!(response.code, 0);
 
         wait_until_async("bounded crash loop", Duration::from_secs(5), || async {
-            service_status_snapshot()
+            get_status(&credentials)
                 .await
+                .map(|response| response.data)
                 .map(|status| {
+                    let Some(status) = status else {
+                        return false;
+                    };
                     status.restart_count >= baseline_restart_count + 2 && status.core_pid.is_none()
                 })
                 .unwrap_or(false)
         })
         .await?;
 
-        let status = service_status_snapshot().await?;
+        let status = get_status(&credentials)
+            .await?
+            .data
+            .ok_or_else(|| anyhow::anyhow!("status response did not include data"))?;
         assert!(
             status.last_core_exit_reason.is_some(),
             "status should retain the last core exit reason"
@@ -306,7 +315,8 @@ mod tests {
             "watchdog should stop supervising after crash loop limit"
         );
 
-        persist_core_stopped().await?;
+        let stop = stop_clash(&credentials).await?;
+        assert_eq!(stop.code, 0);
         stop_ipc_server().await?;
         server_handle.await??;
         Ok(())

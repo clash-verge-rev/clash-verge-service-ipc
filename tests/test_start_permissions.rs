@@ -40,39 +40,18 @@ mod tests {
 
         let permision = std::fs::metadata(IPC_PATH).expect("Failed to get metadata");
         let permissions = permision.permissions();
-        #[cfg(all(unix, target_os = "macos"))]
+        #[cfg(unix)]
         {
-            use platform_lib::{S_IRGRP, S_IRUSR, S_IWGRP, S_IWUSR};
-
-            let owner_perm = u32::from(S_IRUSR | S_IWUSR); // 用户权限 (rwx------ = 600)
-            let group_perm = u32::from(S_IRGRP | S_IWGRP); // 组权限   (---rwx--- = 060)
-            let full_mask = owner_perm | group_perm; // 完整权限掩码 (rwxrwxrwx = 660)
-
-            let actual_perms = permissions.mode() & full_mask;
-
-            debug!("macOS IPC file permissions: {:o}", permissions.mode());
+            let actual_perms = permissions.mode() & 0o777;
             assert_eq!(
-                actual_perms, full_mask,
-                "IPC file permissions should be 660 (actual: {:o})",
-                actual_perms
+                actual_perms, 0o666,
+                "control socket must be world-connectable"
             );
-        }
-
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            use platform_lib::{S_IRGRP, S_IRUSR, S_IWGRP, S_IWUSR};
-
-            let owner_perm = S_IRUSR | S_IWUSR; // 用户权限 (rwx------ = 600)
-            let group_perm = S_IRGRP | S_IWGRP; // 组权限   (---rwx--- = 060)
-            let full_mask = owner_perm | group_perm; // 完整权限掩码 (rwxrwxrwx = 660)
-
-            let actual_perms = permissions.mode() & full_mask;
-
-            debug!("Linux IPC file permissions: {:o}", permissions.mode());
+            let parent = std::path::Path::new(IPC_PATH).parent().unwrap();
+            let parent_mode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
             assert_eq!(
-                actual_perms, full_mask,
-                "IPC file permissions should be 660 (actual: {:o})",
-                actual_perms
+                parent_mode, 0o755,
+                "control runtime directory must be root-managed"
             );
         }
         #[cfg(windows)]

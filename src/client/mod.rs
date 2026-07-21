@@ -11,7 +11,8 @@ use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 
 use crate::{
-    ClashConfig, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand, ServiceStatusSnapshot, WriterConfig,
+    AuthenticatedRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand, OwnerCredentials, RuntimeBundle,
+    ServiceStatusSnapshot, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
@@ -19,6 +20,7 @@ static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> =
     Lazy::new(|| Arc::new(RwLock::new(None)));
 
 static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
+const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct IpcConfig {
@@ -61,6 +63,7 @@ pub async fn connect() -> Result<IpcHttpClient> {
             max_retries: c.max_retries,
             retry_delay: c.retry_delay,
             enable_pooling: true,
+            require_windows_server_system: cfg!(windows),
             ..Default::default()
         },
     )?;
@@ -93,11 +96,16 @@ pub async fn get_version() -> Result<Response<String>> {
     Ok(response)
 }
 
-pub async fn get_status() -> Result<Response<ServiceStatusSnapshot>> {
+pub async fn get_status(credentials: &OwnerCredentials) -> Result<Response<ServiceStatusSnapshot>> {
     let client = connect().await?;
+    let payload = AuthenticatedRequest {
+        credentials: credentials.clone(),
+        payload: (),
+    }
+    .to_json_value()?;
     let response = client
         .get(IpcCommand::Status.as_ref())
-        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
+        .json_body(&payload)
         .send()
         .await?
         .json::<Response<ServiceStatusSnapshot>>()?;
@@ -118,48 +126,90 @@ pub async fn is_reinstall_service_needed() -> bool {
         }
 }
 
-pub async fn start_clash(body: &ClashConfig) -> Result<Response<()>> {
+pub async fn start_clash(
+    credentials: &OwnerCredentials,
+    body: &RuntimeBundle,
+) -> Result<Response<()>> {
     let client = connect().await?;
-    let payload = body.to_json_value()?;
+    let payload = AuthenticatedRequest {
+        credentials: credentials.clone(),
+        payload: body.clone(),
+    }
+    .to_json_value()?;
     let response = client
         .post(IpcCommand::StartClash.as_ref())
+        .timeout(LIFECYCLE_TIMEOUT)
         .json_body(&payload)
-        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
         .json::<Response<()>>()?;
     Ok(response)
 }
 
-pub async fn get_clash_logs() -> Result<Response<Vec<CompactString>>> {
+pub async fn get_clash_logs(
+    credentials: &OwnerCredentials,
+) -> Result<Response<Vec<CompactString>>> {
     let client = connect().await?;
+    let payload = AuthenticatedRequest {
+        credentials: credentials.clone(),
+        payload: (),
+    }
+    .to_json_value()?;
     let response = client
         .get(IpcCommand::GetClashLogs.as_ref())
-        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
+        .json_body(&payload)
         .send()
         .await?
         .json::<Response<Vec<CompactString>>>()?;
     Ok(response)
 }
 
-pub async fn stop_clash() -> Result<Response<()>> {
+pub async fn get_clash_log_snapshot(credentials: &OwnerCredentials) -> Result<Response<String>> {
     let client = connect().await?;
+    let payload = AuthenticatedRequest {
+        credentials: credentials.clone(),
+        payload: (),
+    }
+    .to_json_value()?;
+    let response = client
+        .get(IpcCommand::GetClashLogSnapshot.as_ref())
+        .json_body(&payload)
+        .send()
+        .await?
+        .json::<Response<String>>()?;
+    Ok(response)
+}
+
+pub async fn stop_clash(credentials: &OwnerCredentials) -> Result<Response<()>> {
+    let client = connect().await?;
+    let payload = AuthenticatedRequest {
+        credentials: credentials.clone(),
+        payload: (),
+    }
+    .to_json_value()?;
     let response = client
         .delete(IpcCommand::StopClash.as_ref())
-        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
+        .timeout(LIFECYCLE_TIMEOUT)
+        .json_body(&payload)
         .send()
         .await?
         .json::<Response<()>>()?;
     Ok(response)
 }
 
-pub async fn update_writer(body: &WriterConfig) -> Result<Response<()>> {
+pub async fn update_writer(
+    credentials: &OwnerCredentials,
+    body: &WriterConfig,
+) -> Result<Response<()>> {
     let client = connect().await?;
-    let payload = body.to_json_value()?;
+    let payload = AuthenticatedRequest {
+        credentials: credentials.clone(),
+        payload: body.clone(),
+    }
+    .to_json_value()?;
     let response = client
         .put(IpcCommand::UpdateWriter.as_ref())
         .json_body(&payload)
-        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
         .json::<Response<()>>()?;

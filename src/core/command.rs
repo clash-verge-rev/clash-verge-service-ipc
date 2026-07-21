@@ -14,6 +14,9 @@ pub enum IpcCommand {
     #[strum(serialize = "/clash/logs")]
     GetClashLogs,
 
+    #[strum(serialize = "/clash/log-snapshot")]
+    GetClashLogSnapshot,
+
     #[strum(serialize = "/clash/start")]
     StartClash,
     #[strum(serialize = "/clash/stop")]

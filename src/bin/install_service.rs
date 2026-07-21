@@ -5,6 +5,15 @@ fn main() {
 
 use anyhow::Error;
 
+fn run_maintenance_if_requested() -> Result<bool, Error> {
+    if !std::env::args().any(|argument| argument == "--cleanup-stale-owners") {
+        return Ok(false);
+    }
+    let removed = clash_verge_service_ipc::cleanup_stale_owner_state()?;
+    println!("Removed {} stale owner state directories", removed.len());
+    Ok(true)
+}
+
 #[cfg(unix)]
 fn env_u32(key: &str) -> Option<u32> {
     std::env::var(key).ok()?.parse().ok()
@@ -43,6 +52,9 @@ fn main() -> Result<(), Error> {
     use std::io::Write;
     use std::path::Path;
 
+    if run_maintenance_if_requested()? {
+        return Ok(());
+    }
     let debug = env::args().any(|arg| arg == "--debug");
     let _ = uninstall_old_service();
 
@@ -150,6 +162,9 @@ fn main() -> Result<(), Error> {
     use std::io::Write;
     use std::path::Path;
 
+    if run_maintenance_if_requested()? {
+        return Ok(());
+    }
     let debug = env::args().any(|arg| arg == "--debug");
 
     let service_binary_path = env::current_exe()
@@ -214,6 +229,9 @@ fn main() -> anyhow::Result<()> {
     use std::env;
     use std::ffi::{OsStr, OsString};
 
+    if run_maintenance_if_requested()? {
+        return Ok(());
+    }
     const SERVICE_NAME: &str = "clash_verge_service";
 
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;

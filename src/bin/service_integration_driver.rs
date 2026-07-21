@@ -1,9 +1,12 @@
 #![cfg(feature = "client")]
 
+#[cfg(feature = "test")]
+use clash_verge_service_ipc::test_owner_credentials;
 use clash_verge_service_ipc::{
-    ClashConfig, CoreConfig, IpcConfig, WriterConfig, get_status, set_config, start_clash,
-    stop_clash, stop_ipc_server,
+    IpcConfig, RuntimeBundle, get_status, set_config, start_clash, stop_clash,
 };
+#[cfg(not(feature = "test"))]
+use clash_verge_service_ipc::{OwnerCredentials, OwnerIdentity};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -34,20 +37,31 @@ async fn main() -> anyhow::Result<()> {
 
 async fn start_flow() -> anyhow::Result<()> {
     wait_ipc_ready().await?;
-    let config = ClashConfig {
-        core_config: CoreConfig {
-            core_path: mock_binary_path()?,
-            ..Default::default()
-        },
-        log_config: WriterConfig::default(),
+    let config = RuntimeBundle {
+        yaml: "mode: rule\n".to_string(),
+        assets: vec![],
+        core_path: mock_binary_path()?,
     };
-    start_clash(&config).await?;
+    let response = start_clash(&owner_credentials()?, &config).await?;
+    if response.code != 0 {
+        anyhow::bail!(
+            "service rejected Start: {} ({})",
+            response.message,
+            response.code
+        );
+    }
     Ok(())
 }
 
 async fn stop_flow() -> anyhow::Result<()> {
-    let _ = stop_clash().await;
-    let _ = stop_ipc_server().await;
+    let response = stop_clash(&owner_credentials()?).await?;
+    if response.code != 0 {
+        anyhow::bail!(
+            "service rejected Stop: {} ({})",
+            response.message,
+            response.code
+        );
+    }
     Ok(())
 }
 
@@ -62,7 +76,10 @@ async fn wait_ipc_ready() -> anyhow::Result<()> {
     let result: anyhow::Result<()> = async {
         let deadline = Instant::now() + IPC_READY_TIMEOUT;
         while Instant::now() < deadline {
-            if get_status().await.is_ok() {
+            if let Ok(response) = get_status(&owner_credentials()?).await
+                && response.code == 0
+                && response.data.is_some()
+            {
                 return Ok(());
             }
             sleep(IPC_PROBE_INTERVAL).await;
@@ -73,6 +90,31 @@ async fn wait_ipc_ready() -> anyhow::Result<()> {
 
     set_config(None).await;
     result
+}
+
+#[cfg(feature = "test")]
+fn owner_credentials() -> anyhow::Result<clash_verge_service_ipc::OwnerCredentials> {
+    test_owner_credentials(&std::env::current_dir()?)
+}
+
+#[cfg(not(feature = "test"))]
+fn owner_credentials() -> anyhow::Result<OwnerCredentials> {
+    let app_data_dir = std::env::current_dir()?;
+    #[cfg(unix)]
+    let identity = OwnerIdentity::Unix {
+        uid: unsafe { platform_lib::geteuid() },
+        gid: unsafe { platform_lib::getegid() },
+    };
+    #[cfg(windows)]
+    let identity = OwnerIdentity::Windows {
+        sid: std::env::var("CLASH_VERGE_TEST_OWNER_SID")?,
+    };
+
+    Ok(OwnerCredentials {
+        identity,
+        app_data_dir: app_data_dir.to_string_lossy().into_owned(),
+        token: std::env::var("CLASH_VERGE_TEST_OWNER_TOKEN").ok(),
+    })
 }
 
 fn mock_binary_path() -> anyhow::Result<String> {

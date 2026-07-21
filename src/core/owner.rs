@@ -15,7 +15,7 @@ const OWNER_REACQUIRE_ATTEMPTS: usize = 10;
 const OWNER_REACQUIRE_DELAY: Duration = Duration::from_millis(100);
 
 pub struct ServiceOwnerGuard {
-    _file: File,
+    _file: Option<File>,
     paths: ServicePaths,
 }
 
@@ -23,32 +23,16 @@ impl ServiceOwnerGuard {
     fn new(mut file: File, paths: ServicePaths) -> Result<Self> {
         let pid = std::process::id();
         write_owner_metadata(&mut file, &paths, pid)?;
-        Ok(Self { _file: file, paths })
+        Ok(Self {
+            _file: Some(file),
+            paths,
+        })
     }
 }
 
 impl Drop for ServiceOwnerGuard {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-
-            unsafe {
-                platform_lib::flock(self._file.as_raw_fd(), platform_lib::LOCK_UN);
-            }
-        }
-
         let _ = std::fs::remove_file(self.paths.pid_file_path());
-
-        #[cfg(unix)]
-        {
-            let _ = std::fs::remove_file(self.paths.owner_lock_path());
-        }
-
-        #[cfg(windows)]
-        {
-            let _ = std::fs::remove_file(self.paths.owner_lock_path());
-        }
 
         info!(
             "Released service owner lock: {:?}",
@@ -59,12 +43,11 @@ impl Drop for ServiceOwnerGuard {
 
 pub async fn acquire_service_owner() -> Result<Option<ServiceOwnerGuard>> {
     let paths = service_paths();
-    std::fs::create_dir_all(paths.runtime_dir()).with_context(|| {
-        format!(
-            "failed to create runtime directory {:?}",
-            paths.runtime_dir()
-        )
-    })?;
+    crate::core::paths::ensure_persistent_state_layout()?;
+    #[cfg(unix)]
+    crate::core::unix_security::ensure_service_directory(paths.runtime_dir(), 0o755)?;
+    #[cfg(windows)]
+    crate::core::windows_security::ensure_private_service_directory(paths.runtime_dir())?;
 
     if let Some(guard) = try_acquire_owner_once(&paths)? {
         info!("Acquired service owner lock: {:?}", paths.owner_lock_path());
@@ -82,12 +65,22 @@ pub async fn acquire_service_owner() -> Result<Option<ServiceOwnerGuard>> {
         return Ok(None);
     }
 
-    warn!("Existing service owner is not reachable; cleaning old owner state");
-    if let Some(pid) = old_pid
-        && pid != std::process::id()
-        && is_process_alive(pid)
-    {
-        terminate_process(pid).await;
+    let old_pid = old_pid.context(
+        "service owner lock is held but its PID is unavailable; refusing unsafe lock takeover",
+    )?;
+    if old_pid == std::process::id() {
+        return Err(anyhow!(
+            "current process already holds the service owner lock"
+        ));
+    }
+    warn!("Existing service owner is not reachable; stopping old owner before lock takeover");
+    if is_process_alive(old_pid) {
+        terminate_process(old_pid).await?;
+    }
+    if is_process_alive(old_pid) {
+        return Err(anyhow!(
+            "old service owner process {old_pid} is still alive; refusing lock takeover"
+        ));
     }
     cleanup_runtime_artifacts(&paths);
 
@@ -145,19 +138,24 @@ fn try_acquire_owner_once(paths: &ServicePaths) -> Result<Option<ServiceOwnerGua
 
     #[cfg(windows)]
     {
-        let file = match OpenOptions::new()
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, GetLastError};
+        use windows_sys::Win32::Storage::FileSystem::LockFile;
+
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(paths.owner_lock_path())
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to create {:?}", paths.owner_lock_path()));
+            .with_context(|| format!("failed to open {:?}", paths.owner_lock_path()))?;
+        if unsafe { LockFile(file.as_raw_handle(), 0, 0, u32::MAX, u32::MAX) } == 0 {
+            if unsafe { GetLastError() } == ERROR_LOCK_VIOLATION {
+                return Ok(None);
             }
-        };
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to lock {:?}", paths.owner_lock_path()));
+        }
 
         ServiceOwnerGuard::new(file, paths.clone()).map(Some)
     }
@@ -218,6 +216,7 @@ async fn is_ipc_healthy(paths: &ServicePaths) -> bool {
             max_retries: 1,
             retry_delay: Duration::from_millis(25),
             enable_pooling: false,
+            require_windows_server_system: cfg!(windows),
             ..Default::default()
         },
     ) {
@@ -247,12 +246,9 @@ fn cleanup_runtime_artifacts(paths: &ServicePaths) {
 
     #[cfg(unix)]
     {
-        let _ = std::fs::remove_file(paths.owner_lock_path());
         let _ = std::fs::remove_file(paths.ipc_path());
     }
 
     #[cfg(windows)]
-    {
-        let _ = std::fs::remove_file(paths.owner_lock_path());
-    }
+    let _ = paths;
 }

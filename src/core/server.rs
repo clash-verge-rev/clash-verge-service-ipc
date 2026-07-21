@@ -1,14 +1,22 @@
 use super::state::IpcState;
-use crate::core::auth::ipc_request_context_to_auth_context;
-use crate::core::desired::{persist_core_started, persist_core_stopped, persist_writer_config};
+use crate::core::assets::stage_runtime;
+use crate::core::auth::{
+    AuthenticatedOwner, ServiceError, authenticate_owner, ipc_request_context_to_auth_context,
+};
+use crate::core::desired::{
+    ActiveOwnerState, clear_active_owner, load_active_owner, persist_active_owner,
+    persist_owner_core_started, persist_owner_core_stopped, persist_owner_core_stopped_by_key,
+    persist_owner_writer_config,
+};
+use crate::core::legacy_cleanup::cleanup_legacy_owner_files;
 use crate::core::logger::set_or_update_writer;
 use crate::core::manager::{CORE_MANAGER, LOGGER_MANAGER};
 use crate::core::paths::service_paths;
-use crate::core::state::set_service_lifecycle_state;
+use crate::core::state::{set_core_lifecycle_state, set_service_lifecycle_state};
 use crate::core::status::service_status_snapshot;
 use crate::core::structure::{Response, ServiceLifecycleState};
-use crate::{ClashConfig, IpcCommand, VERSION, WriterConfig};
-use anyhow::{Result as AnyResult, anyhow};
+use crate::{AuthenticatedRequest, IpcCommand, RuntimeBundle, VERSION, WriterConfig};
+use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
 use once_cell::sync::Lazy;
@@ -24,6 +32,72 @@ use tracing::{info, trace, warn};
 const IPC_MAX_RESTARTS: u32 = 10;
 const IPC_RESTART_WINDOW: Duration = Duration::from_secs(10);
 const IPC_MAX_BACKOFF: Duration = Duration::from_millis(500);
+#[cfg(any(windows, test))]
+const WINDOWS_CONTROL_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00000003;;;AU)";
+
+async fn rollback_started_owner(owner: &AuthenticatedOwner) -> AnyResult<()> {
+    if let Err(stop_error) = CORE_MANAGER.lock().await.stop_core().await {
+        let recovery = persist_active_owner(owner).await;
+        return match recovery {
+            Ok(_) => Err(anyhow!(
+                "failed to terminate owner core during rollback: {stop_error:#}; owner remains active"
+            )),
+            Err(active_error) => Err(anyhow!(
+                "failed to terminate owner core during rollback: {stop_error:#}; failed to persist active owner: {active_error:#}"
+            )),
+        };
+    }
+
+    let desired_result = persist_owner_core_stopped(owner).await;
+    let active_result = clear_active_owner().await;
+    match (desired_result, active_result) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(desired_error), Ok(())) => Err(desired_error),
+        (Ok(_), Err(active_error)) => Err(active_error),
+        (Err(desired_error), Err(active_error)) => {
+            set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+            Err(anyhow!(
+                "failed to persist stopped owner state: {desired_error:#}; failed to clear active owner: {active_error:#}"
+            ))
+        }
+    }
+}
+
+async fn commit_previous_owner_stopped(
+    previous_owner: &ActiveOwnerState,
+) -> std::result::Result<(), ServiceError> {
+    if let Err(error) = clear_active_owner().await {
+        if persist_owner_core_stopped_by_key(&previous_owner.owner_key)
+            .await
+            .is_err()
+        {
+            set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+        }
+        return Err(ServiceError::owner_switch_failed(format!(
+            "Previous owner core stopped but active owner could not be cleared: {error}"
+        )));
+    }
+    if let Err(error) = persist_owner_core_stopped_by_key(&previous_owner.owner_key).await {
+        let _ = clear_active_owner().await;
+        return Err(ServiceError::owner_switch_failed(format!(
+            "Failed to mark the previous owner stopped: {error}"
+        )));
+    }
+    Ok(())
+}
+
+async fn commit_started_owner(
+    owner: &AuthenticatedOwner,
+    config: &crate::ClashConfig,
+) -> AnyResult<()> {
+    persist_owner_core_started(owner, config)
+        .await
+        .context("failed to persist owner desired state")?;
+    persist_active_owner(owner)
+        .await
+        .context("failed to persist active owner")?;
+    Ok(())
+}
 
 // 防止旧 listener 的清理删除 supervisor 刚创建的新 socket。
 static IPC_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -43,12 +117,6 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
 
     if let Some(mut server) = IpcState::global().take_server().await {
         let handle = tokio::spawn(async move {
-            #[cfg(unix)]
-            let res = tokio::select! {
-                res = unsafe{ platform_lib::umask(0o007); server.serve() } => res,
-                _ = &mut shutdown_rx => Ok(()),
-            };
-            #[cfg(not(unix))]
             let res = tokio::select! {
                 res = server.serve() => res,
                 _ = &mut shutdown_rx => Ok(()),
@@ -73,15 +141,13 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
             if socket_ready {
-                fs::set_permissions(paths.ipc_path(), Permissions::from_mode(0o777)).await?;
+                fs::set_permissions(paths.ipc_path(), Permissions::from_mode(0o666)).await?;
             } else {
                 warn!(
                     "IPC socket {:?} did not appear before permission update timeout",
                     paths.ipc_path()
                 );
             }
-
-            spawn_socket_dir_watchdog();
         }
         Ok(handle)
     } else {
@@ -94,7 +160,12 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
 pub async fn stop_ipc_server() -> Result<()> {
     let _lifecycle_guard = IPC_LIFECYCLE_LOCK.lock().await;
 
-    CORE_MANAGER.lock().await.stop_core().await.ok();
+    CORE_MANAGER
+        .lock()
+        .await
+        .stop_core()
+        .await
+        .map_err(|error| kode_bridge::KodeBridgeError::custom(error.to_string()))?;
 
     if let Some(sender) = IpcState::global().take_sender().await {
         let _ = sender.send(());
@@ -183,7 +254,7 @@ pub async fn run_ipc_supervisor_until_shutdown(
         }
     }
 
-    let _ = stop_ipc_server().await;
+    stop_ipc_server().await?;
     server_handle.abort();
     Ok(())
 }
@@ -196,127 +267,7 @@ fn ipc_backoff_delay(attempt: u32) -> Duration {
     Duration::from_millis(100u64 << (attempt - 1).min(3)).min(IPC_MAX_BACKOFF)
 }
 
-/// 解析 IPC 目录(`/tmp/verge`)应归属的组 GID。
-///
-/// launchd 下服务以 root:wheel 运行且 **没有 `SUDO_GID`**，若直接用 `getgid()`(=wheel)，
-/// 非 root 的 GUI 用户会被 0o2770 目录挡在外面(issue #7333：重启后服务连接失败、TUN
-/// 失效;而手动 `sudo` 因带 `SUDO_GID` 反而正常)。解析优先级：
-/// 1. `SUDO_GID`(终端 sudo 安装)
-/// 2. macOS 控制台登录用户的主组(运行期 GUI 在线时最准，覆盖非 staff 主组的账户)
-/// 3. macOS `staff` 组(GUI 账户默认主组，开机早于登录时仍可用，修掉开机竞态)
-/// 4. `getgid()` 兜底(保持原行为)
-#[cfg(unix)]
-fn resolve_ipc_dir_gid() -> platform_lib::gid_t {
-    if let Some(gid) = std::env::var("SUDO_GID")
-        .ok()
-        .and_then(|s| s.parse::<platform_lib::gid_t>().ok())
-    {
-        return gid;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(gid) = macos_console_user_gid() {
-            return gid;
-        }
-        if let Some(gid) = macos_group_gid(c"staff") {
-            return gid;
-        }
-    }
-
-    unsafe { platform_lib::getgid() }
-}
-
-/// macOS：控制台(GUI 登录)用户的主组 GID。`/dev/console` 的属主即当前 GUI 用户，
-/// 无人登录时其属主为 root，返回 `None`。
-#[cfg(target_os = "macos")]
-fn macos_console_user_gid() -> Option<platform_lib::gid_t> {
-    use std::os::unix::fs::MetadataExt;
-
-    let uid = std::fs::metadata("/dev/console").ok()?.uid();
-    if uid == 0 {
-        return None;
-    }
-    let pw = unsafe { platform_lib::getpwuid(uid) };
-    if pw.is_null() {
-        return None;
-    }
-    Some(unsafe { (*pw).pw_gid })
-}
-
-/// macOS：按名解析组 GID(如 "staff")。
-#[cfg(target_os = "macos")]
-fn macos_group_gid(name: &std::ffi::CStr) -> Option<platform_lib::gid_t> {
-    let grp = unsafe { platform_lib::getgrnam(name.as_ptr()) };
-    if grp.is_null() {
-        return None;
-    }
-    Some(unsafe { (*grp).gr_gid })
-}
-
-/// 确保 IPC 目录存在并设置属组与权限：属主保持 root、属组设为 GUI 用户可访问的组、
-/// 模式 0o2770。`make_ipc_dir` 与看门狗共用,保证一致。
-///
-/// 见 issue #6149：SetGID(0o2000)让 socket 继承目录组；0o2770(rwxrws---)让 root 与
-/// 目标用户组都能管理 socket 生命周期(GUI 进程以非 root 重建 socket / sidecar 回退时)。
-///
-/// 安全：`/tmp` 世界可写,攻击者可能预置 `/tmp/verge` 为指向任意目标的 symlink。故先用
-/// `symlink_metadata`(lstat)确认是真实目录(否则删除重建),再用 `O_DIRECTORY|O_NOFOLLOW`
-/// 打开后对 **fd** 做 `fchown`/`fchmod`：即便有人在创建后竞态替换成 symlink,`open` 也会
-/// 因 ELOOP 失败,绝不会以 root 跟随 symlink 对任意目标改属/改权。
-#[cfg(unix)]
-fn ensure_ipc_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-
-    // 1) 确保路径是真实目录(非 symlink/文件)
-    match std::fs::symlink_metadata(dir) {
-        Ok(meta) if meta.file_type().is_dir() => {}
-        Ok(_) => {
-            warn!(
-                "Unexpected non-directory at {:?}; removing and recreating",
-                dir
-            );
-            std::fs::remove_file(dir)?;
-            std::fs::create_dir_all(dir)?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(dir)?;
-        }
-        Err(e) => return Err(e),
-    }
-
-    // 2) no-follow 打开目录,再对 fd 改属/改权
-    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    let fd = unsafe {
-        platform_lib::open(
-            c_path.as_ptr(),
-            platform_lib::O_DIRECTORY | platform_lib::O_NOFOLLOW | platform_lib::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let gid = resolve_ipc_dir_gid();
-    // 以 root 运行(生产/launchd)时强制属主为 root:若攻击者预置 `/tmp/verge` 为其拥有的
-    // 真实目录,必须夺回属主,否则其以 owner 身份保留对目录(及内部 socket)的管理权。
-    // 非 root(测试/开发)既无权设 root 属主也无攻击面,跳过 chown,仅设权限位。
-    // chown/chmod 失败即 fatal;`&&`/`||` 短路使 `last_os_error()` 为失败 syscall 的 errno。
-    let chown_ok =
-        unsafe { platform_lib::geteuid() } != 0 || unsafe { platform_lib::fchown(fd, 0, gid) } == 0;
-    let ok = chown_ok && unsafe { platform_lib::fchmod(fd, 0o2770 as platform_lib::mode_t) } == 0;
-    let result = if ok {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    };
-    unsafe {
-        platform_lib::close(fd);
-    }
-    result
-}
-
+/// Creates the root-owned machine-wide control runtime directory.
 async fn make_ipc_dir() -> Result<()> {
     #[cfg(unix)]
     {
@@ -325,13 +276,19 @@ async fn make_ipc_dir() -> Result<()> {
             return Ok(());
         };
 
-        ensure_ipc_dir(dir_path)?;
+        ensure_control_runtime_dir(dir_path)?;
     }
     #[cfg(windows)]
     {
         // No directory creation needed for Windows named pipes
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_control_runtime_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    crate::core::unix_security::ensure_service_directory(dir, 0o755)
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 async fn cleanup_ipc_path() -> Result<()> {
@@ -384,51 +341,6 @@ async fn cleanup_stale_ipc_socket() -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-pub fn spawn_socket_dir_watchdog() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    static WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
-    if WATCHDOG_STARTED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-
-    tokio::spawn(async move {
-        let paths = service_paths();
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-        loop {
-            interval.tick().await;
-
-            let socket_path = paths.ipc_path();
-            let Some(dir) = socket_path.parent() else {
-                continue;
-            };
-
-            if !dir.exists() {
-                warn!("IPC socket directory {:?} was deleted, recreating", dir);
-                if let Err(e) = ensure_ipc_dir(dir) {
-                    warn!("Failed to recreate IPC socket directory {:?}: {}", dir, e);
-                    continue;
-                }
-                info!("IPC socket directory {:?} recreated", dir);
-                continue;
-            }
-
-            // 目录已存在：组属可能过期(开机落 staff、之后控制台用户主组不同)，或被替换为
-            // symlink/文件。用 lstat(no-follow)判断，必要时经 ensure_ipc_dir 安全收敛
-            // (issue #7333 开机竞态尾部 + /tmp symlink 防护)。一致则跳过，避免抖动。
-            use std::os::unix::fs::MetadataExt;
-            let needs_fix = match std::fs::symlink_metadata(dir) {
-                Ok(meta) if meta.file_type().is_dir() => meta.gid() != resolve_ipc_dir_gid(),
-                _ => true,
-            };
-            if needs_fix && let Err(e) = ensure_ipc_dir(dir) {
-                warn!("Failed to re-apply ownership on {:?}: {}", dir, e);
-            }
-        }
-    });
-}
-
 async fn init_ipc_state() -> Result<()> {
     let server = create_ipc_server()?;
     let router = create_ipc_router()?;
@@ -444,9 +356,10 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        use platform_lib::{S_IRGRP, S_IRUSR, S_IWGRP, S_IWUSR, mode_t};
+        use platform_lib::{S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP, S_IWOTH, S_IWUSR, mode_t};
 
-        let mode: mode_t = platform_lib::mode_t::from(S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+        let mode: mode_t =
+            platform_lib::mode_t::from(S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
         let server = server.with_listener_mode(mode);
         Ok(server)
     }
@@ -458,7 +371,7 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
 
     #[cfg(windows)]
     {
-        let server = server.with_listener_security_descriptor("D:(A;;GA;;;WD)");
+        let server = server.with_listener_security_descriptor(WINDOWS_CONTROL_PIPE_SDDL);
         Ok(server)
     }
 }
@@ -476,8 +389,16 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::Status.as_ref(), |ctx| async move {
             trace!("Received Status command");
-            ipc_request_context_to_auth_context(&ctx)?;
-            match service_status_snapshot().await {
+            let request = match ctx.json::<AuthenticatedRequest<()>>() {
+                Ok(request) => request,
+                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
+            };
+            let owner = match authenticate_owner(&ctx, &request.credentials) {
+                Ok(owner) => owner,
+                Err(error) => return service_error(error),
+            };
+            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+            match service_status_snapshot(&owner).await {
                 Ok(status) => ok_json(status),
                 Err(error) => {
                     service_unavailable(format!("Failed to collect service status: {}", error))
@@ -486,65 +407,168 @@ fn create_ipc_router() -> Result<Router> {
         })
         .post(IpcCommand::StartClash.as_ref(), |ctx| async move {
             trace!("Received StartClash command");
-            ipc_request_context_to_auth_context(&ctx)?;
-            match ctx.json::<ClashConfig>() {
-                Ok(start_clash) => {
+            match ctx.json::<AuthenticatedRequest<RuntimeBundle>>() {
+                Ok(request) => {
+                    let owner = match authenticate_owner(&ctx, &request.credentials) {
+                        Ok(owner) => owner,
+                        Err(error) => return service_error(error),
+                    };
+                    let runtime_bundle = request.payload;
+                    let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+                    let staged_runtime = match stage_runtime(&owner, &runtime_bundle).await {
+                        Ok(staged) => staged,
+                        Err(error) => return service_error(error),
+                    };
+                    let previous_owner = match load_active_owner().await {
+                        Ok(owner) => owner,
+                        Err(error) => {
+                            return service_unavailable(format!(
+                                "Failed to load active owner: {error}"
+                            ));
+                        }
+                    };
+                    if let Err(error) = CORE_MANAGER.lock().await.stop_core().await {
+                        return service_error(ServiceError::owner_switch_failed(format!(
+                            "Failed to stop the previous owner core: {error}"
+                        )));
+                    }
+                    if let Some(previous_owner) = previous_owner.as_ref()
+                        && let Err(error) = commit_previous_owner_stopped(previous_owner).await
+                    {
+                        return service_error(error);
+                    }
+                    let start_clash = match staged_runtime.activate().await {
+                        Ok(prepared) => prepared.clash_config,
+                        Err(error) => return service_error(error),
+                    };
                     match CORE_MANAGER
                         .lock()
                         .await
-                        .start_core(start_clash.clone())
+                        .start_core(start_clash.clone(), owner.identity.clone())
                         .await
                     {
                         Ok(_) => info!("Core started successfully"),
-                        Err(e) => {
-                            return service_unavailable(format!("Failed to start core: {}", e));
+                        Err(error) => {
+                            if let Err(rollback_error) = rollback_started_owner(&owner).await {
+                                return service_error(ServiceError::owner_switch_failed(format!(
+                                    "Failed to start owner core: {error}; rollback failed: {rollback_error:#}"
+                                )));
+                            }
+                            return service_error(ServiceError::owner_switch_failed(format!(
+                                "Failed to start owner core: {error}"
+                            )));
                         }
                     }
-                    if let Err(e) = persist_core_started(&start_clash).await {
-                        return service_unavailable(format!(
-                            "Failed to persist desired state: {}",
-                            e
-                        ));
+                    if let Err(error) = commit_started_owner(&owner, &start_clash).await {
+                        if let Err(rollback_error) = rollback_started_owner(&owner).await {
+                            return service_error(ServiceError::owner_switch_failed(format!(
+                                "Failed to commit owner state: {error:#}; rollback failed: {rollback_error:#}"
+                            )));
+                        }
+                        return service_error(ServiceError::owner_switch_failed(format!(
+                            "Failed to commit owner state: {error:#}"
+                        )));
+                    }
+                    if let Err(error) = cleanup_legacy_owner_files(&owner).await {
+                        warn!(
+                            "Core start committed, but legacy owner cleanup will be retried later: {error}"
+                        );
                     }
                     ok_empty("Core started successfully")
                 }
-                Err(e) => Ok(HttpResponse::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .text(format!("Invalid JSON: {}", e))
-                    .build()),
+                Err(error) => bad_request(format!("Invalid JSON: {error}")),
             }
         })
         .get(IpcCommand::GetClashLogs.as_ref(), |ctx| async move {
             trace!("Received GetClashLogs command");
-            ipc_request_context_to_auth_context(&ctx)?;
+            let request = match ctx.json::<AuthenticatedRequest<()>>() {
+                Ok(request) => request,
+                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
+            };
+            let owner = match authenticate_owner(&ctx, &request.credentials) {
+                Ok(owner) => owner,
+                Err(error) => return service_error(error),
+            };
+            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+            if let Err(error) = require_active_owner(&owner).await {
+                return service_error(error);
+            }
             ok_json(LOGGER_MANAGER.get_logs().await)
+        })
+        .get(IpcCommand::GetClashLogSnapshot.as_ref(), |ctx| async move {
+            trace!("Received GetClashLogSnapshot command");
+            let request = match ctx.json::<AuthenticatedRequest<()>>() {
+                Ok(request) => request,
+                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
+            };
+            let owner = match authenticate_owner(&ctx, &request.credentials) {
+                Ok(owner) => owner,
+                Err(error) => return service_error(error),
+            };
+            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+            if let Err(error) = require_active_owner(&owner).await {
+                return service_error(error);
+            }
+            let path = service_paths()
+                .for_owner(&owner.identity)
+                .logs_dir()
+                .join("service_latest.log");
+            match read_log_snapshot(&path).await {
+                Ok(snapshot) => ok_json(snapshot),
+                Err(error) => service_unavailable(format!("Failed to read core log snapshot: {error}")),
+            }
         })
         .delete(IpcCommand::StopClash.as_ref(), |ctx| async move {
             trace!("Received StopClash command");
-            ipc_request_context_to_auth_context(&ctx)?;
+            let request = match ctx.json::<AuthenticatedRequest<()>>() {
+                Ok(request) => request,
+                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
+            };
+            let owner = match authenticate_owner(&ctx, &request.credentials) {
+                Ok(owner) => owner,
+                Err(error) => return service_error(error),
+            };
+            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+            if let Err(error) = require_active_owner(&owner).await {
+                return service_error(error);
+            }
             match CORE_MANAGER.lock().await.stop_core().await {
                 Ok(_) => info!("Core stopped successfully"),
                 Err(e) => {
                     return service_unavailable(format!("Failed to stop core: {}", e));
                 }
             }
-            if let Err(e) = persist_core_stopped().await {
+            if let Err(e) = persist_owner_core_stopped(&owner).await {
+                set_core_lifecycle_state(ServiceLifecycleState::Fatal);
                 return service_unavailable(format!("Failed to persist desired state: {}", e));
             }
             ok_empty("Core stopped successfully")
         })
         .put(IpcCommand::UpdateWriter.as_ref(), |ctx| async move {
             trace!("Received UpdateWriter command");
-            ipc_request_context_to_auth_context(&ctx)?;
-            match ctx.json::<WriterConfig>() {
-                Ok(writer_config) => {
+            match ctx.json::<AuthenticatedRequest<WriterConfig>>() {
+                Ok(request) => {
+                    let owner = match authenticate_owner(&ctx, &request.credentials) {
+                        Ok(owner) => owner,
+                        Err(error) => return service_error(error),
+                    };
+                    let mut writer_config = request.payload;
+                    let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+                    if let Err(error) = require_active_owner(&owner).await {
+                        return service_error(error);
+                    }
+                    writer_config.directory = service_paths()
+                        .for_owner(&owner.identity)
+                        .logs_dir()
+                        .to_string_lossy()
+                        .into_owned();
                     match set_or_update_writer(&writer_config).await {
                         Ok(_) => info!("Update writer successfully"),
                         Err(e) => {
                             return service_unavailable(format!("Failed to update writer: {}", e));
                         }
                     };
-                    if let Err(e) = persist_writer_config(&writer_config).await {
+                    if let Err(e) = persist_owner_writer_config(&owner, &writer_config).await {
                         return service_unavailable(format!(
                             "Failed to persist writer config: {}",
                             e
@@ -552,13 +576,37 @@ fn create_ipc_router() -> Result<Router> {
                     }
                     ok_empty("Update Writer successfully")
                 }
-                Err(e) => Ok(HttpResponse::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .text(format!("Invalid JSON: {}", e))
-                    .build()),
+                Err(error) => bad_request(format!("Invalid JSON: {error}")),
             }
         });
     Ok(router)
+}
+
+async fn read_log_snapshot(path: &std::path::Path) -> std::io::Result<String> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+    // The kode-bridge in-memory response limit is 10 MiB. Hex keeps the JSON payload
+    // bounded and avoids content-dependent escaping expansion.
+    const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
+    let mut file = tokio::fs::File::open(path).await?;
+    let length = file.metadata().await?.len();
+    if length > MAX_SNAPSHOT_BYTES {
+        file.seek(std::io::SeekFrom::Start(length - MAX_SNAPSHOT_BYTES))
+            .await?;
+    }
+    let mut content = Vec::with_capacity(length.min(MAX_SNAPSHOT_BYTES) as usize);
+    file.read_to_end(&mut content).await?;
+    if length > MAX_SNAPSHOT_BYTES
+        && let Some(first_newline) = content.iter().position(|byte| *byte == b'\n')
+    {
+        content.drain(..=first_newline);
+    }
+    let mut encoded = String::with_capacity(content.len() * 2);
+    for byte in content {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    Ok(encoded)
 }
 
 fn ok_json<T: Serialize>(data: T) -> Result<HttpResponse> {
@@ -571,6 +619,38 @@ fn ok_empty(message: impl Into<String>) -> Result<HttpResponse> {
 
 fn service_unavailable(message: impl Into<String>) -> Result<HttpResponse> {
     json_response::<()>(StatusCode::SERVICE_UNAVAILABLE, 1, message, None)
+}
+
+fn bad_request(message: impl Into<String>) -> Result<HttpResponse> {
+    json_response::<()>(
+        StatusCode::BAD_REQUEST,
+        StatusCode::BAD_REQUEST.as_u16(),
+        message,
+        None,
+    )
+}
+
+fn service_error(error: ServiceError) -> Result<HttpResponse> {
+    let status = match error.code {
+        crate::ServiceErrorCode::UnauthorizedOwner => StatusCode::UNAUTHORIZED,
+        crate::ServiceErrorCode::NotActive => StatusCode::CONFLICT,
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    json_response::<()>(status, error.code as u16, error.message, None)
+}
+
+async fn require_active_owner(
+    owner: &crate::core::auth::AuthenticatedOwner,
+) -> std::result::Result<(), ServiceError> {
+    if load_active_owner()
+        .await
+        .map_err(|_| ServiceError::not_active())?
+        .is_some_and(|active| active.owner_key == owner.key)
+    {
+        Ok(())
+    } else {
+        Err(ServiceError::not_active())
+    }
 }
 
 fn json_response<T: Serialize>(
@@ -590,21 +670,141 @@ fn json_response<T: Serialize>(
         .build())
 }
 
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use super::*;
+static OWNER_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-    #[test]
-    fn staff_group_resolves_to_valid_gid() {
-        // macOS GUI 账户默认主组 staff 必须能解析；开机竞态兜底依赖它，
-        // 且其 gid(20)必须 != wheel(0)，否则又会把 GUI 用户挡在外面(issue #7333)。
-        let gid = macos_group_gid(c"staff").expect("staff group must exist on macOS");
-        assert_eq!(gid, 20, "staff 在 macOS 上固定为 gid 20");
-        assert_ne!(gid, 0, "解析出的组不能是 wheel(0)");
+#[cfg(test)]
+mod owner_lifecycle_tests {
+    use super::{
+        OWNER_LIFECYCLE_LOCK, WINDOWS_CONTROL_PIPE_SDDL, commit_previous_owner_stopped,
+        commit_started_owner, require_active_owner,
+    };
+    use crate::ServiceErrorCode;
+    use crate::core::auth::AuthenticatedOwner;
+    use crate::core::desired::{
+        clear_active_owner, load_active_owner, load_owner_desired_state, persist_active_owner,
+        persist_owner_core_started,
+    };
+    use crate::{ClashConfig, OwnerIdentity};
+    use serial_test::serial;
+
+    fn owner(uid: u32) -> AuthenticatedOwner {
+        AuthenticatedOwner {
+            key: uid.to_string(),
+            identity: OwnerIdentity::Unix { uid, gid: 20 },
+            app_data_root: std::env::temp_dir(),
+        }
     }
 
     #[test]
-    fn unknown_group_resolves_to_none() {
-        assert!(macos_group_gid(c"clash-verge-no-such-group-zzz").is_none());
+    fn windows_control_pipe_allows_authenticated_users_not_everyone() {
+        assert!(WINDOWS_CONTROL_PIPE_SDDL.contains(";;;AU)"));
+        assert!(!WINDOWS_CONTROL_PIPE_SDDL.contains(";;;WD)"));
+        assert!(!WINDOWS_CONTROL_PIPE_SDDL.contains("GRGW;;;AU"));
+        assert!(WINDOWS_CONTROL_PIPE_SDDL.contains("0x00000003;;;AU"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn non_active_owner_receives_stable_error() -> anyhow::Result<()> {
+        let active = owner(92_001);
+        let inactive = owner(92_002);
+        persist_active_owner(&active).await?;
+
+        let error = require_active_owner(&inactive)
+            .await
+            .expect_err("non-active owner must be rejected");
+
+        assert_eq!(error.code, ServiceErrorCode::NotActive);
+        clear_active_owner().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn owner_takeover_marks_previous_stopped_before_committing_new_owner()
+    -> anyhow::Result<()> {
+        let owner_a = owner(93_001);
+        let owner_b = owner(93_002);
+        let config = ClashConfig::default();
+        persist_owner_core_started(&owner_a, &config).await?;
+        persist_active_owner(&owner_a).await?;
+
+        let previous = load_active_owner()
+            .await?
+            .expect("owner A should be active");
+        commit_previous_owner_stopped(&previous).await?;
+
+        assert!(load_active_owner().await?.is_none());
+        assert!(
+            !load_owner_desired_state(&owner_a.key)
+                .await?
+                .core_should_be_running
+        );
+
+        persist_owner_core_started(&owner_b, &config).await?;
+        persist_active_owner(&owner_b).await?;
+        assert_eq!(
+            load_active_owner().await?.map(|owner| owner.owner_key),
+            Some(owner_b.key.clone())
+        );
+        assert_eq!(
+            require_active_owner(&owner_a)
+                .await
+                .expect_err("owner A must lose control after owner B commits")
+                .code,
+            ServiceErrorCode::NotActive
+        );
+
+        clear_active_owner().await?;
+        for key in [&owner_a.key, &owner_b.key] {
+            let _ = std::fs::remove_dir_all(crate::service_paths().for_owner_key(key).root());
+        }
+        Ok(())
+    }
+
+    async fn commit_test_transition(
+        owner: &AuthenticatedOwner,
+        config: &ClashConfig,
+    ) -> anyhow::Result<()> {
+        let _guard = OWNER_LIFECYCLE_LOCK.lock().await;
+        if let Some(previous) = load_active_owner().await? {
+            commit_previous_owner_stopped(&previous).await?;
+        }
+        commit_started_owner(owner, config).await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn concurrent_owner_state_commits_leave_exactly_one_active_owner() -> anyhow::Result<()> {
+        clear_active_owner().await?;
+        let owner_a = owner(94_001);
+        let owner_b = owner(94_002);
+        let config = ClashConfig::default();
+
+        let (left, right) = tokio::join!(
+            commit_test_transition(&owner_a, &config),
+            commit_test_transition(&owner_b, &config)
+        );
+        left?;
+        right?;
+
+        let active = load_active_owner()
+            .await?
+            .expect("one owner must be active");
+        let desired_a = load_owner_desired_state(&owner_a.key)
+            .await?
+            .core_should_be_running;
+        let desired_b = load_owner_desired_state(&owner_b.key)
+            .await?
+            .core_should_be_running;
+        assert_ne!(desired_a, desired_b);
+        assert_eq!(active.owner_key == owner_a.key, desired_a);
+        assert_eq!(active.owner_key == owner_b.key, desired_b);
+
+        clear_active_owner().await?;
+        for key in [&owner_a.key, &owner_b.key] {
+            let _ = std::fs::remove_dir_all(crate::service_paths().for_owner_key(key).root());
+        }
+        Ok(())
     }
 }

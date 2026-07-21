@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
+pub const OWNER_TOKEN_FILE_NAME: &str = ".clash-verge-service-owner-token";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OwnerIdentity {
     Unix { uid: u32, gid: u32 },
@@ -101,6 +103,7 @@ impl ServiceLifecycleState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceStatusSnapshot {
+    pub is_active: bool,
     pub service_state: ServiceLifecycleState,
     pub core_pid: Option<u32>,
     pub core_started_at: Option<u64>,
@@ -126,8 +129,10 @@ impl Default for CoreConfig {
             r"\\.\pipe\verge-mihomo".to_string()
         } else if cfg!(feature = "test") {
             "/tmp/clash-verge-service-ipc-test/mihomo.sock".to_string()
+        } else if cfg!(target_os = "macos") {
+            "/var/run/clash-verge-service/users/0/verge-mihomo.sock".to_string()
         } else {
-            "/tmp/verge/verge-mihomo.sock".to_string()
+            "/run/clash-verge-service/users/0/verge-mihomo.sock".to_string()
         };
         Self {
             core_path: "./clash".to_string(),
