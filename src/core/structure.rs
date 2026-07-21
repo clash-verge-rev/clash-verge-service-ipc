@@ -1,6 +1,60 @@
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "client")]
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OwnerIdentity {
+    Unix { uid: u32, gid: u32 },
+    Windows { sid: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerCredentials {
+    pub identity: OwnerIdentity,
+    pub app_data_dir: String,
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticatedRequest<T> {
+    pub credentials: OwnerCredentials,
+    pub payload: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAsset {
+    pub source: String,
+    pub destination: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeBundle {
+    pub yaml: String,
+    pub assets: Vec<RuntimeAsset>,
+    pub core_path: String,
+}
+
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceErrorCode {
+    UnauthorizedOwner = 1001,
+    NotActive = 1002,
+    InvalidInstallLocation = 1003,
+    InvalidRuntimeAsset = 1004,
+    LegacyCleanupFailed = 1005,
+    OwnerSwitchFailed = 1006,
+}
+
+pub fn owner_key(identity: &OwnerIdentity) -> String {
+    match identity {
+        OwnerIdentity::Unix { uid, .. } => uid.to_string(),
+        OwnerIdentity::Windows { sid } => Sha256::digest(sid.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    }
+}
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClashConfig {
@@ -118,3 +172,34 @@ pub trait JsonConvert: Serialize + for<'de> Deserialize<'de> {
 }
 #[cfg(feature = "client")]
 impl<T> JsonConvert for T where T: Serialize + for<'de> Deserialize<'de> {}
+
+#[cfg(test)]
+mod tests {
+    use super::{OwnerIdentity, owner_key};
+
+    #[test]
+    fn unix_owner_key_is_decimal_uid() {
+        let identity = OwnerIdentity::Unix { uid: 501, gid: 20 };
+
+        assert_eq!(owner_key(&identity), "501");
+    }
+
+    #[test]
+    fn windows_owner_key_is_stable_and_does_not_embed_sid() {
+        let identity = OwnerIdentity::Windows {
+            sid: "S-1-5-21-1-2-3-1001".to_string(),
+        };
+
+        let first = owner_key(&identity);
+        let second = owner_key(&identity);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(!first.contains("S-1-5"));
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+    }
+}

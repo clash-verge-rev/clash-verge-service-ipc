@@ -4,7 +4,9 @@ mod core;
 mod client;
 
 pub use core::{
-    ClashConfig, CoreConfig, IpcCommand, ServiceLifecycleState, ServiceStatusSnapshot, WriterConfig,
+    AuthenticatedRequest, ClashConfig, CoreConfig, IpcCommand, OwnerCredentials, OwnerIdentity,
+    RuntimeAsset, RuntimeBundle, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot,
+    WriterConfig, mihomo_ipc_path, owner_key,
 };
 pub use core::{ServicePaths, service_paths};
 
@@ -22,8 +24,10 @@ pub use core::{CoreWatchdogTestConfig, set_core_watchdog_config_for_tests};
 #[cfg(feature = "client")]
 pub use client::*;
 
-#[cfg(all(unix, not(feature = "test")))]
-pub static IPC_PATH: &str = "/tmp/verge/clash-verge-service.sock";
+#[cfg(all(target_os = "macos", not(feature = "test")))]
+pub static IPC_PATH: &str = "/var/run/clash-verge-service/service.sock";
+#[cfg(all(unix, not(target_os = "macos"), not(feature = "test")))]
+pub static IPC_PATH: &str = "/run/clash-verge-service/service.sock";
 #[cfg(all(windows, not(feature = "test")))]
 pub static IPC_PATH: &str = r"\\.\pipe\clash-verge-service";
 

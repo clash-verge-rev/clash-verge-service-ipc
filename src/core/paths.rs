@@ -1,3 +1,4 @@
+use crate::core::structure::{OwnerIdentity, owner_key};
 use std::path::{Path, PathBuf};
 
 const SERVICE_NAME: &str = "clash-verge-service";
@@ -63,7 +64,7 @@ fn runtime_dir() -> PathBuf {
         Path::new(crate::IPC_PATH)
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("/tmp/verge"))
+            .unwrap_or_else(|| PathBuf::from("/run/clash-verge-service"))
     }
 
     #[cfg(windows)]
@@ -87,17 +88,6 @@ fn persistent_state_dir() -> PathBuf {
 
     #[cfg(all(unix, not(target_os = "macos"), not(feature = "test")))]
     {
-        if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
-            return PathBuf::from(path).join(SERVICE_NAME);
-        }
-
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join(".local")
-                .join("state")
-                .join(SERVICE_NAME);
-        }
-
         PathBuf::from("/var/lib").join(SERVICE_NAME)
     }
 
@@ -114,5 +104,49 @@ fn persistent_state_dir() -> PathBuf {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(SERVICE_NAME)
+    }
+}
+
+pub(crate) fn unix_mihomo_ipc_path(runtime_root: &Path, uid: u32) -> PathBuf {
+    runtime_root
+        .join("users")
+        .join(uid.to_string())
+        .join("verge-mihomo.sock")
+}
+
+pub fn mihomo_ipc_path(identity: &OwnerIdentity) -> String {
+    match identity {
+        OwnerIdentity::Unix { uid, .. } => {
+            #[cfg(feature = "test")]
+            let runtime_root = std::env::temp_dir().join("clash-verge-service-ipc-test");
+            #[cfg(all(target_os = "macos", not(feature = "test")))]
+            let runtime_root = PathBuf::from("/var/run/clash-verge-service");
+            #[cfg(all(unix, not(target_os = "macos"), not(feature = "test")))]
+            let runtime_root = PathBuf::from("/run/clash-verge-service");
+
+            unix_mihomo_ipc_path(&runtime_root, *uid)
+                .to_string_lossy()
+                .into_owned()
+        }
+        OwnerIdentity::Windows { .. } => {
+            format!(r"\\.\pipe\verge-mihomo-{}", owner_key(identity))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unix_mihomo_ipc_path;
+    use std::path::Path;
+
+    #[test]
+    fn unix_mihomo_ipc_path_is_owner_scoped_and_below_sun_path_limit() {
+        let path = unix_mihomo_ipc_path(Path::new("/var/run/clash-verge-service"), 501);
+
+        assert_eq!(
+            path,
+            Path::new("/var/run/clash-verge-service/users/501/verge-mihomo.sock")
+        );
+        assert!(path.as_os_str().as_encoded_bytes().len() < 104);
     }
 }

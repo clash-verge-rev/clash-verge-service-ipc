@@ -3,11 +3,13 @@ pub use command::IpcCommand;
 
 pub mod structure;
 pub use structure::{
-    ClashConfig, CoreConfig, ServiceLifecycleState, ServiceStatusSnapshot, WriterConfig,
+    AuthenticatedRequest, ClashConfig, CoreConfig, OwnerCredentials, OwnerIdentity, RuntimeAsset,
+    RuntimeBundle, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot, WriterConfig,
+    owner_key,
 };
 
 pub mod paths;
-pub use paths::{ServicePaths, service_paths};
+pub use paths::{ServicePaths, mihomo_ipc_path, service_paths};
 
 #[cfg(feature = "standalone")]
 mod auth;
