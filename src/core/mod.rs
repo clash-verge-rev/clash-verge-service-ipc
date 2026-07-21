@@ -71,3 +71,5 @@ pub use server::{run_ipc_server, run_ipc_supervisor_until_shutdown, stop_ipc_ser
 pub use state::{service_lifecycle_state, set_service_lifecycle_state};
 #[cfg(feature = "test")]
 pub use test_credentials::test_owner_credentials;
+#[cfg(all(feature = "test", unix))]
+pub use test_credentials::test_owner_credentials_for_uid;

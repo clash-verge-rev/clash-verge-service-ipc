@@ -18,7 +18,7 @@ use crate::core::structure::{Response, ServiceLifecycleState};
 use crate::{AuthenticatedRequest, IpcCommand, RuntimeBundle, VERSION, WriterConfig};
 use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
-use kode_bridge::{IpcHttpServer, Result, Router, ipc_http_server::HttpResponse};
+use kode_bridge::{IpcHttpServer, Result, Router, ServerConfig, ipc_http_server::HttpResponse};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::{
@@ -32,6 +32,7 @@ use tracing::{info, trace, warn};
 const IPC_MAX_RESTARTS: u32 = 10;
 const IPC_RESTART_WINDOW: Duration = Duration::from_secs(10);
 const IPC_MAX_BACKOFF: Duration = Duration::from_millis(500);
+const IPC_HANDLER_TIMEOUT: Duration = Duration::from_secs(25);
 #[cfg(any(windows, test))]
 const WINDOWS_CONTROL_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00000003;;;AU)";
 
@@ -352,7 +353,13 @@ async fn init_ipc_state() -> Result<()> {
 fn create_ipc_server() -> Result<IpcHttpServer> {
     let paths = service_paths();
 
-    let server = IpcHttpServer::new(paths.ipc_path())?;
+    let server = IpcHttpServer::with_config(
+        paths.ipc_path(),
+        ServerConfig {
+            write_timeout: IPC_HANDLER_TIMEOUT,
+            ..ServerConfig::default()
+        },
+    )?;
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -441,12 +448,13 @@ fn create_ipc_router() -> Result<Router> {
                         Ok(prepared) => prepared.clash_config,
                         Err(error) => return service_error(error),
                     };
-                    match CORE_MANAGER
-                        .lock()
-                        .await
-                        .start_core(start_clash.clone(), owner.identity.clone())
-                        .await
-                    {
+                    let start_result = {
+                        let manager = CORE_MANAGER.lock().await;
+                        manager
+                            .start_core(start_clash.clone(), owner.identity.clone())
+                            .await
+                    };
+                    match start_result {
                         Ok(_) => info!("Core started successfully"),
                         Err(error) => {
                             if let Err(rollback_error) = rollback_started_owner(&owner).await {

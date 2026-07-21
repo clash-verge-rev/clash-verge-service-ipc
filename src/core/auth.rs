@@ -95,6 +95,11 @@ pub fn authenticate_owner(
     context: &RequestContext,
     credentials: &OwnerCredentials,
 ) -> Result<AuthenticatedOwner, ServiceError> {
+    #[cfg(all(feature = "test", unix))]
+    if let Some(result) = authenticate_synthetic_test_owner(credentials) {
+        return result;
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -134,6 +139,59 @@ pub fn authenticate_owner(
         let _ = context;
         windows_auth::authenticate(credentials)
     }
+}
+
+#[cfg(all(feature = "test", unix))]
+fn authenticate_synthetic_test_owner(
+    credentials: &OwnerCredentials,
+) -> Option<Result<AuthenticatedOwner, ServiceError>> {
+    use crate::core::test_credentials::SYNTHETIC_TEST_OWNER_TOKEN_PREFIX;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let token = credentials.token.as_deref()?;
+    if !token.starts_with(SYNTHETIC_TEST_OWNER_TOKEN_PREFIX) {
+        return None;
+    }
+    let expected = format!(
+        "{SYNTHETIC_TEST_OWNER_TOKEN_PREFIX}{}",
+        owner_key(&credentials.identity)
+    );
+    if token != expected {
+        return Some(Err(ServiceError::unauthorized(
+            "synthetic test owner token does not match",
+        )));
+    }
+    let OwnerIdentity::Unix { .. } = credentials.identity else {
+        return Some(Err(ServiceError::unauthorized(
+            "synthetic test owner must use a Unix identity",
+        )));
+    };
+    let app_data_root = match std::fs::canonicalize(&credentials.app_data_dir) {
+        Ok(path) => path,
+        Err(_) => {
+            return Some(Err(ServiceError::unauthorized(
+                "synthetic test owner root is unavailable",
+            )));
+        }
+    };
+    let metadata = match std::fs::metadata(&app_data_root) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return Some(Err(ServiceError::unauthorized(
+                "synthetic test owner root metadata is unavailable",
+            )));
+        }
+    };
+    if !metadata.is_dir() || metadata.uid() != unsafe { platform_lib::geteuid() } {
+        return Some(Err(ServiceError::unauthorized(
+            "synthetic test owner root is not controlled by the test process",
+        )));
+    }
+    Some(Ok(AuthenticatedOwner {
+        key: owner_key(&credentials.identity),
+        identity: credentials.identity.clone(),
+        app_data_root,
+    }))
 }
 
 #[cfg(windows)]

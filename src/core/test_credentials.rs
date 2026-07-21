@@ -4,6 +4,9 @@ use crate::{OwnerCredentials, OwnerIdentity};
 use anyhow::Result;
 use std::path::Path;
 
+#[cfg(unix)]
+pub(crate) const SYNTHETIC_TEST_OWNER_TOKEN_PREFIX: &str = "clash-verge-service-test-owner:";
+
 pub fn test_owner_credentials(app_data_root: &Path) -> Result<OwnerCredentials> {
     std::fs::create_dir_all(app_data_root)?;
 
@@ -22,6 +25,24 @@ pub fn test_owner_credentials(app_data_root: &Path) -> Result<OwnerCredentials> 
         identity,
         app_data_dir: app_data_root.to_string_lossy().into_owned(),
         token,
+    })
+}
+
+#[cfg(unix)]
+pub fn test_owner_credentials_for_uid(app_data_root: &Path, uid: u32) -> Result<OwnerCredentials> {
+    std::fs::create_dir_all(app_data_root)?;
+    let identity = OwnerIdentity::Unix {
+        uid,
+        gid: unsafe { platform_lib::getegid() },
+    };
+    let token = format!(
+        "{SYNTHETIC_TEST_OWNER_TOKEN_PREFIX}{}",
+        crate::owner_key(&identity)
+    );
+    Ok(OwnerCredentials {
+        identity,
+        app_data_dir: app_data_root.to_string_lossy().into_owned(),
+        token: Some(token),
     })
 }
 

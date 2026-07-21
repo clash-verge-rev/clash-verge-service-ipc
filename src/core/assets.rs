@@ -325,9 +325,12 @@ async fn prepare_owner_ipc_directory(owner: &AuthenticatedOwner) -> Result<(), S
             return Err(invalid_asset("Unix IPC directory requires a Unix owner"));
         };
         let mut stat = unsafe { std::mem::zeroed::<platform_lib::stat>() };
-        if unsafe { platform_lib::fstat(fd, &mut stat) } != 0
+        let inspected = unsafe { platform_lib::fstat(fd, &mut stat) } == 0;
+        let effective_uid = unsafe { platform_lib::geteuid() };
+        let test_process_owned = cfg!(feature = "test") && stat.st_uid == effective_uid;
+        if !inspected
             || stat.st_mode & platform_lib::S_IFMT != platform_lib::S_IFDIR
-            || (stat.st_uid != 0 && stat.st_uid != uid)
+            || (stat.st_uid != 0 && stat.st_uid != uid && !test_process_owned)
         {
             unsafe { platform_lib::close(fd) };
             return Err(invalid_asset(

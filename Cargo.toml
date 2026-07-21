@@ -35,6 +35,11 @@ path = "src/bin/crash_binary.rs"
 required-features = ["test"]
 
 [[bin]]
+name = "no_ipc_binary"
+path = "src/bin/no_ipc_binary.rs"
+required-features = ["test"]
+
+[[bin]]
 name = "owner_lock_holder"
 path = "src/bin/owner_lock_holder.rs"
 required-features = ["standalone", "test"]
