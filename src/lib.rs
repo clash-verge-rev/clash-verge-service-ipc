@@ -4,9 +4,11 @@ mod core;
 mod client;
 
 pub use core::{
-    AuthenticatedRequest, ClashConfig, CoreConfig, IpcCommand, OWNER_TOKEN_FILE_NAME,
-    OwnerCredentials, OwnerIdentity, RuntimeAsset, RuntimeBundle, ServiceErrorCode,
-    ServiceLifecycleState, ServiceStatusSnapshot, WriterConfig, mihomo_ipc_path, owner_key,
+    AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreConfig, IpcCommand,
+    MacosProxyConfig, OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, OwnerSessionHandle,
+    OwnerSessionProof, ProxyApplyOutcome, RuntimeAsset, RuntimeBundle, SERVICE_PROTOCOL_HEADER,
+    SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot,
+    StartClashRequest, StartClashResult, WriterConfig, mihomo_ipc_path, owner_key,
 };
 pub use core::{OwnerPaths, ServicePaths, service_paths};
 

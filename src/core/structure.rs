@@ -4,6 +4,8 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 pub const OWNER_TOKEN_FILE_NAME: &str = ".clash-verge-service-owner-token";
+pub const SERVICE_PROTOCOL_HEADER: &str = "X-Clash-Verge-Service-Protocol";
+pub const SESSION_TOKEN_HEX_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OwnerIdentity {
@@ -25,6 +27,19 @@ pub struct AuthenticatedRequest<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerSessionProof {
+    pub generation: u64,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticatedSessionRequest<T> {
+    pub credentials: OwnerCredentials,
+    pub session: OwnerSessionProof,
+    pub payload: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeAsset {
     pub source: String,
     pub destination: String,
@@ -37,6 +52,46 @@ pub struct RuntimeBundle {
     pub core_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum MacosProxyConfig {
+    Disabled,
+    Global {
+        host: String,
+        port: u16,
+        bypass: String,
+    },
+    Pac {
+        url: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProxyApplyOutcome {
+    NotRequested,
+    Applied,
+    DirectFallback { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartClashRequest {
+    pub runtime: RuntimeBundle,
+    pub proposed_session_token: String,
+    pub macos_proxy: Option<MacosProxyConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerSessionHandle {
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartClashResult {
+    pub session: OwnerSessionHandle,
+    pub proxy_outcome: ProxyApplyOutcome,
+}
+
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServiceErrorCode {
@@ -46,6 +101,11 @@ pub enum ServiceErrorCode {
     InvalidRuntimeAsset = 1004,
     LegacyCleanupFailed = 1005,
     OwnerSwitchFailed = 1006,
+    ProtocolMismatch = 1007,
+    StaleOwnerSession = 1008,
+    InvalidProxyConfig = 1009,
+    ProxyClearFailed = 1010,
+    ProxyApplyFailed = 1011,
 }
 
 pub fn owner_key(identity: &OwnerIdentity) -> String {
@@ -180,7 +240,40 @@ impl<T> JsonConvert for T where T: Serialize + for<'de> Deserialize<'de> {}
 
 #[cfg(test)]
 mod tests {
-    use super::{OwnerIdentity, owner_key};
+    use super::{
+        MacosProxyConfig, OwnerIdentity, RuntimeBundle, ServiceErrorCode, StartClashRequest,
+        owner_key,
+    };
+
+    #[test]
+    fn service_250_contract_round_trips_owner_session_and_proxy() {
+        let request = StartClashRequest {
+            runtime: RuntimeBundle {
+                yaml: "mode: rule\n".to_owned(),
+                assets: Vec::new(),
+                core_path: "/tmp/mihomo".to_owned(),
+            },
+            proposed_session_token: "11".repeat(32),
+            macos_proxy: Some(MacosProxyConfig::Global {
+                host: "127.0.0.1".to_owned(),
+                port: 7897,
+                bypass: "localhost".to_owned(),
+            }),
+        };
+        let encoded = serde_json::to_vec(&request).expect("request should serialize");
+        let decoded: StartClashRequest =
+            serde_json::from_slice(&encoded).expect("request should deserialize");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn stable_session_error_codes_do_not_overlap_existing_codes() {
+        assert_eq!(ServiceErrorCode::ProtocolMismatch as u16, 1007);
+        assert_eq!(ServiceErrorCode::StaleOwnerSession as u16, 1008);
+        assert_eq!(ServiceErrorCode::InvalidProxyConfig as u16, 1009);
+        assert_eq!(ServiceErrorCode::ProxyClearFailed as u16, 1010);
+        assert_eq!(ServiceErrorCode::ProxyApplyFailed as u16, 1011);
+    }
 
     #[test]
     fn unix_owner_key_is_decimal_uid() {

@@ -3,9 +3,11 @@ pub use command::IpcCommand;
 
 pub mod structure;
 pub use structure::{
-    AuthenticatedRequest, ClashConfig, CoreConfig, OWNER_TOKEN_FILE_NAME, OwnerCredentials,
-    OwnerIdentity, RuntimeAsset, RuntimeBundle, ServiceErrorCode, ServiceLifecycleState,
-    ServiceStatusSnapshot, WriterConfig, owner_key,
+    AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreConfig, MacosProxyConfig,
+    OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, OwnerSessionHandle, OwnerSessionProof,
+    ProxyApplyOutcome, RuntimeAsset, RuntimeBundle, SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN,
+    ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot, StartClashRequest,
+    StartClashResult, WriterConfig, owner_key,
 };
 
 pub mod paths;
