@@ -5,6 +5,53 @@ fn main() {
 
 use anyhow::Error;
 
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_SERVICE_TARGET: &str = "system/io.github.clash-verge-rev.clash-verge-rev.service";
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchdInstallPlan {
+    SkipBootout,
+    Bootout,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn classify_launchd_service_probe(
+    exit_code: Option<i32>,
+    diagnostic: &str,
+) -> Result<LaunchdInstallPlan, Error> {
+    match exit_code {
+        Some(0) => Ok(LaunchdInstallPlan::Bootout),
+        Some(113) if diagnostic.contains("Could not find service") => {
+            Ok(LaunchdInstallPlan::SkipBootout)
+        }
+        _ => Err(anyhow::anyhow!(
+            "Unexpected launchctl service probe result (exit code: {:?}): {}",
+            exit_code,
+            diagnostic
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn probe_launchd_service(debug: bool) -> Result<LaunchdInstallPlan, Error> {
+    if debug {
+        println!("Executing: launchctl print {}", LAUNCHD_SERVICE_TARGET);
+    }
+
+    let output = std::process::Command::new("launchctl")
+        .args(["print", LAUNCHD_SERVICE_TARGET])
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to probe launchd service: {}", e))?;
+    let diagnostic = format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    classify_launchd_service_probe(output.status.code(), &diagnostic)
+}
+
 fn run_maintenance_if_requested() -> Result<bool, Error> {
     if !std::env::args().any(|argument| argument == "--cleanup-stale-owners") {
         return Ok(false);
@@ -56,6 +103,7 @@ fn main() -> Result<(), Error> {
         return Ok(());
     }
     let debug = env::args().any(|arg| arg == "--debug");
+    let launchd_install_plan = probe_launchd_service(debug)?;
     let _ = uninstall_old_service();
 
     let service_binary_path = env::current_exe()
@@ -135,11 +183,18 @@ fn main() -> Result<(), Error> {
         ],
         debug,
     );
-    let _ = run_command(
-        "launchctl",
-        &["bootout", "system", plist_file.to_str().unwrap()],
-        debug,
-    );
+    match launchd_install_plan {
+        LaunchdInstallPlan::SkipBootout => {
+            if debug {
+                println!("No loaded Clash Verge Service exists; skipping launchctl bootout.");
+            }
+        }
+        LaunchdInstallPlan::Bootout => run_command(
+            "launchctl",
+            &["bootout", "system", plist_file.to_str().unwrap()],
+            debug,
+        )?,
+    }
     let _ = run_command(
         "launchctl",
         &["bootstrap", "system", plist_file.to_str().unwrap()],
@@ -376,4 +431,41 @@ pub fn run_command(cmd: &str, args: &[&str], debug: bool) -> Result<(), Error> {
         stdout,
         stderr
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_launchd_service_skips_bootout() {
+        let plan = classify_launchd_service_probe(
+            Some(113),
+            "Could not find service \"io.github.clash-verge-rev.clash-verge-rev.service\" in domain for system",
+        )
+        .unwrap();
+
+        assert_eq!(plan, LaunchdInstallPlan::SkipBootout);
+    }
+
+    #[test]
+    fn loaded_launchd_service_runs_bootout() {
+        let plan = classify_launchd_service_probe(Some(0), "").unwrap();
+
+        assert_eq!(plan, LaunchdInstallPlan::Bootout);
+    }
+
+    #[test]
+    fn unexpected_launchd_exit_is_an_error() {
+        let result = classify_launchd_service_probe(Some(5), "Could not find service");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unexpected_launchd_diagnostic_is_an_error() {
+        let result = classify_launchd_service_probe(Some(113), "Operation not permitted");
+
+        assert!(result.is_err());
+    }
 }
