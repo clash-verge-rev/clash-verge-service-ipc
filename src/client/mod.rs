@@ -11,8 +11,9 @@ use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 
 use crate::{
-    AuthenticatedRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand, OwnerCredentials, RuntimeBundle,
-    ServiceStatusSnapshot, WriterConfig,
+    AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
+    MacosProxyConfig, OwnerCredentials, OwnerSessionProof, ProxyApplyOutcome,
+    ServiceStatusSnapshot, StartClashRequest, StartClashResult, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
@@ -21,6 +22,12 @@ static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> =
 
 static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn protected<'a>(
+    request: kode_bridge::HttpRequestBuilder<'a>,
+) -> kode_bridge::HttpRequestBuilder<'a> {
+    request.header(crate::SERVICE_PROTOCOL_HEADER, crate::VERSION)
+}
 
 #[derive(Debug, Clone)]
 pub struct IpcConfig {
@@ -103,8 +110,7 @@ pub async fn get_status(credentials: &OwnerCredentials) -> Result<Response<Servi
         payload: (),
     }
     .to_json_value()?;
-    let response = client
-        .get(IpcCommand::Status.as_ref())
+    let response = protected(client.get(IpcCommand::Status.as_ref()))
         .json_body(&payload)
         .send()
         .await?
@@ -128,21 +134,20 @@ pub async fn is_reinstall_service_needed() -> bool {
 
 pub async fn start_clash(
     credentials: &OwnerCredentials,
-    body: &RuntimeBundle,
-) -> Result<Response<()>> {
+    body: &StartClashRequest,
+) -> Result<Response<StartClashResult>> {
     let client = connect().await?;
     let payload = AuthenticatedRequest {
         credentials: credentials.clone(),
         payload: body.clone(),
     }
     .to_json_value()?;
-    let response = client
-        .post(IpcCommand::StartClash.as_ref())
+    let response = protected(client.post(IpcCommand::StartClash.as_ref()))
         .timeout(LIFECYCLE_TIMEOUT)
         .json_body(&payload)
         .send()
         .await?
-        .json::<Response<()>>()?;
+        .json::<Response<StartClashResult>>()?;
     Ok(response)
 }
 
@@ -155,8 +160,7 @@ pub async fn get_clash_logs(
         payload: (),
     }
     .to_json_value()?;
-    let response = client
-        .get(IpcCommand::GetClashLogs.as_ref())
+    let response = protected(client.get(IpcCommand::GetClashLogs.as_ref()))
         .json_body(&payload)
         .send()
         .await?
@@ -171,8 +175,7 @@ pub async fn get_clash_log_snapshot(credentials: &OwnerCredentials) -> Result<Re
         payload: (),
     }
     .to_json_value()?;
-    let response = client
-        .get(IpcCommand::GetClashLogSnapshot.as_ref())
+    let response = protected(client.get(IpcCommand::GetClashLogSnapshot.as_ref()))
         .json_body(&payload)
         .send()
         .await?
@@ -180,15 +183,18 @@ pub async fn get_clash_log_snapshot(credentials: &OwnerCredentials) -> Result<Re
     Ok(response)
 }
 
-pub async fn stop_clash(credentials: &OwnerCredentials) -> Result<Response<()>> {
+pub async fn stop_clash(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+) -> Result<Response<()>> {
     let client = connect().await?;
-    let payload = AuthenticatedRequest {
+    let payload = AuthenticatedSessionRequest {
         credentials: credentials.clone(),
+        session: session.clone(),
         payload: (),
     }
     .to_json_value()?;
-    let response = client
-        .delete(IpcCommand::StopClash.as_ref())
+    let response = protected(client.delete(IpcCommand::StopClash.as_ref()))
         .timeout(LIFECYCLE_TIMEOUT)
         .json_body(&payload)
         .send()
@@ -199,19 +205,40 @@ pub async fn stop_clash(credentials: &OwnerCredentials) -> Result<Response<()>> 
 
 pub async fn update_writer(
     credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
     body: &WriterConfig,
 ) -> Result<Response<()>> {
     let client = connect().await?;
-    let payload = AuthenticatedRequest {
+    let payload = AuthenticatedSessionRequest {
         credentials: credentials.clone(),
+        session: session.clone(),
         payload: body.clone(),
     }
     .to_json_value()?;
-    let response = client
-        .put(IpcCommand::UpdateWriter.as_ref())
+    let response = protected(client.put(IpcCommand::UpdateWriter.as_ref()))
         .json_body(&payload)
         .send()
         .await?
         .json::<Response<()>>()?;
+    Ok(response)
+}
+
+pub async fn set_system_proxy(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    body: &MacosProxyConfig,
+) -> Result<Response<ProxyApplyOutcome>> {
+    let client = connect().await?;
+    let payload = AuthenticatedSessionRequest {
+        credentials: credentials.clone(),
+        session: session.clone(),
+        payload: body.clone(),
+    }
+    .to_json_value()?;
+    let response = protected(client.put(IpcCommand::SetSystemProxy.as_ref()))
+        .json_body(&payload)
+        .send()
+        .await?
+        .json::<Response<ProxyApplyOutcome>>()?;
     Ok(response)
 }

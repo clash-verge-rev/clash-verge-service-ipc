@@ -4,11 +4,13 @@ mod common;
 
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::{
-    AuthenticatedRequest, AuthenticatedSessionRequest, IpcCommand, MacosProxyConfig,
-    OwnerCredentials, OwnerSessionProof, ProxyApplyOutcome, RuntimeBundle, SERVICE_PROTOCOL_HEADER,
-    ServiceErrorCode, ServiceStatusSnapshot, StartClashRequest, StartClashResult, VERSION,
-    WriterConfig, connect, load_active_owner, load_owner_desired_state, owner_key,
-    restore_desired_state, run_ipc_server, stop_ipc_server,
+    IpcCommand, MacosProxyConfig, OwnerCredentials, OwnerSessionProof, ProxyApplyOutcome,
+    RuntimeBundle, ServiceErrorCode, ServiceStatusSnapshot, StartClashRequest, StartClashResult,
+    WriterConfig, connect, get_clash_log_snapshot as client_get_clash_log_snapshot,
+    get_clash_logs as client_get_clash_logs, get_status as client_get_status, load_active_owner,
+    load_owner_desired_state, owner_key, restore_desired_state, run_ipc_server,
+    set_system_proxy as client_set_system_proxy, start_clash as client_start_clash,
+    stop_clash as client_stop_clash, stop_ipc_server, update_writer as client_update_writer,
 };
 use serde::Deserialize;
 use serial_test::serial;
@@ -49,50 +51,25 @@ struct WireResponse<T> {
     data: Option<T>,
 }
 
-fn protocol_request<T: serde::Serialize>(
-    credentials: &OwnerCredentials,
-    payload: T,
-) -> Result<serde_json::Value> {
-    Ok(serde_json::to_value(AuthenticatedRequest {
-        credentials: credentials.clone(),
-        payload,
-    })?)
-}
-
-fn session_request<T: serde::Serialize>(
-    credentials: &OwnerCredentials,
-    session: &OwnerSessionProof,
-    payload: T,
-) -> Result<serde_json::Value> {
-    Ok(serde_json::to_value(AuthenticatedSessionRequest {
-        credentials: credentials.clone(),
-        session: session.clone(),
-        payload,
-    })?)
-}
-
 async fn start_clash(
     credentials: &OwnerCredentials,
     runtime: &RuntimeBundle,
     proposed_session_token: &str,
 ) -> Result<WireResponse<StartClashResult>> {
-    let client = connect().await?;
-    let payload = protocol_request(
+    let response = client_start_clash(
         credentials,
-        StartClashRequest {
+        &StartClashRequest {
             runtime: runtime.clone(),
             proposed_session_token: proposed_session_token.to_owned(),
             macos_proxy: None,
         },
-    )?;
-    Ok(client
-        .post(IpcCommand::StartClash.as_ref())
-        .timeout(Duration::from_secs(30))
-        .header(SERVICE_PROTOCOL_HEADER, VERSION)
-        .json_body(&payload)
-        .send()
-        .await?
-        .json()?)
+    )
+    .await?;
+    Ok(WireResponse {
+        code: response.code,
+        message: response.message,
+        data: response.data,
+    })
 }
 
 fn session_from_start(
@@ -111,55 +88,44 @@ fn session_from_start(
 }
 
 async fn get_status(credentials: &OwnerCredentials) -> Result<WireResponse<ServiceStatusSnapshot>> {
-    let client = connect().await?;
-    let payload = protocol_request(credentials, ())?;
-    Ok(client
-        .get(IpcCommand::Status.as_ref())
-        .header(SERVICE_PROTOCOL_HEADER, VERSION)
-        .json_body(&payload)
-        .send()
-        .await?
-        .json()?)
+    let response = client_get_status(credentials).await?;
+    Ok(WireResponse {
+        code: response.code,
+        message: response.message,
+        data: response.data,
+    })
 }
 
 async fn get_clash_logs(credentials: &OwnerCredentials) -> Result<WireResponse<Vec<String>>> {
-    let client = connect().await?;
-    let payload = protocol_request(credentials, ())?;
-    Ok(client
-        .get(IpcCommand::GetClashLogs.as_ref())
-        .header(SERVICE_PROTOCOL_HEADER, VERSION)
-        .json_body(&payload)
-        .send()
-        .await?
-        .json()?)
+    let response = client_get_clash_logs(credentials).await?;
+    Ok(WireResponse {
+        code: response.code,
+        message: response.message,
+        data: response
+            .data
+            .map(|logs| logs.into_iter().map(Into::into).collect()),
+    })
 }
 
 async fn get_clash_log_snapshot(credentials: &OwnerCredentials) -> Result<WireResponse<String>> {
-    let client = connect().await?;
-    let payload = protocol_request(credentials, ())?;
-    Ok(client
-        .get(IpcCommand::GetClashLogSnapshot.as_ref())
-        .header(SERVICE_PROTOCOL_HEADER, VERSION)
-        .json_body(&payload)
-        .send()
-        .await?
-        .json()?)
+    let response = client_get_clash_log_snapshot(credentials).await?;
+    Ok(WireResponse {
+        code: response.code,
+        message: response.message,
+        data: response.data,
+    })
 }
 
 async fn stop_clash(
     credentials: &OwnerCredentials,
     session: &OwnerSessionProof,
 ) -> Result<WireResponse<()>> {
-    let client = connect().await?;
-    let payload = session_request(credentials, session, ())?;
-    Ok(client
-        .delete(IpcCommand::StopClash.as_ref())
-        .timeout(Duration::from_secs(30))
-        .header(SERVICE_PROTOCOL_HEADER, VERSION)
-        .json_body(&payload)
-        .send()
-        .await?
-        .json()?)
+    let response = client_stop_clash(credentials, session).await?;
+    Ok(WireResponse {
+        code: response.code,
+        message: response.message,
+        data: response.data,
+    })
 }
 
 async fn update_writer(
@@ -167,15 +133,12 @@ async fn update_writer(
     session: &OwnerSessionProof,
     writer: &WriterConfig,
 ) -> Result<WireResponse<()>> {
-    let client = connect().await?;
-    let payload = session_request(credentials, session, writer.clone())?;
-    Ok(client
-        .put(IpcCommand::UpdateWriter.as_ref())
-        .header(SERVICE_PROTOCOL_HEADER, VERSION)
-        .json_body(&payload)
-        .send()
-        .await?
-        .json()?)
+    let response = client_update_writer(credentials, session, writer).await?;
+    Ok(WireResponse {
+        code: response.code,
+        message: response.message,
+        data: response.data,
+    })
 }
 
 async fn set_system_proxy(
@@ -183,15 +146,12 @@ async fn set_system_proxy(
     session: &OwnerSessionProof,
     proxy: MacosProxyConfig,
 ) -> Result<WireResponse<ProxyApplyOutcome>> {
-    let client = connect().await?;
-    let payload = session_request(credentials, session, proxy)?;
-    Ok(client
-        .put(IpcCommand::SetSystemProxy.as_ref())
-        .header(SERVICE_PROTOCOL_HEADER, VERSION)
-        .json_body(&payload)
-        .send()
-        .await?
-        .json()?)
+    let response = client_set_system_proxy(credentials, session, &proxy).await?;
+    Ok(WireResponse {
+        code: response.code,
+        message: response.message,
+        data: response.data,
+    })
 }
 
 #[tokio::test]

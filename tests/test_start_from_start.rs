@@ -4,8 +4,9 @@ mod common;
 mod tests {
     use anyhow::Result;
     use clash_verge_service_ipc::{
-        RuntimeBundle, connect, get_status, load_owner_desired_state, owner_key, run_ipc_server,
-        start_clash, stop_clash, stop_ipc_server,
+        OwnerSessionProof, RuntimeBundle, StartClashRequest, connect, get_status,
+        load_owner_desired_state, owner_key, run_ipc_server, start_clash, stop_clash,
+        stop_ipc_server,
     };
     use serial_test::serial;
     use std::sync::OnceLock;
@@ -113,18 +114,33 @@ mod tests {
         info!("✅ IPC connection works after server start");
     }
 
-    async fn step_start_mock_binary() {
+    async fn step_start_mock_binary() -> OwnerSessionProof {
         let credentials = common::owner_credentials();
         let runtime_bundle = RuntimeBundle {
             yaml: "mode: rule\n".to_string(),
             assets: vec![],
             core_path: bin_path().to_string_lossy().to_string(),
         };
-        let start_result = start_clash(&credentials, &runtime_bundle).await;
-        assert!(
-            start_result.is_ok(),
-            "Starting clash with mock binary should return Ok"
-        );
+        let proposed_session_token = "31".repeat(32);
+        let start_result = start_clash(
+            &credentials,
+            &StartClashRequest {
+                runtime: runtime_bundle,
+                proposed_session_token: proposed_session_token.clone(),
+                macos_proxy: None,
+            },
+        )
+        .await
+        .expect("Starting clash with mock binary should return Ok");
+        assert_eq!(start_result.code, 0, "{}", start_result.message);
+        let session = OwnerSessionProof {
+            generation: start_result
+                .data
+                .expect("Start response should contain a session")
+                .session
+                .generation,
+            token: proposed_session_token,
+        };
         let desired_state = load_owner_desired_state(&owner_key(&credentials.identity))
             .await
             .unwrap();
@@ -148,6 +164,7 @@ mod tests {
             "Status should include desired running state"
         );
         info!("✅ mock binary started successfully");
+        session
     }
 
     #[tokio::test]
@@ -169,9 +186,10 @@ mod tests {
         step_connect_ipc_after_starting_server().await;
 
         info!("==== Step 5: Start mock binary 30 times ====");
+        let mut active_session = None;
         for i in 1..=30 {
             info!("-- Iteration {}/30: starting mock binary --", i);
-            step_start_mock_binary().await;
+            active_session = Some(step_start_mock_binary().await);
             assert!(
                 is_mock_binary_running(),
                 "Mock binary should be running (iteration {})",
@@ -181,7 +199,13 @@ mod tests {
         }
 
         info!("🎉 All IPC flow steps passed!");
-        let stop = stop_clash(&common::owner_credentials()).await?;
+        let stop = stop_clash(
+            &common::owner_credentials(),
+            active_session
+                .as_ref()
+                .expect("the final Start should return a session"),
+        )
+        .await?;
         assert_eq!(stop.code, 0);
         stop_ipc_server().await.unwrap();
         let res = server_handle.await.unwrap();

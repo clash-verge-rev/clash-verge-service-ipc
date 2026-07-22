@@ -8,10 +8,11 @@ mod tests {
     #[cfg(unix)]
     use clash_verge_service_ipc::acquire_service_owner;
     use clash_verge_service_ipc::{
-        CoreWatchdogTestConfig, RuntimeBundle, ServiceLifecycleState, connect, get_status,
-        reconcile_service_startup, run_ipc_server, run_ipc_supervisor_until_shutdown,
-        service_lifecycle_state, service_paths, set_core_watchdog_config_for_tests, start_clash,
-        stop_clash, stop_ipc_server, write_core_runtime_record_for_tests,
+        CoreWatchdogTestConfig, OwnerSessionProof, RuntimeBundle, ServiceLifecycleState,
+        StartClashRequest, connect, get_status, reconcile_service_startup, run_ipc_server,
+        run_ipc_supervisor_until_shutdown, service_lifecycle_state, service_paths,
+        set_core_watchdog_config_for_tests, start_clash, stop_clash, stop_ipc_server,
+        write_core_runtime_record_for_tests,
     };
     use serial_test::serial;
     use std::path::PathBuf;
@@ -281,8 +282,25 @@ mod tests {
             assets: vec![],
             core_path: crash_binary.to_string_lossy().to_string(),
         };
-        let response = start_clash(&credentials, &runtime_bundle).await?;
+        let proposed_session_token = "41".repeat(32);
+        let response = start_clash(
+            &credentials,
+            &StartClashRequest {
+                runtime: runtime_bundle,
+                proposed_session_token: proposed_session_token.clone(),
+                macos_proxy: None,
+            },
+        )
+        .await?;
         assert_eq!(response.code, 0);
+        let session = OwnerSessionProof {
+            generation: response
+                .data
+                .context("Start response omitted session")?
+                .session
+                .generation,
+            token: proposed_session_token,
+        };
 
         wait_until_async("bounded crash loop", Duration::from_secs(5), || async {
             get_status(&credentials)
@@ -315,7 +333,7 @@ mod tests {
             "watchdog should stop supervising after crash loop limit"
         );
 
-        let stop = stop_clash(&credentials).await?;
+        let stop = stop_clash(&credentials, &session).await?;
         assert_eq!(stop.code, 0);
         stop_ipc_server().await?;
         server_handle.await??;

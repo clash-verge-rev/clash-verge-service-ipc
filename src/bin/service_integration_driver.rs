@@ -3,7 +3,8 @@
 #[cfg(feature = "test")]
 use clash_verge_service_ipc::test_owner_credentials;
 use clash_verge_service_ipc::{
-    IpcConfig, RuntimeBundle, get_status, set_config, start_clash, stop_clash,
+    IpcConfig, OwnerSessionProof, RuntimeBundle, StartClashRequest, get_status, set_config,
+    start_clash, stop_clash,
 };
 #[cfg(not(feature = "test"))]
 use clash_verge_service_ipc::{OwnerCredentials, OwnerIdentity};
@@ -42,7 +43,15 @@ async fn start_flow() -> anyhow::Result<()> {
         assets: vec![],
         core_path: mock_binary_path()?,
     };
-    let response = start_clash(&owner_credentials()?, &config).await?;
+    let response = start_clash(
+        &owner_credentials()?,
+        &StartClashRequest {
+            runtime: config,
+            proposed_session_token: session_token()?,
+            macos_proxy: None,
+        },
+    )
+    .await?;
     if response.code != 0 {
         anyhow::bail!(
             "service rejected Start: {} ({})",
@@ -50,11 +59,17 @@ async fn start_flow() -> anyhow::Result<()> {
             response.code
         );
     }
+    let generation = response
+        .data
+        .ok_or_else(|| anyhow::anyhow!("service Start response omitted session"))?
+        .session
+        .generation;
+    println!("{generation}");
     Ok(())
 }
 
 async fn stop_flow() -> anyhow::Result<()> {
-    let response = stop_clash(&owner_credentials()?).await?;
+    let response = stop_clash(&owner_credentials()?, &session_proof()?).await?;
     if response.code != 0 {
         anyhow::bail!(
             "service rejected Stop: {} ({})",
@@ -63,6 +78,17 @@ async fn stop_flow() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn session_token() -> anyhow::Result<String> {
+    Ok(std::env::var("CLASH_VERGE_TEST_SESSION_TOKEN")?)
+}
+
+fn session_proof() -> anyhow::Result<OwnerSessionProof> {
+    Ok(OwnerSessionProof {
+        generation: std::env::var("CLASH_VERGE_TEST_SESSION_GENERATION")?.parse()?,
+        token: session_token()?,
+    })
 }
 
 async fn wait_ipc_ready() -> anyhow::Result<()> {

@@ -27,10 +27,14 @@ use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ServerConfig, ipc_http_server::HttpResponse};
 use once_cell::sync::Lazy;
 use serde::Serialize;
+#[cfg(feature = "test")]
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::{
     future::Future,
     time::{Duration, Instant},
 };
+#[cfg(feature = "test")]
+use tokio::sync::Notify;
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, trace, warn};
@@ -201,6 +205,7 @@ async fn apply_service_proxy_or_direct(
     config: Option<&MacosProxyConfig>,
 ) -> AnyResult<ProxyApplyOutcome> {
     let _ = apply_proxy_or_direct;
+    test_proxy_barrier_block_if_armed().await;
     Ok(if config.is_some() {
         ProxyApplyOutcome::Applied
     } else {
@@ -574,6 +579,8 @@ fn create_ipc_router() -> Result<Router> {
             {
                 return service_error(ServiceError::invalid_proxy_config(error.to_string()));
             }
+            #[cfg(feature = "test")]
+            test_proxy_barrier_note_start_waiting();
             let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
             let staged_runtime = match stage_runtime(&owner, &start_request.runtime).await {
                 Ok(staged) => staged,
@@ -756,6 +763,28 @@ fn create_ipc_router() -> Result<Router> {
                 Err(error) => service_error(ServiceError::proxy_apply_failed(error.to_string())),
             }
         });
+    #[cfg(feature = "test")]
+    let router = router
+        .post("/__test/proxy-barrier/arm", |_ctx| async move {
+            test_proxy_barrier_arm();
+            ok_empty("Proxy barrier armed")
+        })
+        .get("/__test/proxy-barrier/proxy-entered", |_ctx| async move {
+            test_proxy_barrier_wait(TEST_PROXY_ENTERED, &TEST_PROXY_ENTERED_NOTIFY).await;
+            ok_empty("Proxy operation entered")
+        })
+        .get("/__test/proxy-barrier/start-waiting", |_ctx| async move {
+            test_proxy_barrier_wait(TEST_START_WAITING, &TEST_START_WAITING_NOTIFY).await;
+            ok_empty("Start is waiting")
+        })
+        .post("/__test/proxy-barrier/release", |_ctx| async move {
+            test_proxy_barrier_release();
+            ok_empty("Proxy barrier released")
+        })
+        .post("/__test/proxy-barrier/reset", |_ctx| async move {
+            test_proxy_barrier_reset();
+            ok_empty("Proxy barrier reset")
+        });
     Ok(router)
 }
 
@@ -880,6 +909,79 @@ fn json_response<T: Serialize>(
 }
 
 static OWNER_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+#[cfg(feature = "test")]
+const TEST_PROXY_ARMED: u8 = 1 << 0;
+#[cfg(feature = "test")]
+const TEST_PROXY_ENTERED: u8 = 1 << 1;
+#[cfg(feature = "test")]
+const TEST_START_WAITING: u8 = 1 << 2;
+#[cfg(feature = "test")]
+const TEST_PROXY_RELEASED: u8 = 1 << 3;
+#[cfg(feature = "test")]
+static TEST_PROXY_BARRIER_STATE: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "test")]
+static TEST_PROXY_ENTERED_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
+#[cfg(feature = "test")]
+static TEST_START_WAITING_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
+#[cfg(feature = "test")]
+static TEST_PROXY_RELEASE_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
+
+#[cfg(feature = "test")]
+fn test_proxy_barrier_arm() {
+    TEST_PROXY_BARRIER_STATE.store(TEST_PROXY_ARMED, Ordering::Release);
+}
+
+#[cfg(feature = "test")]
+async fn test_proxy_barrier_block_if_armed() {
+    if TEST_PROXY_BARRIER_STATE
+        .compare_exchange(
+            TEST_PROXY_ARMED,
+            TEST_PROXY_ARMED | TEST_PROXY_ENTERED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    TEST_PROXY_ENTERED_NOTIFY.notify_waiters();
+    test_proxy_barrier_wait(TEST_PROXY_RELEASED, &TEST_PROXY_RELEASE_NOTIFY).await;
+}
+
+#[cfg(feature = "test")]
+fn test_proxy_barrier_note_start_waiting() {
+    let state = TEST_PROXY_BARRIER_STATE.load(Ordering::Acquire);
+    if state & TEST_PROXY_ENTERED == 0 || state & TEST_PROXY_RELEASED != 0 {
+        return;
+    }
+    if OWNER_LIFECYCLE_LOCK.try_lock().is_err() {
+        TEST_PROXY_BARRIER_STATE.fetch_or(TEST_START_WAITING, Ordering::AcqRel);
+        TEST_START_WAITING_NOTIFY.notify_waiters();
+    }
+}
+
+#[cfg(feature = "test")]
+async fn test_proxy_barrier_wait(required: u8, notify: &Notify) {
+    loop {
+        let notified = notify.notified();
+        if TEST_PROXY_BARRIER_STATE.load(Ordering::Acquire) & required == required {
+            return;
+        }
+        notified.await;
+    }
+}
+
+#[cfg(feature = "test")]
+fn test_proxy_barrier_release() {
+    TEST_PROXY_BARRIER_STATE.fetch_or(TEST_PROXY_RELEASED, Ordering::AcqRel);
+    TEST_PROXY_RELEASE_NOTIFY.notify_waiters();
+}
+
+#[cfg(feature = "test")]
+fn test_proxy_barrier_reset() {
+    TEST_PROXY_BARRIER_STATE.store(0, Ordering::Release);
+}
 
 #[cfg(test)]
 mod owner_lifecycle_tests {
