@@ -126,30 +126,6 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
             let _ = done_tx.send(());
             res
         });
-        #[cfg(unix)]
-        {
-            use std::fs::Permissions;
-            use std::os::unix::fs::PermissionsExt;
-            use tokio::fs;
-
-            let paths = service_paths();
-            let mut socket_ready = false;
-            for _ in 0..20 {
-                if paths.ipc_path().exists() {
-                    socket_ready = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-            if socket_ready {
-                fs::set_permissions(paths.ipc_path(), Permissions::from_mode(0o666)).await?;
-            } else {
-                warn!(
-                    "IPC socket {:?} did not appear before permission update timeout",
-                    paths.ipc_path()
-                );
-            }
-        }
         Ok(handle)
     } else {
         Err(kode_bridge::KodeBridgeError::configuration(
@@ -361,18 +337,13 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
         },
     )?;
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(unix)]
     {
         use platform_lib::{S_IRGRP, S_IROTH, S_IRUSR, S_IWGRP, S_IWOTH, S_IWUSR, mode_t};
 
         let mode: mode_t =
             platform_lib::mode_t::from(S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
         let server = server.with_listener_mode(mode);
-        Ok(server)
-    }
-
-    #[cfg(all(unix, target_os = "macos"))]
-    {
         Ok(server)
     }
 
