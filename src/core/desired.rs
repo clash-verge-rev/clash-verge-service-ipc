@@ -33,6 +33,7 @@ pub struct ActiveOwnerState {
     pub session_token_hash: String,
 }
 
+#[cfg(test)]
 impl From<&AuthenticatedOwner> for ActiveOwnerState {
     fn from(owner: &AuthenticatedOwner) -> Self {
         Self {
@@ -105,6 +106,7 @@ pub async fn load_active_owner() -> Result<Option<ActiveOwnerState>> {
     }
 }
 
+#[cfg(test)]
 pub async fn persist_active_owner(owner: &AuthenticatedOwner) -> Result<ActiveOwnerState> {
     let _guard = DESIRED_STATE_LOCK.lock().await;
     let state = ActiveOwnerState::from(owner);

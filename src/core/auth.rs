@@ -44,11 +44,30 @@ impl ServiceError {
         Self::new(ServiceErrorCode::OwnerSwitchFailed, message)
     }
 
+    pub(crate) fn protocol_mismatch() -> Self {
+        Self::new(
+            ServiceErrorCode::ProtocolMismatch,
+            "service protocol version does not match",
+        )
+    }
+
     pub(crate) fn stale_owner_session() -> Self {
         Self::new(
             ServiceErrorCode::StaleOwnerSession,
             "owner session is stale or invalid",
         )
+    }
+
+    pub(crate) fn invalid_proxy_config(message: impl Into<String>) -> Self {
+        Self::new(ServiceErrorCode::InvalidProxyConfig, message)
+    }
+
+    pub(crate) fn proxy_clear_failed(message: impl Into<String>) -> Self {
+        Self::new(ServiceErrorCode::ProxyClearFailed, message)
+    }
+
+    pub(crate) fn proxy_apply_failed(message: impl Into<String>) -> Self {
+        Self::new(ServiceErrorCode::ProxyApplyFailed, message)
     }
 }
 

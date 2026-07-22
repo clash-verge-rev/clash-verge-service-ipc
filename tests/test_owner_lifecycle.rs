@@ -4,10 +4,13 @@ mod common;
 
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::{
-    RuntimeBundle, ServiceErrorCode, WriterConfig, connect, get_clash_log_snapshot, get_clash_logs,
-    get_status, load_active_owner, load_owner_desired_state, owner_key, restore_desired_state,
-    run_ipc_server, start_clash, stop_clash, stop_ipc_server, update_writer,
+    AuthenticatedRequest, AuthenticatedSessionRequest, IpcCommand, MacosProxyConfig,
+    OwnerCredentials, OwnerSessionProof, ProxyApplyOutcome, RuntimeBundle, SERVICE_PROTOCOL_HEADER,
+    ServiceErrorCode, ServiceStatusSnapshot, StartClashRequest, StartClashResult, VERSION,
+    WriterConfig, connect, load_active_owner, load_owner_desired_state, owner_key,
+    restore_desired_state, run_ipc_server, stop_ipc_server,
 };
+use serde::Deserialize;
 use serial_test::serial;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -39,6 +42,215 @@ async fn wait_for_ipc() -> Result<()> {
     anyhow::bail!("IPC server did not become ready")
 }
 
+#[derive(Debug, Deserialize)]
+struct WireResponse<T> {
+    code: u16,
+    message: String,
+    data: Option<T>,
+}
+
+fn protocol_request<T: serde::Serialize>(
+    credentials: &OwnerCredentials,
+    payload: T,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(AuthenticatedRequest {
+        credentials: credentials.clone(),
+        payload,
+    })?)
+}
+
+fn session_request<T: serde::Serialize>(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    payload: T,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(AuthenticatedSessionRequest {
+        credentials: credentials.clone(),
+        session: session.clone(),
+        payload,
+    })?)
+}
+
+async fn start_clash(
+    credentials: &OwnerCredentials,
+    runtime: &RuntimeBundle,
+    proposed_session_token: &str,
+) -> Result<WireResponse<StartClashResult>> {
+    let client = connect().await?;
+    let payload = protocol_request(
+        credentials,
+        StartClashRequest {
+            runtime: runtime.clone(),
+            proposed_session_token: proposed_session_token.to_owned(),
+            macos_proxy: None,
+        },
+    )?;
+    Ok(client
+        .post(IpcCommand::StartClash.as_ref())
+        .timeout(Duration::from_secs(30))
+        .header(SERVICE_PROTOCOL_HEADER, VERSION)
+        .json_body(&payload)
+        .send()
+        .await?
+        .json()?)
+}
+
+fn session_from_start(
+    response: &WireResponse<StartClashResult>,
+    token: &str,
+) -> Result<OwnerSessionProof> {
+    Ok(OwnerSessionProof {
+        generation: response
+            .data
+            .as_ref()
+            .context("start response omitted session")?
+            .session
+            .generation,
+        token: token.to_owned(),
+    })
+}
+
+async fn get_status(credentials: &OwnerCredentials) -> Result<WireResponse<ServiceStatusSnapshot>> {
+    let client = connect().await?;
+    let payload = protocol_request(credentials, ())?;
+    Ok(client
+        .get(IpcCommand::Status.as_ref())
+        .header(SERVICE_PROTOCOL_HEADER, VERSION)
+        .json_body(&payload)
+        .send()
+        .await?
+        .json()?)
+}
+
+async fn get_clash_logs(credentials: &OwnerCredentials) -> Result<WireResponse<Vec<String>>> {
+    let client = connect().await?;
+    let payload = protocol_request(credentials, ())?;
+    Ok(client
+        .get(IpcCommand::GetClashLogs.as_ref())
+        .header(SERVICE_PROTOCOL_HEADER, VERSION)
+        .json_body(&payload)
+        .send()
+        .await?
+        .json()?)
+}
+
+async fn get_clash_log_snapshot(credentials: &OwnerCredentials) -> Result<WireResponse<String>> {
+    let client = connect().await?;
+    let payload = protocol_request(credentials, ())?;
+    Ok(client
+        .get(IpcCommand::GetClashLogSnapshot.as_ref())
+        .header(SERVICE_PROTOCOL_HEADER, VERSION)
+        .json_body(&payload)
+        .send()
+        .await?
+        .json()?)
+}
+
+async fn stop_clash(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+) -> Result<WireResponse<()>> {
+    let client = connect().await?;
+    let payload = session_request(credentials, session, ())?;
+    Ok(client
+        .delete(IpcCommand::StopClash.as_ref())
+        .timeout(Duration::from_secs(30))
+        .header(SERVICE_PROTOCOL_HEADER, VERSION)
+        .json_body(&payload)
+        .send()
+        .await?
+        .json()?)
+}
+
+async fn update_writer(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    writer: &WriterConfig,
+) -> Result<WireResponse<()>> {
+    let client = connect().await?;
+    let payload = session_request(credentials, session, writer.clone())?;
+    Ok(client
+        .put(IpcCommand::UpdateWriter.as_ref())
+        .header(SERVICE_PROTOCOL_HEADER, VERSION)
+        .json_body(&payload)
+        .send()
+        .await?
+        .json()?)
+}
+
+async fn set_system_proxy(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    proxy: MacosProxyConfig,
+) -> Result<WireResponse<ProxyApplyOutcome>> {
+    let client = connect().await?;
+    let payload = session_request(credentials, session, proxy)?;
+    Ok(client
+        .put(IpcCommand::SetSystemProxy.as_ref())
+        .header(SERVICE_PROTOCOL_HEADER, VERSION)
+        .json_body(&payload)
+        .send()
+        .await?
+        .json()?)
+}
+
+#[tokio::test]
+#[serial]
+async fn protected_routes_reject_protocol_mismatch_before_deserialization() -> Result<()> {
+    common::init_tracing_for_tests();
+    let _ = stop_ipc_server().await;
+    let server_handle = run_ipc_server().await?;
+    wait_for_ipc().await?;
+
+    let invalid = serde_json::Value::String("not an authenticated request".to_owned());
+    let client = connect().await?;
+    let responses = [
+        client
+            .get(IpcCommand::Status.as_ref())
+            .json_body(&invalid)
+            .send()
+            .await?,
+        client
+            .post(IpcCommand::StartClash.as_ref())
+            .json_body(&invalid)
+            .send()
+            .await?,
+        client
+            .delete(IpcCommand::StopClash.as_ref())
+            .json_body(&invalid)
+            .send()
+            .await?,
+        client
+            .get(IpcCommand::GetClashLogs.as_ref())
+            .json_body(&invalid)
+            .send()
+            .await?,
+        client
+            .get(IpcCommand::GetClashLogSnapshot.as_ref())
+            .json_body(&invalid)
+            .send()
+            .await?,
+        client
+            .put(IpcCommand::UpdateWriter.as_ref())
+            .json_body(&invalid)
+            .send()
+            .await?,
+        client
+            .put(IpcCommand::SetSystemProxy.as_ref())
+            .json_body(&invalid)
+            .send()
+            .await?,
+    ];
+    for response in responses {
+        let response = response.json::<WireResponse<()>>()?;
+        assert_eq!(response.code, ServiceErrorCode::ProtocolMismatch as u16);
+    }
+
+    stop_ipc_server().await?;
+    server_handle.await??;
+    Ok(())
+}
+
 #[tokio::test]
 #[serial]
 async fn same_owner_restart_concurrent_start_and_failed_update_remain_atomic() -> Result<()> {
@@ -59,7 +271,9 @@ async fn same_owner_restart_concurrent_start_and_failed_update_remain_atomic() -
         core_path: mock_binary.to_string_lossy().into_owned(),
     };
 
-    assert_eq!(start_clash(&credentials, &bundle).await?.code, 0);
+    let first_token = "11".repeat(32);
+    let first_start = start_clash(&credentials, &bundle, &first_token).await?;
+    assert_eq!(first_start.code, 0);
     let first_pid = get_status(&credentials)
         .await?
         .data
@@ -67,7 +281,9 @@ async fn same_owner_restart_concurrent_start_and_failed_update_remain_atomic() -
         .core_pid
         .context("first start omitted core PID")?;
 
-    assert_eq!(start_clash(&credentials, &bundle).await?.code, 0);
+    let restart_token = "22".repeat(32);
+    let restart = start_clash(&credentials, &bundle, &restart_token).await?;
+    assert_eq!(restart.code, 0);
     let restarted_pid = get_status(&credentials)
         .await?
         .data
@@ -79,12 +295,34 @@ async fn same_owner_restart_concurrent_start_and_failed_update_remain_atomic() -
         "same-owner Start must restart core"
     );
 
+    let left_token = "33".repeat(32);
+    let right_token = "44".repeat(32);
     let (left, right) = tokio::join!(
-        start_clash(&credentials, &bundle),
-        start_clash(&credentials, &bundle)
+        start_clash(&credentials, &bundle, &left_token),
+        start_clash(&credentials, &bundle, &right_token)
     );
-    assert_eq!(left?.code, 0);
-    assert_eq!(right?.code, 0);
+    let left = left?;
+    let right = right?;
+    assert_eq!(left.code, 0, "{}", left.message);
+    assert_eq!(right.code, 0, "{}", right.message);
+    let (active_start, active_token) = if left
+        .data
+        .as_ref()
+        .context("left concurrent start omitted data")?
+        .session
+        .generation
+        > right
+            .data
+            .as_ref()
+            .context("right concurrent start omitted data")?
+            .session
+            .generation
+    {
+        (&left, left_token.as_str())
+    } else {
+        (&right, right_token.as_str())
+    };
+    let active_session = session_from_start(active_start, active_token)?;
 
     let committed = get_status(&credentials)
         .await?
@@ -103,7 +341,12 @@ async fn same_owner_restart_concurrent_start_and_failed_update_remain_atomic() -
             .into_owned(),
         ..bundle
     };
-    assert_ne!(start_clash(&credentials, &invalid).await?.code, 0);
+    assert_ne!(
+        start_clash(&credentials, &invalid, &"55".repeat(32))
+            .await?
+            .code,
+        0
+    );
     let after_failure = get_status(&credentials)
         .await?
         .data
@@ -118,7 +361,7 @@ async fn same_owner_restart_concurrent_start_and_failed_update_remain_atomic() -
     );
     assert!(load_owner_desired_state(&key).await?.core_should_be_running);
 
-    assert_eq!(stop_clash(&credentials).await?.code, 0);
+    assert_eq!(stop_clash(&credentials, &active_session).await?.code, 0);
     stop_ipc_server().await?;
     server_handle.await??;
     Ok(())
@@ -145,14 +388,27 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
         core_path: test_bin_path("mock_binary").to_string_lossy().into_owned(),
     };
 
-    let start_a = start_clash(&owner_a, &bundle)
+    let token_a = "66".repeat(32);
+    let start_a = start_clash(&owner_a, &bundle, &token_a)
         .await
         .context("initial owner A start request failed")?;
     assert_eq!(start_a.code, 0, "{}", start_a.message);
-    let start_b = start_clash(&owner_b, &bundle)
+    let session_a = session_from_start(&start_a, &token_a)?;
+    let token_b = "77".repeat(32);
+    let start_b = start_clash(&owner_b, &bundle, &token_b)
         .await
         .context("owner B takeover request failed")?;
     assert_eq!(start_b.code, 0, "{}", start_b.message);
+    let session_b = session_from_start(&start_b, &token_b)?;
+    assert_eq!(
+        update_writer(&owner_b, &session_b, &WriterConfig::default())
+            .await?
+            .code,
+        0
+    );
+    let proxy = set_system_proxy(&owner_b, &session_b, MacosProxyConfig::Disabled).await?;
+    assert_eq!(proxy.code, 0);
+    assert_eq!(proxy.data, Some(ProxyApplyOutcome::Applied));
     assert_eq!(
         load_active_owner().await?.map(|owner| owner.owner_key),
         Some(key_b.clone())
@@ -175,8 +431,8 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
     assert!(!inactive_status.is_active);
     assert_eq!(inactive_status.core_pid, None);
     assert_eq!(
-        stop_clash(&owner_a).await?.code,
-        ServiceErrorCode::NotActive as u16
+        stop_clash(&owner_a, &session_a).await?.code,
+        ServiceErrorCode::StaleOwnerSession as u16
     );
     assert_eq!(
         get_clash_logs(&owner_a).await?.code,
@@ -187,14 +443,28 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
         ServiceErrorCode::NotActive as u16
     );
     assert_eq!(
-        update_writer(&owner_a, &WriterConfig::default())
+        update_writer(&owner_a, &session_a, &WriterConfig::default())
             .await?
             .code,
-        ServiceErrorCode::NotActive as u16
+        ServiceErrorCode::StaleOwnerSession as u16
+    );
+    assert_eq!(
+        set_system_proxy(
+            &owner_a,
+            &session_a,
+            MacosProxyConfig::Global {
+                host: "127.0.0.1".to_owned(),
+                port: 0,
+                bypass: String::new(),
+            },
+        )
+        .await?
+        .code,
+        ServiceErrorCode::StaleOwnerSession as u16
     );
 
     assert_eq!(
-        start_clash(&owner_a, &bundle)
+        start_clash(&owner_a, &bundle, &"88".repeat(32))
             .await
             .context("owner A reactivation request failed")?
             .code,
@@ -207,7 +477,7 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
         ..bundle.clone()
     };
     assert_eq!(
-        start_clash(&owner_c, &no_ipc_bundle)
+        start_clash(&owner_c, &no_ipc_bundle, &"99".repeat(32))
             .await
             .context("owner C failing takeover request failed")?
             .code,
@@ -225,12 +495,16 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
             .core_should_be_running
     );
 
+    let concurrent_token_a = "aa".repeat(32);
+    let concurrent_token_b = "bb".repeat(32);
     let (start_a, start_b) = tokio::join!(
-        start_clash(&owner_a, &bundle),
-        start_clash(&owner_b, &bundle)
+        start_clash(&owner_a, &bundle, &concurrent_token_a),
+        start_clash(&owner_b, &bundle, &concurrent_token_b)
     );
-    assert_eq!(start_a?.code, 0);
-    assert_eq!(start_b?.code, 0);
+    let start_a = start_a?;
+    let start_b = start_b?;
+    assert_eq!(start_a.code, 0);
+    assert_eq!(start_b.code, 0);
     let active_key = load_active_owner()
         .await?
         .context("concurrent starts did not persist an active owner")?
@@ -245,6 +519,11 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
         &owner_a
     } else {
         &owner_b
+    };
+    let active_session = if active_key == key_a {
+        session_from_start(&start_a, &concurrent_token_a)?
+    } else {
+        session_from_start(&start_b, &concurrent_token_b)?
     };
     let active_status = get_status(active_owner)
         .await?
@@ -282,7 +561,7 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
     assert!(!not_restored.is_active);
     assert_eq!(not_restored.core_pid, None);
 
-    assert_eq!(stop_clash(active_owner).await?.code, 0);
+    assert_eq!(stop_clash(active_owner, &active_session).await?.code, 0);
     stop_ipc_server().await?;
     server_handle.await??;
     Ok(())

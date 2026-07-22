@@ -1,11 +1,11 @@
 use super::state::IpcState;
-use crate::core::assets::stage_runtime;
+use crate::core::assets::{StagedRuntime, stage_runtime};
 use crate::core::auth::{
     AuthenticatedOwner, ServiceError, authenticate_owner, hash_session_token,
     ipc_request_context_to_auth_context,
 };
 use crate::core::desired::{
-    ActiveOwnerState, clear_active_owner, load_active_owner, persist_active_owner,
+    ActiveOwnerState, clear_active_owner, commit_active_owner_session, load_active_owner,
     persist_owner_core_started, persist_owner_core_stopped, persist_owner_core_stopped_by_key,
     persist_owner_writer_config,
 };
@@ -16,7 +16,12 @@ use crate::core::paths::service_paths;
 use crate::core::state::{set_core_lifecycle_state, set_service_lifecycle_state};
 use crate::core::status::service_status_snapshot;
 use crate::core::structure::{OwnerSessionProof, Response, ServiceLifecycleState};
-use crate::{AuthenticatedRequest, IpcCommand, RuntimeBundle, VERSION, WriterConfig};
+use crate::core::{apply_proxy, apply_proxy_or_direct, clear_proxy, validate_proxy_config};
+use crate::{
+    AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, IpcCommand, MacosProxyConfig,
+    OwnerSessionHandle, ProxyApplyOutcome, SERVICE_PROTOCOL_HEADER, StartClashRequest,
+    StartClashResult, VERSION, WriterConfig,
+};
 use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
 use kode_bridge::{IpcHttpServer, Result, Router, ServerConfig, ipc_http_server::HttpResponse};
@@ -37,17 +42,199 @@ const IPC_HANDLER_TIMEOUT: Duration = Duration::from_secs(25);
 #[cfg(any(windows, test))]
 const WINDOWS_CONTROL_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00000003;;;AU)";
 
+trait OwnerProxyTransition {
+    async fn clear_previous_proxy(&mut self) -> AnyResult<()>;
+    async fn compensate_direct(&mut self) -> AnyResult<()>;
+    async fn stop_previous_core(&mut self) -> AnyResult<()>;
+    async fn start_new_core(&mut self) -> AnyResult<()>;
+    async fn commit_new_owner(&mut self) -> AnyResult<ActiveOwnerState>;
+    async fn apply_new_proxy(&mut self) -> AnyResult<crate::ProxyApplyOutcome>;
+}
+
+async fn owner_proxy_transition(
+    transition: &mut impl OwnerProxyTransition,
+) -> std::result::Result<(ActiveOwnerState, crate::ProxyApplyOutcome), ServiceError> {
+    if let Err(clear_error) = transition.clear_previous_proxy().await {
+        let compensation = transition.compensate_direct().await;
+        let message = match compensation {
+            Ok(()) => format!("Failed to clear the previous owner's proxy: {clear_error:#}"),
+            Err(compensation_error) => format!(
+                "Failed to clear the previous owner's proxy: {clear_error:#}; direct compensation failed: {compensation_error:#}"
+            ),
+        };
+        return Err(ServiceError::proxy_clear_failed(message));
+    }
+
+    transition.stop_previous_core().await.map_err(|error| {
+        ServiceError::owner_switch_failed(format!(
+            "Failed to stop the previous owner core: {error:#}"
+        ))
+    })?;
+    transition.start_new_core().await.map_err(|error| {
+        ServiceError::owner_switch_failed(format!("Failed to start owner core: {error:#}"))
+    })?;
+    let active = transition.commit_new_owner().await.map_err(|error| {
+        ServiceError::owner_switch_failed(format!("Failed to commit owner state: {error:#}"))
+    })?;
+    let proxy_outcome = transition.apply_new_proxy().await.map_err(|error| {
+        ServiceError::proxy_apply_failed(format!("Failed to apply owner proxy: {error:#}"))
+    })?;
+    Ok((active, proxy_outcome))
+}
+
+struct StartOwnerTransition<'a> {
+    previous_owner: Option<ActiveOwnerState>,
+    owner: &'a AuthenticatedOwner,
+    staged_runtime: Option<StagedRuntime>,
+    clash_config: Option<ClashConfig>,
+    proposed_session_token: &'a str,
+    macos_proxy: Option<&'a MacosProxyConfig>,
+}
+
+impl OwnerProxyTransition for StartOwnerTransition<'_> {
+    async fn clear_previous_proxy(&mut self) -> AnyResult<()> {
+        clear_service_proxy().await
+    }
+
+    async fn compensate_direct(&mut self) -> AnyResult<()> {
+        compensate_service_proxy().await
+    }
+
+    async fn stop_previous_core(&mut self) -> AnyResult<()> {
+        CORE_MANAGER.lock().await.stop_core().await?;
+        if let Some(previous_owner) = self.previous_owner.as_ref() {
+            persist_owner_core_stopped_by_key(&previous_owner.owner_key)
+                .await
+                .context("failed to persist the previous owner stopped state")?;
+        }
+        clear_active_owner()
+            .await
+            .context("failed to clear the previous active owner")?;
+        Ok(())
+    }
+
+    async fn start_new_core(&mut self) -> AnyResult<()> {
+        let staged_runtime = self
+            .staged_runtime
+            .take()
+            .context("staged runtime was already consumed")?;
+        let clash_config = staged_runtime
+            .activate()
+            .await
+            .map_err(anyhow::Error::new)?
+            .clash_config;
+        if let Err(error) = CORE_MANAGER
+            .lock()
+            .await
+            .start_core(clash_config.clone(), self.owner.identity.clone())
+            .await
+        {
+            let _ = persist_owner_core_stopped(self.owner).await;
+            return Err(error);
+        }
+        self.clash_config = Some(clash_config);
+        Ok(())
+    }
+
+    async fn commit_new_owner(&mut self) -> AnyResult<ActiveOwnerState> {
+        let clash_config = self
+            .clash_config
+            .as_ref()
+            .context("new core configuration is unavailable")?;
+        if let Err(error) = persist_owner_core_started(self.owner, clash_config).await {
+            return rollback_commit_failure(self.owner, error).await;
+        }
+        match commit_active_owner_session(self.owner, self.proposed_session_token).await {
+            Ok(active) => Ok(active),
+            Err(error) => rollback_commit_failure(self.owner, error).await,
+        }
+    }
+
+    async fn apply_new_proxy(&mut self) -> AnyResult<ProxyApplyOutcome> {
+        apply_service_proxy_or_direct(self.macos_proxy).await
+    }
+}
+
+async fn rollback_commit_failure<T>(
+    owner: &AuthenticatedOwner,
+    error: anyhow::Error,
+) -> AnyResult<T> {
+    match rollback_started_owner(owner).await {
+        Ok(()) => Err(error),
+        Err(rollback_error) => Err(anyhow!(
+            "{error:#}; failed to roll back uncommitted owner core: {rollback_error:#}"
+        )),
+    }
+}
+
+#[cfg(all(target_os = "macos", not(feature = "test")))]
+async fn clear_service_proxy() -> AnyResult<()> {
+    clear_proxy().await
+}
+
+#[cfg(any(not(target_os = "macos"), feature = "test"))]
+async fn clear_service_proxy() -> AnyResult<()> {
+    let _ = clear_proxy;
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", not(feature = "test")))]
+async fn compensate_service_proxy() -> AnyResult<()> {
+    apply_proxy(&MacosProxyConfig::Disabled).await
+}
+
+#[cfg(any(not(target_os = "macos"), feature = "test"))]
+async fn compensate_service_proxy() -> AnyResult<()> {
+    let _ = apply_proxy;
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", not(feature = "test")))]
+async fn apply_service_proxy_or_direct(
+    config: Option<&MacosProxyConfig>,
+) -> AnyResult<ProxyApplyOutcome> {
+    apply_proxy_or_direct(config).await
+}
+
+#[cfg(feature = "test")]
+async fn apply_service_proxy_or_direct(
+    config: Option<&MacosProxyConfig>,
+) -> AnyResult<ProxyApplyOutcome> {
+    let _ = apply_proxy_or_direct;
+    Ok(if config.is_some() {
+        ProxyApplyOutcome::Applied
+    } else {
+        ProxyApplyOutcome::NotRequested
+    })
+}
+
+#[cfg(all(not(target_os = "macos"), not(feature = "test")))]
+async fn apply_service_proxy_or_direct(
+    config: Option<&MacosProxyConfig>,
+) -> AnyResult<ProxyApplyOutcome> {
+    apply_proxy_or_direct(config).await
+}
+
+async fn clear_proxy_with_direct_compensation() -> std::result::Result<(), ServiceError> {
+    let Err(clear_error) = clear_service_proxy().await else {
+        return Ok(());
+    };
+    let compensation = compensate_service_proxy().await;
+    let message = match compensation {
+        Ok(()) => format!("Failed to clear the active owner's proxy: {clear_error:#}"),
+        Err(compensation_error) => format!(
+            "Failed to clear the active owner's proxy: {clear_error:#}; direct compensation failed: {compensation_error:#}"
+        ),
+    };
+    Err(ServiceError::proxy_clear_failed(message))
+}
+
 async fn rollback_started_owner(owner: &AuthenticatedOwner) -> AnyResult<()> {
     if let Err(stop_error) = CORE_MANAGER.lock().await.stop_core().await {
-        let recovery = persist_active_owner(owner).await;
-        return match recovery {
-            Ok(_) => Err(anyhow!(
-                "failed to terminate owner core during rollback: {stop_error:#}; owner remains active"
-            )),
-            Err(active_error) => Err(anyhow!(
-                "failed to terminate owner core during rollback: {stop_error:#}; failed to persist active owner: {active_error:#}"
-            )),
-        };
+        set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+        return Err(anyhow!(
+            "failed to terminate owner core during rollback: {stop_error:#}"
+        ));
     }
 
     let desired_result = persist_owner_core_stopped(owner).await;
@@ -63,42 +250,6 @@ async fn rollback_started_owner(owner: &AuthenticatedOwner) -> AnyResult<()> {
             ))
         }
     }
-}
-
-async fn commit_previous_owner_stopped(
-    previous_owner: &ActiveOwnerState,
-) -> std::result::Result<(), ServiceError> {
-    if let Err(error) = clear_active_owner().await {
-        if persist_owner_core_stopped_by_key(&previous_owner.owner_key)
-            .await
-            .is_err()
-        {
-            set_core_lifecycle_state(ServiceLifecycleState::Fatal);
-        }
-        return Err(ServiceError::owner_switch_failed(format!(
-            "Previous owner core stopped but active owner could not be cleared: {error}"
-        )));
-    }
-    if let Err(error) = persist_owner_core_stopped_by_key(&previous_owner.owner_key).await {
-        let _ = clear_active_owner().await;
-        return Err(ServiceError::owner_switch_failed(format!(
-            "Failed to mark the previous owner stopped: {error}"
-        )));
-    }
-    Ok(())
-}
-
-async fn commit_started_owner(
-    owner: &AuthenticatedOwner,
-    config: &crate::ClashConfig,
-) -> AnyResult<()> {
-    persist_owner_core_started(owner, config)
-        .await
-        .context("failed to persist owner desired state")?;
-    persist_active_owner(owner)
-        .await
-        .context("failed to persist active owner")?;
-    Ok(())
 }
 
 // 防止旧 listener 的清理删除 supervisor 刚创建的新 socket。
@@ -355,6 +506,20 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
     }
 }
 
+fn require_protocol_version(
+    ctx: &kode_bridge::RequestContext,
+) -> std::result::Result<(), ServiceError> {
+    let supplied = ctx
+        .headers
+        .get(SERVICE_PROTOCOL_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if supplied == Some(VERSION) {
+        Ok(())
+    } else {
+        Err(ServiceError::protocol_mismatch())
+    }
+}
+
 fn create_ipc_router() -> Result<Router> {
     let router = Router::new()
         .get(IpcCommand::Magic.as_ref(), |ctx| async move {
@@ -368,6 +533,9 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::Status.as_ref(), |ctx| async move {
             trace!("Received Status command");
+            if let Err(error) = require_protocol_version(&ctx) {
+                return service_error(error);
+            }
             let request = match ctx.json::<AuthenticatedRequest<()>>() {
                 Ok(request) => request,
                 Err(error) => return bad_request(format!("Invalid JSON: {error}")),
@@ -386,81 +554,67 @@ fn create_ipc_router() -> Result<Router> {
         })
         .post(IpcCommand::StartClash.as_ref(), |ctx| async move {
             trace!("Received StartClash command");
-            match ctx.json::<AuthenticatedRequest<RuntimeBundle>>() {
-                Ok(request) => {
-                    let owner = match authenticate_owner(&ctx, &request.credentials) {
-                        Ok(owner) => owner,
-                        Err(error) => return service_error(error),
-                    };
-                    let runtime_bundle = request.payload;
-                    let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
-                    let staged_runtime = match stage_runtime(&owner, &runtime_bundle).await {
-                        Ok(staged) => staged,
-                        Err(error) => return service_error(error),
-                    };
-                    let previous_owner = match load_active_owner().await {
-                        Ok(owner) => owner,
-                        Err(error) => {
-                            return service_unavailable(format!(
-                                "Failed to load active owner: {error}"
-                            ));
-                        }
-                    };
-                    if let Err(error) = CORE_MANAGER.lock().await.stop_core().await {
-                        return service_error(ServiceError::owner_switch_failed(format!(
-                            "Failed to stop the previous owner core: {error}"
-                        )));
-                    }
-                    if let Some(previous_owner) = previous_owner.as_ref()
-                        && let Err(error) = commit_previous_owner_stopped(previous_owner).await
-                    {
-                        return service_error(error);
-                    }
-                    let start_clash = match staged_runtime.activate().await {
-                        Ok(prepared) => prepared.clash_config,
-                        Err(error) => return service_error(error),
-                    };
-                    let start_result = {
-                        let manager = CORE_MANAGER.lock().await;
-                        manager
-                            .start_core(start_clash.clone(), owner.identity.clone())
-                            .await
-                    };
-                    match start_result {
-                        Ok(_) => info!("Core started successfully"),
-                        Err(error) => {
-                            if let Err(rollback_error) = rollback_started_owner(&owner).await {
-                                return service_error(ServiceError::owner_switch_failed(format!(
-                                    "Failed to start owner core: {error}; rollback failed: {rollback_error:#}"
-                                )));
-                            }
-                            return service_error(ServiceError::owner_switch_failed(format!(
-                                "Failed to start owner core: {error}"
-                            )));
-                        }
-                    }
-                    if let Err(error) = commit_started_owner(&owner, &start_clash).await {
-                        if let Err(rollback_error) = rollback_started_owner(&owner).await {
-                            return service_error(ServiceError::owner_switch_failed(format!(
-                                "Failed to commit owner state: {error:#}; rollback failed: {rollback_error:#}"
-                            )));
-                        }
-                        return service_error(ServiceError::owner_switch_failed(format!(
-                            "Failed to commit owner state: {error:#}"
-                        )));
-                    }
-                    if let Err(error) = cleanup_legacy_owner_files(&owner).await {
-                        warn!(
-                            "Core start committed, but legacy owner cleanup will be retried later: {error}"
-                        );
-                    }
-                    ok_empty("Core started successfully")
-                }
-                Err(error) => bad_request(format!("Invalid JSON: {error}")),
+            if let Err(error) = require_protocol_version(&ctx) {
+                return service_error(error);
             }
+            let request = match ctx.json::<AuthenticatedRequest<StartClashRequest>>() {
+                Ok(request) => request,
+                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
+            };
+            let owner = match authenticate_owner(&ctx, &request.credentials) {
+                Ok(owner) => owner,
+                Err(error) => return service_error(error),
+            };
+            let start_request = request.payload;
+            if hash_session_token(&start_request.proposed_session_token).is_err() {
+                return bad_request("Invalid proposed owner session token");
+            }
+            if let Some(proxy) = start_request.macos_proxy.as_ref()
+                && let Err(error) = validate_proxy_config(proxy)
+            {
+                return service_error(ServiceError::invalid_proxy_config(error.to_string()));
+            }
+            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+            let staged_runtime = match stage_runtime(&owner, &start_request.runtime).await {
+                Ok(staged) => staged,
+                Err(error) => return service_error(error),
+            };
+            let previous_owner = match load_active_owner().await {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return service_unavailable(format!("Failed to load active owner: {error}"));
+                }
+            };
+            let mut transition = StartOwnerTransition {
+                previous_owner,
+                owner: &owner,
+                staged_runtime: Some(staged_runtime),
+                clash_config: None,
+                proposed_session_token: &start_request.proposed_session_token,
+                macos_proxy: start_request.macos_proxy.as_ref(),
+            };
+            let (active, proxy_outcome) = match owner_proxy_transition(&mut transition).await {
+                Ok(result) => result,
+                Err(error) => return service_error(error),
+            };
+            if let Err(error) = cleanup_legacy_owner_files(&owner).await {
+                warn!(
+                    "Core start committed, but legacy owner cleanup will be retried later: {error}"
+                );
+            }
+            info!("Core started successfully");
+            ok_json(StartClashResult {
+                session: OwnerSessionHandle {
+                    generation: active.generation,
+                },
+                proxy_outcome,
+            })
         })
         .get(IpcCommand::GetClashLogs.as_ref(), |ctx| async move {
             trace!("Received GetClashLogs command");
+            if let Err(error) = require_protocol_version(&ctx) {
+                return service_error(error);
+            }
             let request = match ctx.json::<AuthenticatedRequest<()>>() {
                 Ok(request) => request,
                 Err(error) => return bad_request(format!("Invalid JSON: {error}")),
@@ -477,6 +631,9 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::GetClashLogSnapshot.as_ref(), |ctx| async move {
             trace!("Received GetClashLogSnapshot command");
+            if let Err(error) = require_protocol_version(&ctx) {
+                return service_error(error);
+            }
             let request = match ctx.json::<AuthenticatedRequest<()>>() {
                 Ok(request) => request,
                 Err(error) => return bad_request(format!("Invalid JSON: {error}")),
@@ -495,12 +652,17 @@ fn create_ipc_router() -> Result<Router> {
                 .join("service_latest.log");
             match read_log_snapshot(&path).await {
                 Ok(snapshot) => ok_json(snapshot),
-                Err(error) => service_unavailable(format!("Failed to read core log snapshot: {error}")),
+                Err(error) => {
+                    service_unavailable(format!("Failed to read core log snapshot: {error}"))
+                }
             }
         })
         .delete(IpcCommand::StopClash.as_ref(), |ctx| async move {
             trace!("Received StopClash command");
-            let request = match ctx.json::<AuthenticatedRequest<()>>() {
+            if let Err(error) = require_protocol_version(&ctx) {
+                return service_error(error);
+            }
+            let request = match ctx.json::<AuthenticatedSessionRequest<()>>() {
                 Ok(request) => request,
                 Err(error) => return bad_request(format!("Invalid JSON: {error}")),
             };
@@ -509,7 +671,10 @@ fn create_ipc_router() -> Result<Router> {
                 Err(error) => return service_error(error),
             };
             let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
-            if let Err(error) = require_active_owner(&owner).await {
+            if let Err(error) = require_active_session(&owner, &request.session).await {
+                return service_error(error);
+            }
+            if let Err(error) = clear_proxy_with_direct_compensation().await {
                 return service_error(error);
             }
             match CORE_MANAGER.lock().await.stop_core().await {
@@ -522,11 +687,18 @@ fn create_ipc_router() -> Result<Router> {
                 set_core_lifecycle_state(ServiceLifecycleState::Fatal);
                 return service_unavailable(format!("Failed to persist desired state: {}", e));
             }
+            if let Err(e) = clear_active_owner().await {
+                set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                return service_unavailable(format!("Failed to clear active owner: {}", e));
+            }
             ok_empty("Core stopped successfully")
         })
         .put(IpcCommand::UpdateWriter.as_ref(), |ctx| async move {
             trace!("Received UpdateWriter command");
-            match ctx.json::<AuthenticatedRequest<WriterConfig>>() {
+            if let Err(error) = require_protocol_version(&ctx) {
+                return service_error(error);
+            }
+            match ctx.json::<AuthenticatedSessionRequest<WriterConfig>>() {
                 Ok(request) => {
                     let owner = match authenticate_owner(&ctx, &request.credentials) {
                         Ok(owner) => owner,
@@ -534,7 +706,7 @@ fn create_ipc_router() -> Result<Router> {
                     };
                     let mut writer_config = request.payload;
                     let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
-                    if let Err(error) = require_active_owner(&owner).await {
+                    if let Err(error) = require_active_session(&owner, &request.session).await {
                         return service_error(error);
                     }
                     writer_config.directory = service_paths()
@@ -557,6 +729,31 @@ fn create_ipc_router() -> Result<Router> {
                     ok_empty("Update Writer successfully")
                 }
                 Err(error) => bad_request(format!("Invalid JSON: {error}")),
+            }
+        })
+        .put(IpcCommand::SetSystemProxy.as_ref(), |ctx| async move {
+            trace!("Received SetSystemProxy command");
+            if let Err(error) = require_protocol_version(&ctx) {
+                return service_error(error);
+            }
+            let request = match ctx.json::<AuthenticatedSessionRequest<MacosProxyConfig>>() {
+                Ok(request) => request,
+                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
+            };
+            let owner = match authenticate_owner(&ctx, &request.credentials) {
+                Ok(owner) => owner,
+                Err(error) => return service_error(error),
+            };
+            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+            if let Err(error) = require_active_session(&owner, &request.session).await {
+                return service_error(error);
+            }
+            if let Err(error) = validate_proxy_config(&request.payload) {
+                return service_error(ServiceError::invalid_proxy_config(error.to_string()));
+            }
+            match apply_service_proxy_or_direct(Some(&request.payload)).await {
+                Ok(outcome) => ok_json(outcome),
+                Err(error) => service_error(ServiceError::proxy_apply_failed(error.to_string())),
             }
         });
     Ok(router)
@@ -687,16 +884,15 @@ static OWNER_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 #[cfg(test)]
 mod owner_lifecycle_tests {
     use super::{
-        OWNER_LIFECYCLE_LOCK, WINDOWS_CONTROL_PIPE_SDDL, commit_previous_owner_stopped,
-        commit_started_owner, require_active_owner, require_active_session,
+        OwnerProxyTransition, WINDOWS_CONTROL_PIPE_SDDL, owner_proxy_transition,
+        require_active_owner, require_active_session,
     };
     use crate::ServiceErrorCode;
     use crate::core::auth::AuthenticatedOwner;
     use crate::core::desired::{
-        clear_active_owner, commit_active_owner_session, load_active_owner,
-        load_owner_desired_state, persist_active_owner, persist_owner_core_started,
+        ActiveOwnerState, clear_active_owner, commit_active_owner_session, persist_active_owner,
     };
-    use crate::{ClashConfig, OwnerIdentity, OwnerSessionProof};
+    use crate::{OwnerIdentity, OwnerSessionProof, ProxyApplyOutcome};
     use serial_test::serial;
 
     fn owner(uid: u32) -> AuthenticatedOwner {
@@ -705,6 +901,120 @@ mod owner_lifecycle_tests {
             identity: OwnerIdentity::Unix { uid, gid: 20 },
             app_data_root: std::env::temp_dir(),
         }
+    }
+
+    struct RecordingTransition {
+        events: Vec<&'static str>,
+        active_owner: ActiveOwnerState,
+        running_pid: u32,
+        next_owner: ActiveOwnerState,
+        clear_fails: bool,
+        apply_falls_back: bool,
+    }
+
+    impl OwnerProxyTransition for RecordingTransition {
+        async fn clear_previous_proxy(&mut self) -> anyhow::Result<()> {
+            self.events.push("clear_proxy");
+            if self.clear_fails {
+                anyhow::bail!("clear failed");
+            }
+            Ok(())
+        }
+
+        async fn compensate_direct(&mut self) -> anyhow::Result<()> {
+            self.events.push("compensate_direct");
+            Ok(())
+        }
+
+        async fn stop_previous_core(&mut self) -> anyhow::Result<()> {
+            self.events.push("stop_a");
+            self.running_pid = 0;
+            Ok(())
+        }
+
+        async fn start_new_core(&mut self) -> anyhow::Result<()> {
+            self.events.push("start_b");
+            self.running_pid = 202;
+            Ok(())
+        }
+
+        async fn commit_new_owner(&mut self) -> anyhow::Result<ActiveOwnerState> {
+            self.events.push("commit_b");
+            self.active_owner = self.next_owner.clone();
+            Ok(self.active_owner.clone())
+        }
+
+        async fn apply_new_proxy(&mut self) -> anyhow::Result<ProxyApplyOutcome> {
+            self.events.push("apply_b");
+            if self.apply_falls_back {
+                self.events.push("compensate_direct");
+                return Ok(ProxyApplyOutcome::DirectFallback {
+                    message: "apply failed".to_owned(),
+                });
+            }
+            Ok(ProxyApplyOutcome::Applied)
+        }
+    }
+
+    fn recording_transition() -> RecordingTransition {
+        RecordingTransition {
+            events: Vec::new(),
+            active_owner: ActiveOwnerState::from(&owner(96_001)),
+            running_pid: 101,
+            next_owner: ActiveOwnerState::from(&owner(96_002)),
+            clear_fails: false,
+            apply_falls_back: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_proxy_transition_successful_takeover_has_exact_order() -> anyhow::Result<()> {
+        let mut transition = recording_transition();
+
+        let (_, outcome) = owner_proxy_transition(&mut transition).await?;
+
+        assert_eq!(
+            transition.events,
+            ["clear_proxy", "stop_a", "start_b", "commit_b", "apply_b"]
+        );
+        assert_eq!(transition.active_owner.owner_key, "96002");
+        assert_eq!(transition.running_pid, 202);
+        assert_eq!(outcome, ProxyApplyOutcome::Applied);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_proxy_transition_clear_failure_preserves_old_owner_and_core() {
+        let mut transition = recording_transition();
+        transition.clear_fails = true;
+
+        let error = owner_proxy_transition(&mut transition)
+            .await
+            .expect_err("proxy clear failure must abort takeover");
+
+        assert_eq!(error.code, ServiceErrorCode::ProxyClearFailed);
+        assert_eq!(transition.events, ["clear_proxy", "compensate_direct"]);
+        assert_eq!(transition.active_owner.owner_key, "96001");
+        assert_eq!(transition.running_pid, 101);
+    }
+
+    #[tokio::test]
+    async fn owner_proxy_transition_apply_failure_keeps_new_owner_and_core() -> anyhow::Result<()> {
+        let mut transition = recording_transition();
+        transition.apply_falls_back = true;
+
+        let (active, outcome) = owner_proxy_transition(&mut transition).await?;
+
+        assert_eq!(active.owner_key, "96002");
+        assert_eq!(transition.active_owner.owner_key, "96002");
+        assert_eq!(transition.running_pid, 202);
+        assert_eq!(
+            outcome,
+            ProxyApplyOutcome::DirectFallback {
+                message: "apply failed".to_owned(),
+            }
+        );
+        Ok(())
     }
 
     #[test]
@@ -720,7 +1030,7 @@ mod owner_lifecycle_tests {
     async fn non_active_owner_receives_stable_error() -> anyhow::Result<()> {
         let active = owner(92_001);
         let inactive = owner(92_002);
-        persist_active_owner(&active).await?;
+        commit_active_owner_session(&active, &"10".repeat(32)).await?;
 
         let error = require_active_owner(&inactive)
             .await
@@ -728,95 +1038,6 @@ mod owner_lifecycle_tests {
 
         assert_eq!(error.code, ServiceErrorCode::NotActive);
         clear_active_owner().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn owner_takeover_marks_previous_stopped_before_committing_new_owner()
-    -> anyhow::Result<()> {
-        let owner_a = owner(93_001);
-        let owner_b = owner(93_002);
-        let config = ClashConfig::default();
-        persist_owner_core_started(&owner_a, &config).await?;
-        persist_active_owner(&owner_a).await?;
-
-        let previous = load_active_owner()
-            .await?
-            .expect("owner A should be active");
-        commit_previous_owner_stopped(&previous).await?;
-
-        assert!(load_active_owner().await?.is_none());
-        assert!(
-            !load_owner_desired_state(&owner_a.key)
-                .await?
-                .core_should_be_running
-        );
-
-        persist_owner_core_started(&owner_b, &config).await?;
-        persist_active_owner(&owner_b).await?;
-        assert_eq!(
-            load_active_owner().await?.map(|owner| owner.owner_key),
-            Some(owner_b.key.clone())
-        );
-        assert_eq!(
-            require_active_owner(&owner_a)
-                .await
-                .expect_err("owner A must lose control after owner B commits")
-                .code,
-            ServiceErrorCode::NotActive
-        );
-
-        clear_active_owner().await?;
-        for key in [&owner_a.key, &owner_b.key] {
-            let _ = std::fs::remove_dir_all(crate::service_paths().for_owner_key(key).root());
-        }
-        Ok(())
-    }
-
-    async fn commit_test_transition(
-        owner: &AuthenticatedOwner,
-        config: &ClashConfig,
-    ) -> anyhow::Result<()> {
-        let _guard = OWNER_LIFECYCLE_LOCK.lock().await;
-        if let Some(previous) = load_active_owner().await? {
-            commit_previous_owner_stopped(&previous).await?;
-        }
-        commit_started_owner(owner, config).await
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn concurrent_owner_state_commits_leave_exactly_one_active_owner() -> anyhow::Result<()> {
-        clear_active_owner().await?;
-        let owner_a = owner(94_001);
-        let owner_b = owner(94_002);
-        let config = ClashConfig::default();
-
-        let (left, right) = tokio::join!(
-            commit_test_transition(&owner_a, &config),
-            commit_test_transition(&owner_b, &config)
-        );
-        left?;
-        right?;
-
-        let active = load_active_owner()
-            .await?
-            .expect("one owner must be active");
-        let desired_a = load_owner_desired_state(&owner_a.key)
-            .await?
-            .core_should_be_running;
-        let desired_b = load_owner_desired_state(&owner_b.key)
-            .await?
-            .core_should_be_running;
-        assert_ne!(desired_a, desired_b);
-        assert_eq!(active.owner_key == owner_a.key, desired_a);
-        assert_eq!(active.owner_key == owner_b.key, desired_b);
-
-        clear_active_owner().await?;
-        for key in [&owner_a.key, &owner_b.key] {
-            let _ = std::fs::remove_dir_all(crate::service_paths().for_owner_key(key).root());
-        }
         Ok(())
     }
 
