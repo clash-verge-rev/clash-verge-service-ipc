@@ -167,16 +167,25 @@ fn apply_with_backend(
 struct RealBackend;
 
 #[cfg(target_os = "macos")]
+fn system_proxy_to_sysproxy(proxy: SystemProxy) -> sysproxy::Sysproxy {
+    sysproxy::Sysproxy {
+        host: proxy.host,
+        port: proxy.port,
+        bypass: if proxy.bypass.is_empty() {
+            "Empty".to_owned()
+        } else {
+            proxy.bypass
+        },
+        enable: proxy.enable,
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl ProxyBackend for RealBackend {
     fn set_system_proxy(&mut self, proxy: SystemProxy) -> anyhow::Result<()> {
-        sysproxy::Sysproxy {
-            host: proxy.host,
-            port: proxy.port,
-            bypass: proxy.bypass,
-            enable: proxy.enable,
-        }
-        .set_system_proxy()
-        .map_err(Into::into)
+        system_proxy_to_sysproxy(proxy)
+            .set_system_proxy()
+            .map_err(Into::into)
     }
 
     fn set_auto_proxy(&mut self, proxy: AutoProxy) -> anyhow::Result<()> {
@@ -257,6 +266,8 @@ pub async fn apply_proxy_or_direct(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::system_proxy_to_sysproxy;
     use super::{
         AutoProxy, ProxyBackend, ProxyCall, SystemProxy, apply_proxy_or_direct_with,
         apply_with_backend, validate_proxy_config,
@@ -278,6 +289,19 @@ mod tests {
             self.calls.push(ProxyCall::Auto(proxy));
             Ok(())
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sysproxy_conversion_uses_empty_sentinel_only_for_empty_bypass() {
+        let empty = system_proxy_to_sysproxy(SystemProxy::default());
+        assert_eq!(empty.bypass, "Empty");
+
+        let nonempty = system_proxy_to_sysproxy(SystemProxy {
+            bypass: "localhost,127.0.0.1".to_owned(),
+            ..SystemProxy::default()
+        });
+        assert_eq!(nonempty.bypass, "localhost,127.0.0.1");
     }
 
     #[test]
