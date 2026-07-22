@@ -118,6 +118,10 @@ flexi_logger = { version = "0.31", optional = true }
 log = { version = "0.4.28", optional = true }
 tracing-log = { version = "0.2", optional = true }
 compact_str = { version = "0.9", features = ["serde"], optional = true }
+url = "2.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sysproxy = { git = "https://github.com/clash-verge-rev/sysproxy-rs", rev = "d214eba9f61d655d49a35f6ae17c359f7ad68d79" }
 
 [target.'cfg(unix)'.dependencies]
 platform_lib = { package = "libc", version = "0.2", optional = true }
