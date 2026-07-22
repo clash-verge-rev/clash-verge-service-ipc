@@ -1,4 +1,4 @@
-use crate::core::auth::AuthenticatedOwner;
+use crate::core::auth::{AuthenticatedOwner, hash_session_token};
 use crate::core::logger::set_or_update_writer;
 use crate::core::manager::CORE_MANAGER;
 use crate::core::paths::service_paths;
@@ -27,6 +27,10 @@ pub struct ActiveOwnerState {
     pub owner_key: String,
     pub identity: OwnerIdentity,
     pub app_data_root: String,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
+    pub session_token_hash: String,
 }
 
 impl From<&AuthenticatedOwner> for ActiveOwnerState {
@@ -35,8 +39,15 @@ impl From<&AuthenticatedOwner> for ActiveOwnerState {
             owner_key: owner.key.clone(),
             identity: owner.identity.clone(),
             app_data_root: owner.app_data_root.to_string_lossy().into_owned(),
+            generation: 0,
+            session_token_hash: String::new(),
         }
     }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct OwnerGenerationState {
+    generation: u64,
 }
 
 pub async fn load_owner_desired_state(owner_key: &str) -> Result<DesiredState> {
@@ -98,6 +109,29 @@ pub async fn persist_active_owner(owner: &AuthenticatedOwner) -> Result<ActiveOw
     let _guard = DESIRED_STATE_LOCK.lock().await;
     let state = ActiveOwnerState::from(owner);
     write_json_atomic(&service_paths().active_owner_path(), &state).await?;
+    Ok(state)
+}
+
+pub async fn commit_active_owner_session(
+    owner: &AuthenticatedOwner,
+    session_token: &str,
+) -> Result<ActiveOwnerState> {
+    let session_token_hash = hash_session_token(session_token)?;
+    let _guard = DESIRED_STATE_LOCK.lock().await;
+    let paths = service_paths();
+    let generation_path = paths.owner_generation_path();
+    let mut generation_state: OwnerGenerationState = read_json_or_default(&generation_path).await?;
+    generation_state.generation = generation_state.generation.saturating_add(1);
+    write_json_atomic(&generation_path, &generation_state).await?;
+
+    let state = ActiveOwnerState {
+        owner_key: owner.key.clone(),
+        identity: owner.identity.clone(),
+        app_data_root: owner.app_data_root.to_string_lossy().into_owned(),
+        generation: generation_state.generation,
+        session_token_hash,
+    };
+    write_json_atomic(&paths.active_owner_path(), &state).await?;
     Ok(state)
 }
 
@@ -295,8 +329,9 @@ fn unix_timestamp_secs() -> u64 {
 #[cfg(test)]
 mod owner_tests {
     use super::{
-        backup_legacy_state_file, clear_active_owner, load_active_owner, load_owner_desired_state,
-        persist_active_owner, persist_owner_core_started, persist_owner_core_stopped,
+        backup_legacy_state_file, clear_active_owner, commit_active_owner_session,
+        load_active_owner, load_owner_desired_state, persist_active_owner,
+        persist_owner_core_started, persist_owner_core_stopped, write_json_atomic,
     };
     use crate::core::auth::AuthenticatedOwner;
     use crate::{ClashConfig, CoreConfig, OwnerIdentity};
@@ -363,6 +398,64 @@ mod owner_tests {
         );
 
         clear_active_owner().await?;
+        assert!(load_active_owner().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn owner_generation_survives_active_owner_clear() -> anyhow::Result<()> {
+        clear_active_owner().await?;
+        let owner = test_owner(90_005);
+        let first_token = "33".repeat(32);
+        let first = commit_active_owner_session(&owner, &first_token).await?;
+
+        assert_ne!(first.session_token_hash, first_token);
+        assert!(
+            !tokio::fs::read_to_string(crate::service_paths().active_owner_path())
+                .await?
+                .contains(&first_token)
+        );
+
+        clear_active_owner().await?;
+        let second = commit_active_owner_session(&owner, &"44".repeat(32)).await?;
+
+        assert!(second.generation > first.generation);
+        clear_active_owner().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn legacy_active_owner_defaults_session_fields() -> anyhow::Result<()> {
+        clear_active_owner().await?;
+        let owner = test_owner(90_006);
+        let legacy_state = serde_json::json!({
+            "owner_key": owner.key,
+            "identity": owner.identity,
+            "app_data_root": owner.app_data_root.to_string_lossy(),
+        });
+        write_json_atomic(&crate::service_paths().active_owner_path(), &legacy_state).await?;
+
+        let active = load_active_owner()
+            .await?
+            .expect("legacy owner should load");
+
+        assert_eq!(active.generation, 0);
+        assert!(active.session_token_hash.is_empty());
+        clear_active_owner().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn session_commit_rejects_non_lowercase_hex_tokens() -> anyhow::Result<()> {
+        clear_active_owner().await?;
+        let owner = test_owner(90_007);
+
+        for invalid in ["55".repeat(31), "AA".repeat(32), "gg".repeat(32)] {
+            assert!(commit_active_owner_session(&owner, &invalid).await.is_err());
+        }
         assert!(load_active_owner().await?.is_none());
         Ok(())
     }

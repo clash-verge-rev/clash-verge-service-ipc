@@ -1,8 +1,11 @@
 #[cfg(unix)]
 use crate::owner_key;
-use crate::{IPC_AUTH_EXPECT, OwnerCredentials, OwnerIdentity, ServiceErrorCode};
+use crate::{
+    IPC_AUTH_EXPECT, OwnerCredentials, OwnerIdentity, SESSION_TOKEN_HEX_LEN, ServiceErrorCode,
+};
 use kode_bridge::errors::KodeBridgeError;
 use kode_bridge::ipc_http_server::RequestContext;
+use sha2::{Digest as _, Sha256};
 use std::{fmt, path::PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +43,13 @@ impl ServiceError {
     pub(crate) fn owner_switch_failed(message: impl Into<String>) -> Self {
         Self::new(ServiceErrorCode::OwnerSwitchFailed, message)
     }
+
+    pub(crate) fn stale_owner_session() -> Self {
+        Self::new(
+            ServiceErrorCode::StaleOwnerSession,
+            "owner session is stale or invalid",
+        )
+    }
 }
 
 impl fmt::Display for ServiceError {
@@ -53,6 +63,20 @@ impl std::error::Error for ServiceError {}
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthStatus {
     Authorized,
+}
+
+pub(crate) fn hash_session_token(token: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        token.len() == SESSION_TOKEN_HEX_LEN
+            && token
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+        "owner session token must be 64 lowercase hexadecimal characters"
+    );
+    Ok(Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 pub fn ipc_request_context_to_auth_context(

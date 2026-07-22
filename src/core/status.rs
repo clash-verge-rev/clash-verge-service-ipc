@@ -11,9 +11,12 @@ pub async fn service_status_snapshot(owner: &AuthenticatedOwner) -> Result<Servi
     let desired = load_owner_desired_state(&owner.key)
         .await
         .unwrap_or_default();
-    let is_active = load_active_owner()
-        .await?
-        .is_some_and(|active| active.owner_key == owner.key);
+    let active_owner = load_active_owner().await?;
+    let active_generation = active_owner
+        .as_ref()
+        .filter(|active| active.owner_key == owner.key)
+        .map(|active| active.generation);
+    let is_active = active_generation.is_some();
     let core = if is_active {
         Some(CORE_MANAGER.lock().await.status().await)
     } else {
@@ -31,6 +34,7 @@ pub async fn service_status_snapshot(owner: &AuthenticatedOwner) -> Result<Servi
 
     Ok(ServiceStatusSnapshot {
         is_active,
+        active_generation,
         service_state,
         core_pid,
         core_started_at: core.as_ref().and_then(|core| core.core_started_at),
@@ -76,7 +80,7 @@ fn effective_service_state(
 mod tests {
     use super::{effective_service_state, service_status_snapshot};
     use crate::core::auth::AuthenticatedOwner;
-    use crate::core::desired::{clear_active_owner, persist_active_owner};
+    use crate::core::desired::{clear_active_owner, commit_active_owner_session};
     use crate::{OwnerIdentity, ServiceLifecycleState};
     use serial_test::serial;
 
@@ -127,16 +131,21 @@ mod tests {
     async fn inactive_owner_status_hides_active_core_details() -> anyhow::Result<()> {
         let active = owner(91_001);
         let inactive = owner(91_002);
-        persist_active_owner(&active).await?;
+        let active_session = commit_active_owner_session(&active, &"66".repeat(32)).await?;
 
         let status = service_status_snapshot(&inactive).await?;
 
         assert!(!status.is_active);
+        assert_eq!(status.active_generation, None);
         assert_eq!(status.core_pid, None);
         assert_eq!(status.core_started_at, None);
         assert_eq!(status.last_core_exit_reason, None);
         assert_eq!(status.restart_count, 0);
         assert_eq!(status.last_recovery_at, None);
+        assert_eq!(
+            service_status_snapshot(&active).await?.active_generation,
+            Some(active_session.generation)
+        );
         clear_active_owner().await?;
         Ok(())
     }

@@ -1,7 +1,8 @@
 use super::state::IpcState;
 use crate::core::assets::stage_runtime;
 use crate::core::auth::{
-    AuthenticatedOwner, ServiceError, authenticate_owner, ipc_request_context_to_auth_context,
+    AuthenticatedOwner, ServiceError, authenticate_owner, hash_session_token,
+    ipc_request_context_to_auth_context,
 };
 use crate::core::desired::{
     ActiveOwnerState, clear_active_owner, load_active_owner, persist_active_owner,
@@ -14,7 +15,7 @@ use crate::core::manager::{CORE_MANAGER, LOGGER_MANAGER};
 use crate::core::paths::service_paths;
 use crate::core::state::{set_core_lifecycle_state, set_service_lifecycle_state};
 use crate::core::status::service_status_snapshot;
-use crate::core::structure::{Response, ServiceLifecycleState};
+use crate::core::structure::{OwnerSessionProof, Response, ServiceLifecycleState};
 use crate::{AuthenticatedRequest, IpcCommand, RuntimeBundle, VERSION, WriterConfig};
 use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
@@ -632,6 +633,38 @@ async fn require_active_owner(
     }
 }
 
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
+}
+
+pub async fn require_active_session(
+    owner: &AuthenticatedOwner,
+    proof: &OwnerSessionProof,
+) -> std::result::Result<ActiveOwnerState, ServiceError> {
+    let active = load_active_owner()
+        .await
+        .map_err(|_| ServiceError::stale_owner_session())?
+        .ok_or_else(ServiceError::stale_owner_session)?;
+    let supplied_hash =
+        hash_session_token(&proof.token).map_err(|_| ServiceError::stale_owner_session())?;
+    if active.owner_key != owner.key
+        || active.generation != proof.generation
+        || !constant_time_eq(
+            active.session_token_hash.as_bytes(),
+            supplied_hash.as_bytes(),
+        )
+    {
+        return Err(ServiceError::stale_owner_session());
+    }
+    Ok(active)
+}
+
 fn json_response<T: Serialize>(
     status: StatusCode,
     code: u16,
@@ -655,15 +688,15 @@ static OWNER_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 mod owner_lifecycle_tests {
     use super::{
         OWNER_LIFECYCLE_LOCK, WINDOWS_CONTROL_PIPE_SDDL, commit_previous_owner_stopped,
-        commit_started_owner, require_active_owner,
+        commit_started_owner, require_active_owner, require_active_session,
     };
     use crate::ServiceErrorCode;
     use crate::core::auth::AuthenticatedOwner;
     use crate::core::desired::{
-        clear_active_owner, load_active_owner, load_owner_desired_state, persist_active_owner,
-        persist_owner_core_started,
+        clear_active_owner, commit_active_owner_session, load_active_owner,
+        load_owner_desired_state, persist_active_owner, persist_owner_core_started,
     };
-    use crate::{ClashConfig, OwnerIdentity};
+    use crate::{ClashConfig, OwnerIdentity, OwnerSessionProof};
     use serial_test::serial;
 
     fn owner(uid: u32) -> AuthenticatedOwner {
@@ -784,6 +817,52 @@ mod owner_lifecycle_tests {
         for key in [&owner_a.key, &owner_b.key] {
             let _ = std::fs::remove_dir_all(crate::service_paths().for_owner_key(key).root());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn same_owner_new_session_invalidates_old_proof() -> anyhow::Result<()> {
+        clear_active_owner().await?;
+        let owner = owner(95_001);
+        let first = commit_active_owner_session(&owner, &"11".repeat(32)).await?;
+        let first_proof = OwnerSessionProof {
+            generation: first.generation,
+            token: "11".repeat(32),
+        };
+        require_active_session(&owner, &first_proof).await?;
+        let second = commit_active_owner_session(&owner, &"22".repeat(32)).await?;
+        assert!(second.generation > first.generation);
+        assert_eq!(
+            require_active_session(&owner, &first_proof)
+                .await
+                .expect_err("old proof must be stale")
+                .code,
+            ServiceErrorCode::StaleOwnerSession,
+        );
+        clear_active_owner().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn legacy_active_owner_session_fails_closed() -> anyhow::Result<()> {
+        clear_active_owner().await?;
+        let owner = owner(95_002);
+        persist_active_owner(&owner).await?;
+        let proof = OwnerSessionProof {
+            generation: 0,
+            token: "55".repeat(32),
+        };
+
+        assert_eq!(
+            require_active_session(&owner, &proof)
+                .await
+                .expect_err("legacy owner must not authenticate a session")
+                .code,
+            ServiceErrorCode::StaleOwnerSession,
+        );
+        clear_active_owner().await?;
         Ok(())
     }
 }

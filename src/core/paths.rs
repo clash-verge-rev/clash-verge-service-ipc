@@ -52,6 +52,10 @@ impl ServicePaths {
         self.persistent_state_dir.join("active-owner.json")
     }
 
+    pub fn owner_generation_path(&self) -> PathBuf {
+        self.persistent_state_dir.join("owner-generation.json")
+    }
+
     pub fn for_owner(&self, identity: &OwnerIdentity) -> OwnerPaths {
         self.for_owner_key(&owner_key(identity))
     }
@@ -114,6 +118,12 @@ pub(crate) fn ensure_persistent_state_layout() -> anyhow::Result<()> {
     #[cfg(windows)]
     crate::core::windows_security::secure_private_service_file_if_exists(
         &paths.active_owner_path(),
+    )?;
+    #[cfg(unix)]
+    crate::core::unix_security::secure_service_file_if_exists(&paths.owner_generation_path())?;
+    #[cfg(windows)]
+    crate::core::windows_security::secure_private_service_file_if_exists(
+        &paths.owner_generation_path(),
     )?;
     Ok(())
 }

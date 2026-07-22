@@ -164,6 +164,7 @@ impl ServiceLifecycleState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceStatusSnapshot {
     pub is_active: bool,
+    pub active_generation: Option<u64>,
     pub service_state: ServiceLifecycleState,
     pub core_pid: Option<u32>,
     pub core_started_at: Option<u64>,
