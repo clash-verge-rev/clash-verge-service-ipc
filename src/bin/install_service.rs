@@ -159,30 +159,30 @@ fn main() -> Result<(), Error> {
 
     // 设置权限
     // 设置 LaunchDaemons plist 权限
-    let _ = run_command("chmod", &["644", plist_file.to_str().unwrap()], debug);
-    let _ = run_command(
+    run_command("chmod", &["644", plist_file.to_str().unwrap()], debug)?;
+    run_command(
         "chown",
         &["root:wheel", plist_file.to_str().unwrap()],
         debug,
-    );
+    )?;
 
     // 设置二进制文件权限
-    let _ = run_command("chmod", &["544", &target_binary_path], debug);
-    let _ = run_command("chown", &["root:wheel", &target_binary_path], debug);
+    run_command("chmod", &["544", &target_binary_path], debug)?;
+    run_command("chown", &["root:wheel", &target_binary_path], debug)?;
 
     // 设置 bundle 目录及其内容的权限
-    let _ = run_command("chmod", &["755", bundle_path], debug);
-    let _ = run_command("chown", &["-R", "root:wheel", bundle_path], debug);
+    run_command("chmod", &["755", bundle_path], debug)?;
+    run_command("chown", &["-R", "root:wheel", bundle_path], debug)?;
 
     // 加载和启动服务
-    let _ = run_command(
+    run_command(
         "launchctl",
         &[
             "enable",
             "system/io.github.clash-verge-rev.clash-verge-rev.service",
         ],
         debug,
-    );
+    )?;
     match launchd_install_plan {
         LaunchdInstallPlan::SkipBootout => {
             if debug {
@@ -195,16 +195,16 @@ fn main() -> Result<(), Error> {
             debug,
         )?,
     }
-    let _ = run_command(
+    run_command(
         "launchctl",
         &["bootstrap", "system", plist_file.to_str().unwrap()],
         debug,
-    );
-    let _ = run_command(
+    )?;
+    run_command(
         "launchctl",
         &["start", "io.github.clash-verge-rev.clash-verge-rev.service"],
         debug,
-    );
+    )?;
 
     Ok(())
 }
