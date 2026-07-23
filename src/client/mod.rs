@@ -70,12 +70,6 @@ pub async fn connect() -> Result<IpcHttpClient> {
 
     let c = { CLIENT_CONFIG.read().await.clone() }.unwrap_or_default();
     debug!("Using config: {:?}", c);
-    #[cfg(all(windows, not(feature = "test")))]
-    windows_identity::verify_registered_service_pipe(
-        IPC_PATH,
-        crate::WINDOWS_SERVICE_NAME,
-        IPC_AUTH_EXPECT,
-    )?;
     let client = kode_bridge::IpcHttpClient::with_config(
         IPC_PATH,
         ClientConfig {
@@ -84,6 +78,12 @@ pub async fn connect() -> Result<IpcHttpClient> {
             retry_delay: c.retry_delay,
             enable_pooling: true,
             require_windows_server_system: false,
+            #[cfg(all(windows, not(feature = "test")))]
+            windows_server_pid_verifier: Some(
+                windows_identity::verify_registered_service_process_id,
+            ),
+            #[cfg(all(windows, feature = "test"))]
+            windows_server_pid_verifier: None,
             ..Default::default()
         },
     )?;
