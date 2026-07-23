@@ -1,4 +1,4 @@
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 fn main() {
     panic!("This program is not intended to run on this platform.");
 }
@@ -89,6 +89,58 @@ fn main() -> Result<(), Error> {
     let _ = run_command("systemctl", &["daemon-reload"], debug);
 
     Ok(())
+}
+
+#[cfg(target_os = "freebsd")]
+fn main() -> Result<(), Error> {
+    const SERVICE_NAME: &str = "clash_verge_service";
+    use std::env;
+
+    let debug = env::args().any(|arg| arg == "--debug");
+
+    // Stop the service and disable it at boot.
+    let _ = run_command("service", &[SERVICE_NAME, "stop"], debug);
+
+    // The service may have spawned a privileged mihomo core that owns a TUN
+    // device. Stopping the service does not necessarily terminate that core,
+    // and a lingering mihomo keeps its cloned tun interface alive. Once the
+    // mihomo process exits, FreeBSD's kernel automatically reclaims the cloned
+    // tun device, so we just need to make sure the process is gone — we never
+    // destroy interfaces directly (that could hit an unrelated tun).
+    //
+    // Try SIGTERM first so mihomo can run its own shutdown (executor.Shutdown),
+    // then fall back to SIGKILL: on FreeBSD this build of mihomo does not
+    // reliably honor SIGTERM, so the kill is required to guarantee teardown.
+    // Match only the bundled core (verge-mihomo) to avoid touching unrelated
+    // processes the user may be running.
+    let _ = run_command("pkill", &["-TERM", "-f", "verge-mihomo"], debug);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    if mihomo_still_running() {
+        let _ = run_command("pkill", &["-KILL", "-f", "verge-mihomo"], debug);
+        // Give the kernel a moment to reclaim the cloned tun device.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    let _ = run_command("sysrc", &["-x", &format!("{}_enable", SERVICE_NAME)], debug);
+
+    // Remove the rc.d script.
+    let rc_file = format!("/usr/local/etc/rc.d/{}", SERVICE_NAME);
+    if std::path::Path::new(&rc_file).exists() {
+        std::fs::remove_file(&rc_file)
+            .map_err(|e| anyhow::anyhow!("Failed to remove rc.d script: {}", e))?;
+    }
+
+    Ok(())
+}
+
+/// Returns true if a bundled mihomo core (verge-mihomo) is still running.
+#[cfg(target_os = "freebsd")]
+fn mihomo_still_running() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-f", "verge-mihomo"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// stop and uninstall the service
