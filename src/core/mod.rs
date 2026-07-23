@@ -5,12 +5,14 @@ pub mod structure;
 pub use structure::{
     AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreConfig, MacosProxyConfig,
     OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, OwnerSessionHandle, OwnerSessionProof,
-    ProxyApplyOutcome, RuntimeAsset, RuntimeBundle, SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN,
-    ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot, StartClashRequest,
-    StartClashResult, WriterConfig, owner_key,
+    ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeAsset, RuntimeBundle,
+    SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState,
+    ServiceStatusSnapshot, StartClashRequest, StartClashResult, WriterConfig, owner_key,
 };
 
 pub mod paths;
+#[cfg(feature = "standalone")]
+pub use paths::prepare_service_install_directory;
 pub use paths::{OwnerPaths, ServicePaths, mihomo_ipc_path, service_paths};
 
 #[cfg(feature = "standalone")]
@@ -37,6 +39,8 @@ mod process;
 mod proxy;
 #[cfg(feature = "standalone")]
 mod reconcile;
+#[cfg(feature = "standalone")]
+mod repair;
 #[cfg(feature = "standalone")]
 mod runtime;
 #[cfg(feature = "standalone")]
@@ -69,6 +73,8 @@ pub use owner::{ServiceOwnerGuard, acquire_service_owner};
 pub use proxy::{apply_proxy, apply_proxy_or_direct, clear_proxy, validate_proxy_config};
 #[cfg(feature = "standalone")]
 pub use reconcile::reconcile_service_startup;
+#[cfg(feature = "standalone")]
+pub use repair::{REPAIR_IN_PROGRESS_EXIT_CODE, ServiceRepairGate, acquire_service_repair_gate};
 #[cfg(all(feature = "standalone", feature = "test"))]
 pub use runtime::write_core_runtime_record_for_tests;
 #[cfg(feature = "standalone")]

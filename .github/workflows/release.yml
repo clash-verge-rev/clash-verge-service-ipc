@@ -122,14 +122,14 @@ jobs:
 
       - name: Build
         if: matrix.os != 'ubuntu-latest'
-        run: cargo build --release --target ${{ matrix.target }} --features standalone --verbose
+        run: cargo build --release --target ${{ matrix.target }} --features "standalone client" --verbose
 
       - name: Build Linux
         if: matrix.os == 'ubuntu-latest'
         uses: ./.github/build-for-linux
         with:
           target: ${{ matrix.target }}
-          features: standalone
+          features: standalone,client
 
       - name: CodeSign macOS binaries
         if: startsWith(matrix.os, 'macos')

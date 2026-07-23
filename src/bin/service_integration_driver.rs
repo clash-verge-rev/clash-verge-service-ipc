@@ -3,8 +3,8 @@
 #[cfg(feature = "test")]
 use clash_verge_service_ipc::test_owner_credentials;
 use clash_verge_service_ipc::{
-    IpcConfig, OwnerSessionProof, RuntimeBundle, StartClashRequest, get_status, set_config,
-    start_clash, stop_clash,
+    IpcConfig, MIN_REQUIRED_SERVICE_REVISION, OwnerSessionProof, ProtocolVersion, RuntimeBundle,
+    StartClashRequest, get_status, get_version, set_config, start_clash, stop_clash,
 };
 #[cfg(not(feature = "test"))]
 use clash_verge_service_ipc::{OwnerCredentials, OwnerIdentity};
@@ -19,21 +19,71 @@ const IPC_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: service-integration-driver <ping|start|stop>");
+        eprintln!("usage: service-integration-driver <probe|ready|ping|start|stop>");
         std::process::exit(1);
     }
 
     match args[1].as_str() {
+        "probe" => probe_protocol().await?,
+        "ready" => wait_protocol_ready().await?,
         "ping" => wait_ipc_ready().await?,
         "start" => start_flow().await?,
         "stop" => stop_flow().await?,
         _ => {
-            eprintln!("usage: service-integration-driver <ping|start|stop>");
+            eprintln!("usage: service-integration-driver <probe|ready|ping|start|stop>");
             std::process::exit(1);
         }
     }
 
     Ok(())
+}
+
+async fn probe_protocol() -> anyhow::Result<()> {
+    set_config(Some(IpcConfig {
+        default_timeout: Duration::from_millis(250),
+        max_retries: 1,
+        retry_delay: Duration::from_millis(25),
+    }))
+    .await;
+    let result = async {
+        let response = get_version().await?;
+        let info = response
+            .data
+            .ok_or_else(|| anyhow::anyhow!("service omitted protocol information"))?;
+        if response.code != 0
+            || !info.supports_client(ProtocolVersion::current(), MIN_REQUIRED_SERVICE_REVISION)
+        {
+            anyhow::bail!("service protocol is not compatible");
+        }
+        Ok(())
+    }
+    .await;
+    set_config(None).await;
+    result
+}
+
+async fn wait_protocol_ready() -> anyhow::Result<()> {
+    set_config(Some(IpcConfig {
+        default_timeout: Duration::from_millis(250),
+        max_retries: 1,
+        retry_delay: Duration::from_millis(25),
+    }))
+    .await;
+
+    let result: anyhow::Result<()> = async {
+        let deadline = Instant::now() + IPC_READY_TIMEOUT;
+        while Instant::now() < deadline {
+            if probe_protocol().await.is_ok() {
+                return Ok(());
+            }
+            sleep(IPC_PROBE_INTERVAL).await;
+        }
+        anyhow::bail!("service protocol did not become ready within {IPC_READY_TIMEOUT:?}")
+    }
+    .await;
+
+    set_config(None).await;
+    result
 }
 
 async fn start_flow() -> anyhow::Result<()> {

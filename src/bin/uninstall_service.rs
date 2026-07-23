@@ -5,6 +5,16 @@ fn main() {
 
 use anyhow::Error;
 
+fn enter_repair_gate() -> Result<clash_verge_service_ipc::ServiceRepairGate, Error> {
+    match clash_verge_service_ipc::acquire_service_repair_gate()? {
+        Some(gate) => Ok(gate),
+        None => {
+            eprintln!("Service repair is already in progress");
+            std::process::exit(clash_verge_service_ipc::REPAIR_IN_PROGRESS_EXIT_CODE);
+        }
+    }
+}
+
 fn run_maintenance_if_requested() -> Result<bool, Error> {
     if !std::env::args().any(|argument| argument == "--cleanup-stale-owners") {
         return Ok(false);
@@ -40,15 +50,21 @@ fn main() -> Result<(), Error> {
     if run_maintenance_if_requested()? {
         return Ok(());
     }
+    let _gate = enter_repair_gate()?;
     let debug = env::args().any(|arg| arg == "--debug");
 
+    #[cfg(not(feature = "development-channel"))]
     let _ = uninstall_old_service();
     // 定义路径
-    let bundle_path =
-        "/Library/PrivilegedHelperTools/io.github.clash-verge-rev.clash-verge-rev.service.bundle";
-    let plist_file =
-        "/Library/LaunchDaemons/io.github.clash-verge-rev.clash-verge-rev.service.plist";
-    let service_id = "io.github.clash-verge-rev.clash-verge-rev.service";
+    let bundle_path = format!(
+        "/Library/PrivilegedHelperTools/{}.bundle",
+        clash_verge_service_ipc::MACOS_SERVICE_ID
+    );
+    let plist_file = format!(
+        "/Library/LaunchDaemons/{}.plist",
+        clash_verge_service_ipc::MACOS_SERVICE_ID
+    );
+    let service_id = clash_verge_service_ipc::MACOS_SERVICE_ID;
 
     // 停止并卸载服务
     let _ = run_command("launchctl", &["stop", service_id], debug);
@@ -57,17 +73,17 @@ fn main() -> Result<(), Error> {
         &["disable", &format!("system/{}", service_id)],
         debug,
     );
-    let _ = run_command("launchctl", &["bootout", "system", plist_file], debug);
+    let _ = run_command("launchctl", &["bootout", "system", &plist_file], debug);
 
     // 删除文件
-    if Path::new(plist_file).exists() {
-        std::fs::remove_file(plist_file)
+    if Path::new(&plist_file).exists() {
+        std::fs::remove_file(&plist_file)
             .map_err(|e| anyhow::anyhow!("Failed to remove plist file: {}", e))?;
     }
 
     // 删除整个 bundle 目录
-    if Path::new(bundle_path).exists() {
-        std::fs::remove_dir_all(bundle_path)
+    if Path::new(&bundle_path).exists() {
+        std::fs::remove_dir_all(&bundle_path)
             .map_err(|e| anyhow::anyhow!("Failed to remove bundle directory: {}", e))?;
     }
 
@@ -76,28 +92,29 @@ fn main() -> Result<(), Error> {
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Error> {
-    const SERVICE_NAME: &str = "clash-verge-service";
     use std::env;
 
     if run_maintenance_if_requested()? {
         return Ok(());
     }
+    let _gate = enter_repair_gate()?;
     let debug = env::args().any(|arg| arg == "--debug");
+    let service_name = clash_verge_service_ipc::SERVICE_SLUG;
 
     // Stop and disable service
     let _ = run_command(
         "systemctl",
-        &["stop", &format!("{}.service", SERVICE_NAME)],
+        &["stop", &format!("{}.service", service_name)],
         debug,
     );
     let _ = run_command(
         "systemctl",
-        &["disable", &format!("{}.service", SERVICE_NAME)],
+        &["disable", &format!("{}.service", service_name)],
         debug,
     );
 
     // Remove service file
-    let unit_file = format!("/etc/systemd/system/{}.service", SERVICE_NAME);
+    let unit_file = format!("/etc/systemd/system/{}.service", service_name);
     if std::path::Path::new(&unit_file).exists() {
         std::fs::remove_file(&unit_file)
             .map_err(|e| anyhow::anyhow!("Failed to remove service file: {}", e))?;
@@ -105,6 +122,13 @@ fn main() -> Result<(), Error> {
 
     // Reload systemd
     let _ = run_command("systemctl", &["daemon-reload"], debug);
+    let target =
+        clash_verge_service_ipc::prepare_service_install_directory()?.join("clash-verge-service");
+    if target.exists() {
+        std::fs::remove_file(&target).map_err(|error| {
+            anyhow::anyhow!("Failed to remove service binary {target:?}: {error}")
+        })?;
+    }
 
     Ok(())
 }
@@ -123,7 +147,6 @@ fn main() -> anyhow::Result<()> {
     const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
     const POLL_ATTEMPTS: usize = 200;
     const POLL_INTERVAL: Duration = Duration::from_millis(100);
-    const SERVICE_NAME: &str = "clash_verge_service";
 
     fn has_raw_error(error: &WindowsServiceError, code: i32) -> bool {
         matches!(error, WindowsServiceError::Winapi(error) if error.raw_os_error() == Some(code))
@@ -132,11 +155,15 @@ fn main() -> anyhow::Result<()> {
     if run_maintenance_if_requested()? {
         return Ok(());
     }
+    let _gate = enter_repair_gate()?;
     let manager_access = ServiceManagerAccess::CONNECT;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
     let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
-    let service = service_manager.open_service(SERVICE_NAME, service_access)?;
+    let service = service_manager.open_service(
+        clash_verge_service_ipc::WINDOWS_SERVICE_NAME,
+        service_access,
+    )?;
 
     let service_status = service.query_status()?;
     if service_status.current_state != ServiceState::Stopped {
@@ -160,7 +187,10 @@ fn main() -> anyhow::Result<()> {
     drop(service);
     poll_until(
         POLL_ATTEMPTS,
-        || match service_manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        || match service_manager.open_service(
+            clash_verge_service_ipc::WINDOWS_SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS,
+        ) {
             Ok(service) => {
                 drop(service);
                 Ok(None)
@@ -171,6 +201,13 @@ fn main() -> anyhow::Result<()> {
         || thread::sleep(POLL_INTERVAL),
         "timed out waiting for service deletion",
     )?;
+    let target = clash_verge_service_ipc::prepare_service_install_directory()?
+        .join("clash-verge-service.exe");
+    if target.exists() {
+        std::fs::remove_file(&target).map_err(|error| {
+            anyhow::anyhow!("Failed to remove service binary {target:?}: {error}")
+        })?;
+    }
     println!("Service uninstalled successfully. Resource cleanup warnings can be ignored.");
     Ok(())
 }

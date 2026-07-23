@@ -18,9 +18,10 @@ use crate::core::status::service_status_snapshot;
 use crate::core::structure::{OwnerSessionProof, Response, ServiceLifecycleState};
 use crate::core::{apply_proxy, apply_proxy_or_direct, clear_proxy, validate_proxy_config};
 use crate::{
-    AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, IpcCommand, MacosProxyConfig,
-    OwnerSessionHandle, ProxyApplyOutcome, SERVICE_PROTOCOL_HEADER, StartClashRequest,
-    StartClashResult, VERSION, WriterConfig,
+    AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, IpcCommand,
+    MIN_SUPPORTED_CLIENT_REVISION, MacosProxyConfig, OwnerSessionHandle, ProtocolInfo,
+    ProtocolVersion, ProxyApplyOutcome, SERVICE_PROTOCOL_HEADER, StartClashRequest,
+    StartClashResult, WriterConfig,
 };
 use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
@@ -43,8 +44,10 @@ const IPC_MAX_RESTARTS: u32 = 10;
 const IPC_RESTART_WINDOW: Duration = Duration::from_secs(10);
 const IPC_MAX_BACKOFF: Duration = Duration::from_millis(500);
 const IPC_HANDLER_TIMEOUT: Duration = Duration::from_secs(25);
-#[cfg(any(windows, test))]
-const WINDOWS_CONTROL_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00000003;;;AU)";
+#[cfg(any(test, all(windows, not(feature = "test"))))]
+const WINDOWS_CONTROL_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012019b;;;AU)";
+#[cfg(all(windows, feature = "test"))]
+const WINDOWS_TEST_CONTROL_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)";
 
 trait OwnerProxyTransition {
     async fn clear_previous_proxy(&mut self) -> AnyResult<()>;
@@ -506,7 +509,15 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
 
     #[cfg(windows)]
     {
-        let server = server.with_listener_security_descriptor(WINDOWS_CONTROL_PIPE_SDDL);
+        // The production service runs as SYSTEM, whose ACE may create subsequent
+        // named-pipe instances. Integration tests run as the invoking user, so
+        // they need a test-only server ACE with the same create-instance right.
+        // Production clients still receive only read/write access.
+        #[cfg(feature = "test")]
+        let descriptor = WINDOWS_TEST_CONTROL_PIPE_SDDL;
+        #[cfg(not(feature = "test"))]
+        let descriptor = WINDOWS_CONTROL_PIPE_SDDL;
+        let server = server.with_listener_security_descriptor(descriptor);
         Ok(server)
     }
 }
@@ -518,11 +529,13 @@ fn require_protocol_version(
         .headers
         .get(SERVICE_PROTOCOL_HEADER)
         .and_then(|value| value.to_str().ok());
-    if supplied == Some(VERSION) {
-        Ok(())
-    } else {
-        Err(ServiceError::protocol_mismatch())
-    }
+    let Some(supplied) = supplied.and_then(ProtocolVersion::parse_header) else {
+        return Err(ServiceError::protocol_mismatch());
+    };
+    let current = ProtocolVersion::current();
+    (supplied.epoch == current.epoch && supplied.revision >= MIN_SUPPORTED_CLIENT_REVISION)
+        .then_some(())
+        .ok_or_else(ServiceError::protocol_mismatch)
 }
 
 fn create_ipc_router() -> Result<Router> {
@@ -534,7 +547,7 @@ fn create_ipc_router() -> Result<Router> {
         })
         .get(IpcCommand::GetVersion.as_ref(), |ctx| async move {
             ipc_request_context_to_auth_context(&ctx)?;
-            ok_json(VERSION.to_string())
+            ok_json(ProtocolInfo::current())
         })
         .get(IpcCommand::Status.as_ref(), |ctx| async move {
             trace!("Received Status command");
@@ -1124,7 +1137,8 @@ mod owner_lifecycle_tests {
         assert!(WINDOWS_CONTROL_PIPE_SDDL.contains(";;;AU)"));
         assert!(!WINDOWS_CONTROL_PIPE_SDDL.contains(";;;WD)"));
         assert!(!WINDOWS_CONTROL_PIPE_SDDL.contains("GRGW;;;AU"));
-        assert!(WINDOWS_CONTROL_PIPE_SDDL.contains("0x00000003;;;AU"));
+        assert!(WINDOWS_CONTROL_PIPE_SDDL.contains("0x0012019b;;;AU"));
+        assert!(!WINDOWS_CONTROL_PIPE_SDDL.contains("0x0012019f;;;AU"));
     }
 
     #[tokio::test]

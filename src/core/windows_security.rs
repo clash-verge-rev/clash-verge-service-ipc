@@ -14,7 +14,7 @@ use windows_sys::Win32::Security::Authorization::{
 #[cfg(not(feature = "test"))]
 use windows_sys::Win32::Security::{
     CreateWellKnownSid, EqualSid, OWNER_SECURITY_INFORMATION, SECURITY_MAX_SID_SIZE,
-    WinLocalSystemSid,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
@@ -24,27 +24,36 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
-    GetFileInformationByHandle, GetFileType, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    GetFileInformationByHandle, GetFileType, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
 
 #[cfg(not(feature = "test"))]
-const PRIVATE_SERVICE_DIRECTORY_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+const PRIVATE_SERVICE_DIRECTORY_SDDL: &str = "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 #[cfg(feature = "test")]
 const PRIVATE_SERVICE_DIRECTORY_SDDL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+const PRIVATE_INSTALLER_DIRECTORY_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 #[cfg(not(feature = "test"))]
-const PRIVATE_SERVICE_FILE_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
+const PRIVATE_SERVICE_FILE_SDDL: &str = "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 #[cfg(feature = "test")]
 const PRIVATE_SERVICE_FILE_SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)";
 
 pub(crate) fn ensure_private_service_directory(path: &Path) -> Result<()> {
-    let descriptor = LocalDescriptor::from_sddl(PRIVATE_SERVICE_DIRECTORY_SDDL)?;
+    ensure_private_directory(path, PRIVATE_SERVICE_DIRECTORY_SDDL, true)
+}
+
+pub(crate) fn ensure_private_installer_directory(path: &Path) -> Result<()> {
+    ensure_private_directory(path, PRIVATE_INSTALLER_DIRECTORY_SDDL, false)
+}
+
+fn ensure_private_directory(path: &Path, sddl: &str, migrate_owner: bool) -> Result<()> {
+    let descriptor = LocalDescriptor::from_sddl(sddl)?;
     let wide = wide_path(path)?;
-    let mut attributes = SECURITY_ATTRIBUTES {
+    let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: descriptor.0,
         bInheritHandle: 0,
     };
-    if unsafe { CreateDirectoryW(wide.as_ptr(), &mut attributes) } == 0
+    if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0
         && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS
     {
         return Err(std::io::Error::last_os_error())
@@ -54,7 +63,7 @@ pub(crate) fn ensure_private_service_directory(path: &Path) -> Result<()> {
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            READ_CONTROL | WRITE_DAC,
+            READ_CONTROL | WRITE_DAC | WRITE_OWNER,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_EXISTING,
@@ -77,7 +86,13 @@ pub(crate) fn ensure_private_service_directory(path: &Path) -> Result<()> {
         bail!("service directory {path:?} is not an ordinary directory");
     }
     #[cfg(not(feature = "test"))]
-    ensure_local_system_owner(handle.0, path)?;
+    if migrate_owner {
+        ensure_local_system_owner(handle.0, path)?;
+    } else {
+        ensure_installer_owner(handle.0, path)?;
+    }
+    #[cfg(feature = "test")]
+    let _ = migrate_owner;
     descriptor.apply_dacl(handle.0)?;
     Ok(())
 }
@@ -92,7 +107,7 @@ pub(crate) fn secure_private_service_file_if_exists(path: &Path) -> Result<()> {
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            READ_CONTROL | WRITE_DAC,
+            READ_CONTROL | WRITE_DAC | WRITE_OWNER,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_EXISTING,
@@ -123,6 +138,57 @@ pub(crate) fn secure_private_service_file_if_exists(path: &Path) -> Result<()> {
 
 #[cfg(not(feature = "test"))]
 fn ensure_local_system_owner(handle: *mut std::ffi::c_void, path: &Path) -> Result<()> {
+    let (owner, security) = read_owner(handle)?;
+    let mut system_sid = well_known_sid(WinLocalSystemSid, "LocalSystem")?;
+    if unsafe { EqualSid(owner, system_sid.as_mut_ptr().cast()) } != 0 {
+        return Ok(());
+    }
+    let mut administrators_sid =
+        well_known_sid(WinBuiltinAdministratorsSid, "Builtin Administrators")?;
+    if unsafe { EqualSid(owner, administrators_sid.as_mut_ptr().cast()) } == 0 {
+        bail!(
+            "service path {path:?} has an unexpected owner; only legacy Builtin Administrators ownership can be migrated"
+        );
+    }
+    drop(security);
+
+    let status = unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            system_sid.as_mut_ptr().cast(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        bail!(
+            "failed to migrate service path {path:?} to LocalSystem ownership: Windows error {status}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "test"))]
+fn ensure_installer_owner(handle: *mut std::ffi::c_void, path: &Path) -> Result<()> {
+    let (owner, _security) = read_owner(handle)?;
+    let mut system_sid = well_known_sid(WinLocalSystemSid, "LocalSystem")?;
+    let mut administrators_sid =
+        well_known_sid(WinBuiltinAdministratorsSid, "Builtin Administrators")?;
+    if unsafe { EqualSid(owner, system_sid.as_mut_ptr().cast()) } == 0
+        && unsafe { EqualSid(owner, administrators_sid.as_mut_ptr().cast()) } == 0
+    {
+        bail!(
+            "service install path {path:?} has an unexpected owner; refusing to publish a privileged binary"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "test"))]
+fn read_owner(handle: *mut std::ffi::c_void) -> Result<(*mut std::ffi::c_void, LocalDescriptor)> {
     let mut owner = std::ptr::null_mut();
     let mut security = std::ptr::null_mut();
     let status = unsafe {
@@ -138,28 +204,30 @@ fn ensure_local_system_owner(handle: *mut std::ffi::c_void, path: &Path) -> Resu
         )
     };
     if status != 0 || security.is_null() || owner.is_null() {
-        bail!("failed to inspect service directory owner: Windows error {status}");
+        bail!("failed to inspect service path owner: Windows error {status}");
     }
     let security = LocalDescriptor(security);
+    Ok((owner, security))
+}
+
+#[cfg(not(feature = "test"))]
+fn well_known_sid(kind: i32, label: &str) -> Result<Vec<usize>> {
     let words = (SECURITY_MAX_SID_SIZE as usize).div_ceil(std::mem::size_of::<usize>());
-    let mut system_sid = vec![0_usize; words];
+    let mut sid = vec![0_usize; words];
     let mut sid_size = SECURITY_MAX_SID_SIZE;
     if unsafe {
         CreateWellKnownSid(
-            WinLocalSystemSid,
+            kind,
             std::ptr::null_mut(),
-            system_sid.as_mut_ptr().cast(),
+            sid.as_mut_ptr().cast(),
             &mut sid_size,
         )
     } == 0
     {
-        return Err(std::io::Error::last_os_error()).context("failed to create LocalSystem SID");
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to create {label} SID"));
     }
-    if unsafe { EqualSid(owner, system_sid.as_mut_ptr().cast()) } == 0 {
-        bail!("service directory {path:?} is not owned by LocalSystem");
-    }
-    drop(security);
-    Ok(())
+    Ok(sid)
 }
 
 fn wide_path(path: &Path) -> Result<Vec<u16>> {
@@ -243,6 +311,9 @@ mod tests {
 
     #[test]
     fn private_directory_dacl_excludes_ordinary_users() {
+        #[cfg(not(feature = "test"))]
+        assert!(PRIVATE_SERVICE_DIRECTORY_SDDL.starts_with("O:SYD:P"));
+        #[cfg(feature = "test")]
         assert!(PRIVATE_SERVICE_DIRECTORY_SDDL.starts_with("D:P"));
         assert!(PRIVATE_SERVICE_DIRECTORY_SDDL.contains(";;;SY)"));
         assert!(PRIVATE_SERVICE_DIRECTORY_SDDL.contains(";;;BA)"));

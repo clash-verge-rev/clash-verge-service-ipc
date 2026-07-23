@@ -7,6 +7,60 @@ pub const OWNER_TOKEN_FILE_NAME: &str = ".clash-verge-service-owner-token";
 pub const SERVICE_PROTOCOL_HEADER: &str = "X-Clash-Verge-Service-Protocol";
 pub const SESSION_TOKEN_HEX_LEN: usize = 64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolVersion {
+    pub epoch: u16,
+    pub revision: u16,
+}
+
+impl ProtocolVersion {
+    pub const fn current() -> Self {
+        Self {
+            epoch: crate::PROTOCOL_EPOCH,
+            revision: crate::PROTOCOL_REVISION,
+        }
+    }
+
+    pub fn header_value(self) -> String {
+        format!("{}.{}", self.epoch, self.revision)
+    }
+
+    pub fn parse_header(value: &str) -> Option<Self> {
+        let (epoch, revision) = value.split_once('.')?;
+        Some(Self {
+            epoch: epoch.parse().ok()?,
+            revision: revision.parse().ok()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolInfo {
+    pub build_version: String,
+    pub protocol: ProtocolVersion,
+    pub min_client_revision: u16,
+}
+
+impl ProtocolInfo {
+    pub fn current() -> Self {
+        Self {
+            build_version: crate::VERSION.to_owned(),
+            protocol: ProtocolVersion::current(),
+            min_client_revision: crate::MIN_SUPPORTED_CLIENT_REVISION,
+        }
+    }
+
+    pub const fn supports_client(
+        &self,
+        client: ProtocolVersion,
+        min_service_revision: u16,
+    ) -> bool {
+        self.protocol.epoch == client.epoch
+            && self.protocol.revision >= min_service_revision
+            && client.revision >= self.min_client_revision
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OwnerIdentity {
     Unix { uid: u32, gid: u32 },
@@ -187,13 +241,13 @@ pub struct Response<T> {
 impl Default for CoreConfig {
     fn default() -> Self {
         let core_ipc_path = if cfg!(windows) {
-            r"\\.\pipe\verge-mihomo".to_string()
+            format!(r"\\.\pipe\verge-mihomo-{}", crate::CHANNEL_IDENTITY.id)
         } else if cfg!(feature = "test") {
             "/tmp/clash-verge-service-ipc-test/mihomo.sock".to_string()
         } else if cfg!(target_os = "macos") {
-            "/var/run/clash-verge-service/users/0/verge-mihomo.sock".to_string()
+            format!("/var/run/{}/users/0/verge-mihomo.sock", crate::SERVICE_SLUG)
         } else {
-            "/run/clash-verge-service/users/0/verge-mihomo.sock".to_string()
+            format!("/run/{}/users/0/verge-mihomo.sock", crate::SERVICE_SLUG)
         };
         Self {
             core_path: "./clash".to_string(),
@@ -242,8 +296,8 @@ impl<T> JsonConvert for T where T: Serialize + for<'de> Deserialize<'de> {}
 #[cfg(test)]
 mod tests {
     use super::{
-        MacosProxyConfig, OwnerIdentity, RuntimeBundle, ServiceErrorCode, StartClashRequest,
-        owner_key,
+        MacosProxyConfig, OwnerIdentity, ProtocolInfo, ProtocolVersion, RuntimeBundle,
+        ServiceErrorCode, StartClashRequest, owner_key,
     };
 
     #[test]
@@ -274,6 +328,37 @@ mod tests {
         assert_eq!(ServiceErrorCode::InvalidProxyConfig as u16, 1009);
         assert_eq!(ServiceErrorCode::ProxyClearFailed as u16, 1010);
         assert_eq!(ServiceErrorCode::ProxyApplyFailed as u16, 1011);
+    }
+
+    #[test]
+    fn protocol_header_is_independent_from_the_build_version() {
+        let current = ProtocolVersion::current();
+        assert_eq!(
+            ProtocolVersion::parse_header(&current.header_value()),
+            Some(current)
+        );
+        assert!(ProtocolVersion::parse_header(crate::VERSION).is_none());
+    }
+
+    #[test]
+    fn protocol_compatibility_is_epoch_and_revision_based() {
+        let info = ProtocolInfo::current();
+        let current = ProtocolVersion::current();
+        assert!(info.supports_client(current, crate::MIN_REQUIRED_SERVICE_REVISION));
+        assert!(!info.supports_client(
+            ProtocolVersion {
+                epoch: current.epoch.saturating_add(1),
+                revision: current.revision,
+            },
+            crate::MIN_REQUIRED_SERVICE_REVISION,
+        ));
+        assert!(!info.supports_client(
+            ProtocolVersion {
+                epoch: current.epoch,
+                revision: info.min_client_revision.saturating_sub(1),
+            },
+            crate::MIN_REQUIRED_SERVICE_REVISION,
+        ));
     }
 
     #[test]

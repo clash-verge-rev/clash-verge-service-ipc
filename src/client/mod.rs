@@ -12,8 +12,9 @@ use tokio::sync::RwLock;
 
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
-    MacosProxyConfig, OwnerCredentials, OwnerSessionProof, ProxyApplyOutcome,
-    ServiceStatusSnapshot, StartClashRequest, StartClashResult, WriterConfig,
+    MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof,
+    ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, ServiceStatusSnapshot, StartClashRequest,
+    StartClashResult, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
@@ -26,7 +27,10 @@ const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
 fn protected<'a>(
     request: kode_bridge::HttpRequestBuilder<'a>,
 ) -> kode_bridge::HttpRequestBuilder<'a> {
-    request.header(crate::SERVICE_PROTOCOL_HEADER, crate::VERSION)
+    request.header(
+        crate::SERVICE_PROTOCOL_HEADER,
+        ProtocolVersion::current().header_value(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +74,7 @@ pub async fn connect() -> Result<IpcHttpClient> {
             max_retries: c.max_retries,
             retry_delay: c.retry_delay,
             enable_pooling: true,
-            require_windows_server_system: cfg!(windows),
+            require_windows_server_system: cfg!(all(windows, not(feature = "test"))),
             ..Default::default()
         },
     )?;
@@ -92,14 +96,14 @@ pub fn is_ipc_path_exists() -> bool {
     Path::new(IPC_PATH).exists()
 }
 
-pub async fn get_version() -> Result<Response<String>> {
+pub async fn get_version() -> Result<Response<ProtocolInfo>> {
     let client = connect().await?;
     let response = client
         .get(IpcCommand::GetVersion.as_ref())
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .send()
         .await?
-        .json::<Response<String>>()?;
+        .json::<Response<ProtocolInfo>>()?;
     Ok(response)
 }
 
@@ -121,13 +125,9 @@ pub async fn get_status(credentials: &OwnerCredentials) -> Result<Response<Servi
 pub async fn is_reinstall_service_needed() -> bool {
     is_ipc_path_exists()
         && match get_version().await {
-            Ok(resp) => {
-                if let Some(ver) = resp.data {
-                    ver != crate::VERSION
-                } else {
-                    true
-                }
-            }
+            Ok(resp) => resp.data.is_none_or(|info| {
+                !info.supports_client(ProtocolVersion::current(), MIN_REQUIRED_SERVICE_REVISION)
+            }),
             Err(_) => true,
         }
 }

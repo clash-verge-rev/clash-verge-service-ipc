@@ -60,9 +60,8 @@ mod windows {
     };
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        PSECURITY_DESCRIPTOR, SetFileSecurityW, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
-    use windows_sys::Win32::Storage::FileSystem::SetFileSecurityW;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     const TOKEN_BYTES: usize = 32;

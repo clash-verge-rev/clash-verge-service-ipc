@@ -632,9 +632,8 @@ mod windows_tests {
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
     };
-    use windows_sys::Win32::Storage::FileSystem::SetFileSecurityW;
 
     fn test_root(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("cvs-auth-{name}-{}", std::process::id()))
@@ -747,7 +746,13 @@ mod windows_tests {
 
         let link_root = test_root("link");
         let _ = std::fs::remove_dir_all(&link_root);
-        std::os::windows::fs::symlink_dir(&dacl_root, &link_root)?;
+        if let Err(error) = std::os::windows::fs::symlink_dir(&dacl_root, &link_root) {
+            if error.raw_os_error() == Some(1314) {
+                std::fs::remove_dir_all(dacl_root)?;
+                return Ok(());
+            }
+            return Err(error.into());
+        }
         let mut link_credentials = dacl_credentials;
         link_credentials.app_data_dir = link_root.to_string_lossy().into_owned();
         assert_eq!(

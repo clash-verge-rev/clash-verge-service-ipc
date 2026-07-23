@@ -5,7 +5,8 @@ mod common;
 #[cfg(test)]
 mod tests {
     use clash_verge_service_ipc::{
-        VERSION, connect, get_status, get_version, run_ipc_server, stop_ipc_server,
+        PROTOCOL_EPOCH, PROTOCOL_REVISION, VERSION, connect, get_status, get_version,
+        run_ipc_server, stop_ipc_server,
     };
     use serial_test::serial;
     use tokio::task::JoinHandle;
@@ -58,7 +59,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn test_start_and_parse() {
         crate::common::init_tracing_for_tests();
@@ -86,16 +87,9 @@ mod tests {
         assert!(version_data.is_some(), "Version data should not be None");
 
         let version = version_data.unwrap();
-        assert!(
-            version == VERSION,
-            "Version data should match expected VERSION constant"
-        );
-
-        let mock_version = "mock_version_1.0.0";
-        assert!(
-            mock_version != version,
-            "Version should not match mock version"
-        );
+        assert_eq!(version.build_version, VERSION);
+        assert_eq!(version.protocol.epoch, PROTOCOL_EPOCH);
+        assert_eq!(version.protocol.revision, PROTOCOL_REVISION);
 
         let status = get_status(&crate::common::owner_credentials()).await;
         assert!(

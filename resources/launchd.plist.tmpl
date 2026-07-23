@@ -3,22 +3,22 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>io.github.clash-verge-rev.clash-verge-rev.service</string>
+    <string>{service_id}</string>
 
     <key>AssociatedBundleIdentifiers</key>
     <array>
-        <string>io.github.clash-verge-rev.clash-verge-rev</string>
+        <string>{app_bundle_id}</string>
     </array>
 
     <key>MachServices</key>
     <dict>
-        <key>io.github.clash-verge-rev.clash-verge-rev.service</key>
+        <key>{service_id}</key>
         <true/>
     </dict>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Library/PrivilegedHelperTools/io.github.clash-verge-rev.clash-verge-rev.service.bundle/Contents/MacOS/clash-verge-service</string>
+        <string>{service_binary}</string>
     </array>
 
     <key>GroupName</key>
