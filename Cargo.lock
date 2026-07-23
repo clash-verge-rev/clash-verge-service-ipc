@@ -639,7 +639,7 @@ dependencies = [
 [[package]]
 name = "kode-bridge"
 version = "0.4.1"
-source = "git+https://github.com/clash-verge-rev/kode-bridge.git?tag=v0.4.1#86e26b88023be3d0224214b24de8a5574e1be34b"
+source = "git+https://github.com/clash-verge-rev/kode-bridge.git?branch=dev#6f06abdfcbfe8a8ac040ab68e098298bd9d5e03a"
 dependencies = [
  "bytes",
  "futures",
@@ -1232,7 +1232,7 @@ dependencies = [
 [[package]]
 name = "sysproxy"
 version = "0.5.4"
-source = "git+https://github.com/clash-verge-rev/sysproxy-rs?rev=d214eba9f61d655d49a35f6ae17c359f7ad68d79#d214eba9f61d655d49a35f6ae17c359f7ad68d79"
+source = "git+https://github.com/clash-verge-rev/sysproxy-rs?branch=main#d214eba9f61d655d49a35f6ae17c359f7ad68d79"
 dependencies = [
  "iptools",
  "log",
