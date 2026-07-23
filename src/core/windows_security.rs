@@ -31,7 +31,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 const PRIVATE_SERVICE_DIRECTORY_SDDL: &str = "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 #[cfg(feature = "test")]
 const PRIVATE_SERVICE_DIRECTORY_SDDL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
-const PRIVATE_INSTALLER_DIRECTORY_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+const PRIVATE_INSTALLER_DIRECTORY_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 #[cfg(not(feature = "test"))]
 const PRIVATE_SERVICE_FILE_SDDL: &str = "O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 #[cfg(feature = "test")]
@@ -46,6 +46,15 @@ pub(crate) fn ensure_private_installer_directory(path: &Path) -> Result<()> {
 }
 
 fn ensure_private_directory(path: &Path, sddl: &str, migrate_owner: bool) -> Result<()> {
+    ensure_private_directory_with_recovery(path, sddl, migrate_owner, true)
+}
+
+fn ensure_private_directory_with_recovery(
+    path: &Path,
+    sddl: &str,
+    migrate_owner: bool,
+    allow_empty_recreation: bool,
+) -> Result<()> {
     let descriptor = LocalDescriptor::from_sddl(sddl)?;
     let wide = wide_path(path)?;
     let attributes = SECURITY_ATTRIBUTES {
@@ -88,11 +97,20 @@ fn ensure_private_directory(path: &Path, sddl: &str, migrate_owner: bool) -> Res
     #[cfg(not(feature = "test"))]
     if migrate_owner {
         ensure_local_system_owner(handle.0, path)?;
-    } else {
-        ensure_installer_owner(handle.0, path)?;
+    } else if !installer_owner_is_trusted(handle.0)? {
+        drop(handle);
+        if allow_empty_recreation {
+            std::fs::remove_dir(path).with_context(|| {
+                format!(
+                    "service install path {path:?} has an unexpected owner and is not an empty directory that can be safely reclaimed"
+                )
+            })?;
+            return ensure_private_directory_with_recovery(path, sddl, migrate_owner, false);
+        }
+        bail!("service install path {path:?} still has an unexpected owner after safe recreation");
     }
     #[cfg(feature = "test")]
-    let _ = migrate_owner;
+    let _ = (migrate_owner, allow_empty_recreation);
     descriptor.apply_dacl(handle.0)?;
     Ok(())
 }
@@ -172,19 +190,15 @@ fn ensure_local_system_owner(handle: *mut std::ffi::c_void, path: &Path) -> Resu
 }
 
 #[cfg(not(feature = "test"))]
-fn ensure_installer_owner(handle: *mut std::ffi::c_void, path: &Path) -> Result<()> {
+fn installer_owner_is_trusted(handle: *mut std::ffi::c_void) -> Result<bool> {
     let (owner, _security) = read_owner(handle)?;
     let mut system_sid = well_known_sid(WinLocalSystemSid, "LocalSystem")?;
     let mut administrators_sid =
         well_known_sid(WinBuiltinAdministratorsSid, "Builtin Administrators")?;
-    if unsafe { EqualSid(owner, system_sid.as_mut_ptr().cast()) } == 0
-        && unsafe { EqualSid(owner, administrators_sid.as_mut_ptr().cast()) } == 0
-    {
-        bail!(
-            "service install path {path:?} has an unexpected owner; refusing to publish a privileged binary"
-        );
-    }
-    Ok(())
+    Ok(
+        unsafe { EqualSid(owner, system_sid.as_mut_ptr().cast()) } != 0
+            || unsafe { EqualSid(owner, administrators_sid.as_mut_ptr().cast()) } != 0,
+    )
 }
 
 #[cfg(not(feature = "test"))]
@@ -307,7 +321,12 @@ impl Drop for LocalDescriptor {
 
 #[cfg(test)]
 mod tests {
-    use super::PRIVATE_SERVICE_DIRECTORY_SDDL;
+    use super::{PRIVATE_INSTALLER_DIRECTORY_SDDL, PRIVATE_SERVICE_DIRECTORY_SDDL};
+
+    #[test]
+    fn installer_directory_assigns_builtin_administrators_as_owner() {
+        assert!(PRIVATE_INSTALLER_DIRECTORY_SDDL.starts_with("O:BAD:P"));
+    }
 
     #[test]
     fn private_directory_dacl_excludes_ordinary_users() {

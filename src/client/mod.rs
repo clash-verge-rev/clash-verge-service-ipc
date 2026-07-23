@@ -10,6 +10,9 @@ use log::{debug, warn};
 use once_cell::sync::Lazy;
 use tokio::sync::RwLock;
 
+#[cfg(all(windows, any(not(feature = "test"), test)))]
+mod windows_identity;
+
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
     MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof,
@@ -67,6 +70,9 @@ pub async fn connect() -> Result<IpcHttpClient> {
 
     let c = { CLIENT_CONFIG.read().await.clone() }.unwrap_or_default();
     debug!("Using config: {:?}", c);
+    #[cfg(all(windows, not(feature = "test")))]
+    let _verified_windows_server =
+        windows_identity::verify_registered_service_pipe(IPC_PATH, crate::WINDOWS_SERVICE_NAME)?;
     let client = kode_bridge::IpcHttpClient::with_config(
         IPC_PATH,
         ClientConfig {
@@ -74,7 +80,7 @@ pub async fn connect() -> Result<IpcHttpClient> {
             max_retries: c.max_retries,
             retry_delay: c.retry_delay,
             enable_pooling: true,
-            require_windows_server_system: cfg!(all(windows, not(feature = "test"))),
+            require_windows_server_system: false,
             ..Default::default()
         },
     )?;
