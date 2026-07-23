@@ -6,13 +6,15 @@ use std::os::windows::ffi::OsStrExt as _;
 #[cfg(not(feature = "test"))]
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 #[cfg(not(feature = "test"))]
+use std::time::{Duration, Instant};
+#[cfg(not(feature = "test"))]
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 #[cfg(not(feature = "test"))]
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
 };
 #[cfg(not(feature = "test"))]
-use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+use windows_sys::Win32::System::Pipes::{GetNamedPipeServerProcessId, PeekNamedPipe};
 
 #[cfg(not(feature = "test"))]
 use platform_lib::service::ServiceAccess;
@@ -53,12 +55,34 @@ fn identity_probe_request(auth_value: &str) -> Option<Vec<u8>> {
     )
 }
 
+fn completed_identity_probe_response(response: &[u8]) -> Option<bool> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
+    let headers = std::str::from_utf8(&response[..header_end]).ok()?;
+    let content_length = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    })?;
+    let body_start = header_end + 4;
+    let response_length = body_start.checked_add(content_length)?;
+    if response.len() < response_length {
+        return None;
+    }
+    Some(
+        headers.starts_with("HTTP/1.1 200 ")
+            && response[body_start..response_length] == *b"Tunglies!",
+    )
+}
+
 #[cfg(not(feature = "test"))]
 pub(super) fn verify_registered_service_pipe(
     pipe_path: &str,
     service_name: &str,
     auth_value: &str,
-) -> Result<OwnedHandle> {
+) -> Result<()> {
     let mut wide: Vec<u16> = OsStr::new(pipe_path).encode_wide().collect();
     if wide.contains(&0) {
         bail!("Windows named-pipe path contains NUL");
@@ -134,7 +158,62 @@ pub(super) fn verify_registered_service_pipe(
         return Err(std::io::Error::last_os_error())
             .context("failed to complete the verified service identity probe");
     }
-    Ok(pipe)
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut response = Vec::with_capacity(512);
+    loop {
+        if let Some(valid) = completed_identity_probe_response(&response) {
+            if valid {
+                return Ok(());
+            }
+            bail!("registered service returned an invalid identity probe response");
+        }
+        if response.len() > 64 * 1024 {
+            bail!("registered service identity probe response is too large");
+        }
+        if Instant::now() >= deadline {
+            bail!("registered service identity probe response timed out");
+        }
+
+        let mut available = 0;
+        if unsafe {
+            PeekNamedPipe(
+                pipe.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect the registered service identity probe response");
+        }
+        if available == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+
+        let chunk_length = available.min(4096);
+        let mut chunk = vec![0_u8; chunk_length as usize];
+        let mut read = 0;
+        if unsafe {
+            windows_sys::Win32::Storage::FileSystem::ReadFile(
+                pipe.as_raw_handle(),
+                chunk.as_mut_ptr().cast(),
+                chunk_length,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        } == 0
+            || read == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to read the registered service identity probe response");
+        }
+        response.extend_from_slice(&chunk[..read as usize]);
+    }
 }
 
 #[cfg(test)]
@@ -191,5 +270,19 @@ mod tests {
     #[test]
     fn identity_probe_rejects_header_injection() {
         assert!(super::identity_probe_request("expected\r\nInjected: yes").is_none());
+    }
+
+    #[test]
+    fn identity_probe_requires_a_complete_success_response() {
+        let valid = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nTunglies!";
+        let partial = &valid[..valid.len() - 1];
+        let rejected = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+
+        assert_eq!(super::completed_identity_probe_response(partial), None);
+        assert_eq!(super::completed_identity_probe_response(valid), Some(true));
+        assert_eq!(
+            super::completed_identity_probe_response(rejected),
+            Some(false)
+        );
     }
 }
