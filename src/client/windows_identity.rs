@@ -9,7 +9,7 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 #[cfg(not(feature = "test"))]
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
 };
 #[cfg(not(feature = "test"))]
 use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
@@ -41,10 +41,23 @@ fn trusted_service_identity(
         && account.is_some_and(is_local_system_account)
 }
 
+fn identity_probe_request(auth_value: &str) -> Option<Vec<u8>> {
+    if auth_value.contains(['\r', '\n']) {
+        return None;
+    }
+    Some(
+        format!(
+            "GET /magic HTTP/1.1\r\nHost: localhost\r\nX-IPC-Magic: {auth_value}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes(),
+    )
+}
+
 #[cfg(not(feature = "test"))]
 pub(super) fn verify_registered_service_pipe(
     pipe_path: &str,
     service_name: &str,
+    auth_value: &str,
 ) -> Result<OwnedHandle> {
     let mut wide: Vec<u16> = OsStr::new(pipe_path).encode_wide().collect();
     if wide.contains(&0) {
@@ -59,7 +72,7 @@ pub(super) fn verify_registered_service_pipe(
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             std::ptr::null(),
             OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,
+            0,
             std::ptr::null_mut(),
         )
     };
@@ -100,6 +113,26 @@ pub(super) fn verify_registered_service_pipe(
         bail!(
             "Windows named-pipe server does not match the registered LocalSystem service process"
         );
+    }
+
+    let request = identity_probe_request(auth_value)
+        .context("IPC authentication value cannot contain HTTP line breaks")?;
+    let request_length =
+        u32::try_from(request.len()).context("IPC identity probe request is too large")?;
+    let mut written = 0;
+    if unsafe {
+        WriteFile(
+            pipe.as_raw_handle(),
+            request.as_ptr().cast(),
+            request_length,
+            &mut written,
+            std::ptr::null_mut(),
+        )
+    } == 0
+        || written != request_length
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to complete the verified service identity probe");
     }
     Ok(pipe)
 }
@@ -143,5 +176,20 @@ mod tests {
             Some(4242),
             Some(OsStr::new("NT AUTHORITY\\SYSTEM")),
         ));
+    }
+
+    #[test]
+    fn identity_probe_is_a_complete_connection_close_request() {
+        let request = super::identity_probe_request("expected").expect("valid auth value");
+        let request = String::from_utf8(request).expect("request is ASCII");
+
+        assert!(request.starts_with("GET /magic HTTP/1.1\r\n"));
+        assert!(request.contains("X-IPC-Magic: expected\r\n"));
+        assert!(request.ends_with("Connection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn identity_probe_rejects_header_injection() {
+        assert!(super::identity_probe_request("expected\r\nInjected: yes").is_none());
     }
 }

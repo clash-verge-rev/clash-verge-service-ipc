@@ -71,8 +71,11 @@ pub async fn connect() -> Result<IpcHttpClient> {
     let c = { CLIENT_CONFIG.read().await.clone() }.unwrap_or_default();
     debug!("Using config: {:?}", c);
     #[cfg(all(windows, not(feature = "test")))]
-    let _verified_windows_server =
-        windows_identity::verify_registered_service_pipe(IPC_PATH, crate::WINDOWS_SERVICE_NAME)?;
+    let _verified_windows_server = windows_identity::verify_registered_service_pipe(
+        IPC_PATH,
+        crate::WINDOWS_SERVICE_NAME,
+        IPC_AUTH_EXPECT,
+    )?;
     let client = kode_bridge::IpcHttpClient::with_config(
         IPC_PATH,
         ClientConfig {
