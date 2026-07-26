@@ -25,6 +25,9 @@ pub fn init_tracing_for_tests() {
     });
 }
 
+// Each test binary compiles this module separately and uses a different part of it; a helper one
+// binary does not need is not an unused helper.
+#[allow(dead_code)]
 pub fn owner_credentials() -> OwnerCredentials {
     let app_data_dir =
         std::env::temp_dir().join(format!("service-ipc-owner-{}", std::process::id()));

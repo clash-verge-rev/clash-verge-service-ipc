@@ -290,6 +290,18 @@ impl CoreManager {
         }
     }
 
+    /// The configuration a core is currently running with, if one is.
+    ///
+    /// Staging is defined relative to a live core: it writes into the generation that core was
+    /// started in and reasons about the binary it was started from. Both facts live only here,
+    /// which is why the decision to stage or to restart cannot be made by the client.
+    pub(super) async fn running_core_config(&self) -> Option<ClashConfig> {
+        if self.running_pid.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        self.running_config.lock().await.clone()
+    }
+
     pub async fn start_core(&self, config: ClashConfig, owner: OwnerIdentity) -> Result<()> {
         ensure_startup_reconciled()?;
         set_core_lifecycle_state(ServiceLifecycleState::Starting);

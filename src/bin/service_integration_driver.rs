@@ -91,6 +91,7 @@ async fn start_flow() -> anyhow::Result<()> {
     let config = RuntimeBundle {
         yaml: "mode: rule\n".to_string(),
         assets: vec![],
+        remote_providers: Vec::new(),
         core_path: mock_binary_path()?,
     };
     let response = start_clash(

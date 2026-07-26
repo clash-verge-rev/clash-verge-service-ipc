@@ -13,6 +13,7 @@ use crate::core::legacy_cleanup::cleanup_legacy_owner_files;
 use crate::core::logger::set_or_update_writer;
 use crate::core::manager::{CORE_MANAGER, LOGGER_MANAGER};
 use crate::core::paths::service_paths;
+use crate::core::staging::stage_runtime;
 use crate::core::state::{set_core_lifecycle_state, set_service_lifecycle_state};
 use crate::core::status::service_status_snapshot;
 use crate::core::structure::{OwnerSessionProof, Response, ServiceLifecycleState};
@@ -20,7 +21,7 @@ use crate::core::{apply_proxy, apply_proxy_or_direct, clear_proxy, validate_prox
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IpcCommand, MIN_SUPPORTED_CLIENT_REVISION,
     MacosProxyConfig, OwnerSessionHandle, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome,
-    SERVICE_PROTOCOL_HEADER, StartClashRequest, StartClashResult, WriterConfig,
+    RuntimeBundle, SERVICE_PROTOCOL_HEADER, StartClashRequest, StartClashResult, WriterConfig,
 };
 use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
@@ -756,6 +757,35 @@ fn create_ipc_router() -> Result<Router> {
                 return service_unavailable(format!("Failed to clear active owner: {}", e));
             }
             ok_empty("Core stopped successfully")
+        })
+        .put(IpcCommand::StageRuntime.as_ref(), |ctx| async move {
+            trace!("Received StageRuntime command");
+            if let Err(error) = require_protocol_version(&ctx) {
+                return service_error(error);
+            }
+            let request = match ctx.json::<AuthenticatedSessionRequest<RuntimeBundle>>() {
+                Ok(request) => request,
+                Err(error) => return bad_request(format!("Invalid JSON: {error}")),
+            };
+            let owner = match authenticate_owner(&ctx, &request.credentials) {
+                Ok(owner) => owner,
+                Err(error) => return service_error(error),
+            };
+            // Held for the whole operation, and for the same reason `StartClash` holds it: a core
+            // must not be stopped, started, or handed to another owner while its generation is
+            // being rewritten underneath it.
+            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+            // Proof of the current session, not merely of the owner. Staging writes into the
+            // directory the *running* core reads from, so an app that no longer owns that core —
+            // a second instance of the same user, or one whose core was replaced — must not be
+            // able to reach it.
+            if let Err(error) = require_active_session(&owner, &request.session).await {
+                return service_error(error);
+            }
+            match stage_runtime(&owner, &request.payload).await {
+                Ok(outcome) => ok_json(outcome),
+                Err(error) => service_error(error),
+            }
         })
         .put(IpcCommand::UpdateWriter.as_ref(), |ctx| async move {
             trace!("Received UpdateWriter command");

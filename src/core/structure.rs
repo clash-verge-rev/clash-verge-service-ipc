@@ -59,6 +59,16 @@ impl ProtocolInfo {
             && self.protocol.revision >= min_service_revision
             && client.revision >= self.min_client_revision
     }
+
+    /// Whether this service can stage a runtime in place instead of being stopped and restarted.
+    ///
+    /// Deliberately finer-grained than `supports_client`: an installed service that predates
+    /// staging is still fully *compatible*, so it must not be pushed into a reinstall. Callers
+    /// gate the fast path on this and fall back to stop + start when it is false.
+    pub const fn supports_runtime_staging(&self) -> bool {
+        self.protocol.epoch == ProtocolVersion::current().epoch
+            && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,16 +103,40 @@ pub struct AuthenticatedSessionRequest<T> {
     pub payload: T,
 }
 
+/// A file the client owns and the service copies into the runtime generation.
+///
+/// The distinction from [`RemoteProvider`] is who writes the file: these are copied in by the
+/// service and can therefore be compared against their source, so an unchanged one is skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeAsset {
     pub source: String,
     pub destination: String,
 }
 
+/// A provider file the *core* fetches and owns; the service never writes it.
+///
+/// Recorded only so the service can tell a reusable download cache from a stale one. The core
+/// will not re-fetch a provider whose file already exists, so when `url` changes underneath an
+/// unchanged `destination` the cache must be deleted before the core reloads — otherwise it
+/// keeps serving the previous source's content until the provider's own interval elapses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteProvider {
+    pub destination: String,
+    pub url: String,
+}
+
+/// The complete declaration of what a runtime generation should contain.
+///
+/// "Complete" is load-bearing: staging decides what to delete by subtracting this declaration
+/// from what is on disk, so anything omitted here is something staging cannot reason about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeBundle {
     pub yaml: String,
     pub assets: Vec<RuntimeAsset>,
+    /// Absent on the wire from clients older than revision 2; an empty list simply means
+    /// staging cannot distinguish a reusable cache from a stale one and keeps neither.
+    #[serde(default)]
+    pub remote_providers: Vec<RemoteProvider>,
     pub core_path: String,
 }
 
@@ -144,6 +178,39 @@ pub struct OwnerSessionHandle {
 pub struct StartClashResult {
     pub session: OwnerSessionHandle,
     pub proxy_outcome: ProxyApplyOutcome,
+}
+
+/// What staging a bundle into the running core's generation achieved.
+///
+/// `RestartRequired` is an outcome, not an error: staging is an optimisation that is allowed to
+/// decline. Every way of declining leaves the generation exactly as the running core left it,
+/// so the caller can fall back to stop + start — which builds a fresh generation and therefore
+/// has none of the constraints that made staging decline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum StageRuntimeOutcome {
+    /// The generation now matches the bundle. The core still runs the previous configuration
+    /// until the caller points it at `config_path`.
+    Staged {
+        config_path: String,
+    },
+    RestartRequired {
+        reason: StageRejection,
+    },
+}
+
+/// Why staging declined. Each variant is a fact only the service can establish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum StageRejection {
+    /// No core is running, so there is nothing to reload into.
+    CoreNotRunning,
+    /// The bundle names a different core binary. A configuration reload would succeed and
+    /// silently leave the previous binary running, which is worse than declining.
+    CorePathChanged,
+    /// A file that had to be replaced or removed could not be. Expected on Windows, where the
+    /// running core holds handles on its provider files.
+    RuntimeUnwritable { detail: String },
 }
 
 #[repr(u16)]
@@ -306,6 +373,7 @@ mod tests {
             runtime: RuntimeBundle {
                 yaml: "mode: rule\n".to_owned(),
                 assets: Vec::new(),
+                remote_providers: Vec::new(),
                 core_path: "/tmp/mihomo".to_owned(),
             },
             proposed_session_token: "11".repeat(32),

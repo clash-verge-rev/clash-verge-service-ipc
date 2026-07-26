@@ -280,6 +280,7 @@ mod tests {
         let runtime_bundle = RuntimeBundle {
             yaml: "mode: rule\n".to_string(),
             assets: vec![],
+            remote_providers: Vec::new(),
             core_path: crash_binary.to_string_lossy().to_string(),
         };
         let proposed_session_token = "41".repeat(32);

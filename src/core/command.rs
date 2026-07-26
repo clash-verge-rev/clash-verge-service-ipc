@@ -21,6 +21,8 @@ pub enum IpcCommand {
     StartClash,
     #[strum(serialize = "/clash/stop")]
     StopClash,
+    #[strum(serialize = "/clash/stage-runtime")]
+    StageRuntime,
     #[strum(serialize = "/system-proxy")]
     SetSystemProxy,
     #[strum(serialize = "/writer")]

@@ -270,6 +270,7 @@ fn windows_runtime_bundle(yaml: &str) -> Result<RuntimeBundle> {
     Ok(RuntimeBundle {
         yaml: yaml.to_owned(),
         assets: vec![],
+        remote_providers: Vec::new(),
         core_path: mock_binary.to_string_lossy().into_owned(),
     })
 }
@@ -513,6 +514,7 @@ async fn same_owner_restart_concurrent_start_and_failed_update_remain_atomic() -
     let bundle = RuntimeBundle {
         yaml: "mode: rule\n".to_string(),
         assets: vec![],
+        remote_providers: Vec::new(),
         core_path: mock_binary.to_string_lossy().into_owned(),
     };
 
@@ -580,6 +582,7 @@ async fn same_owner_restart_concurrent_start_and_failed_update_remain_atomic() -
     assert!(committed.desired_core_should_be_running);
 
     let invalid = RuntimeBundle {
+        remote_providers: Vec::new(),
         core_path: mock_binary
             .with_file_name("missing-core")
             .to_string_lossy()
@@ -698,6 +701,7 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
     let bundle = RuntimeBundle {
         yaml: "mode: rule\n".to_string(),
         assets: vec![],
+        remote_providers: Vec::new(),
         core_path: test_bin_path("mock_binary").to_string_lossy().into_owned(),
     };
 
@@ -784,6 +788,7 @@ async fn different_owner_takeover_routes_failure_and_restore_are_isolated() -> R
         0
     );
     let no_ipc_bundle = RuntimeBundle {
+        remote_providers: Vec::new(),
         core_path: test_bin_path("no_ipc_binary")
             .to_string_lossy()
             .into_owned(),

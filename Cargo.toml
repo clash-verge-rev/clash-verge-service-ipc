@@ -1,6 +1,6 @@
 [package]
 name = "clash_verge_service_ipc"
-version = "2.5.3"
+version = "2.6.0"
 edition = "2024"
 authors = ["Tunglies"]
 license = "GPL-3.0"
@@ -42,6 +42,11 @@ required-features = ["test"]
 [[bin]]
 name = "owner_lock_holder"
 path = "src/bin/owner_lock_holder.rs"
+required-features = ["standalone", "test"]
+
+[[bin]]
+name = "asset_lock_holder"
+path = "src/bin/asset_lock_holder.rs"
 required-features = ["standalone", "test"]
 
 [[bin]]

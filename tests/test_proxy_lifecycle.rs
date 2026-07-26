@@ -78,6 +78,7 @@ async fn client_uses_versioned_session_aware_proxy_lifecycle() -> Result<()> {
     let bundle = RuntimeBundle {
         yaml: "mode: rule\n".to_owned(),
         assets: vec![],
+        remote_providers: Vec::new(),
         core_path: test_bin_path("mock_binary").to_string_lossy().into_owned(),
     };
     let proposed_session_token = "11".repeat(32);
@@ -115,6 +116,7 @@ async fn client_uses_versioned_session_aware_proxy_lifecycle() -> Result<()> {
             runtime: RuntimeBundle {
                 yaml: "mode: rule\n".to_owned(),
                 assets: vec![],
+                remote_providers: Vec::new(),
                 core_path: test_bin_path("mock_binary").to_string_lossy().into_owned(),
             },
             proposed_session_token: "22".repeat(32),
@@ -155,6 +157,7 @@ async fn owner_b_cannot_overtake_owner_a_proxy_operation() -> Result<()> {
     let bundle = RuntimeBundle {
         yaml: "mode: rule\n".to_owned(),
         assets: vec![],
+        remote_providers: Vec::new(),
         core_path: test_bin_path("mock_binary").to_string_lossy().into_owned(),
     };
 

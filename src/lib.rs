@@ -11,10 +11,10 @@ pub use channel::{
 pub use core::{
     AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreConfig, IpcCommand,
     MacosProxyConfig, OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, OwnerSessionHandle,
-    OwnerSessionProof, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeAsset,
-    RuntimeBundle, SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode,
-    ServiceLifecycleState, ServiceStatusSnapshot, StartClashRequest, StartClashResult,
-    WriterConfig, mihomo_ipc_path, owner_key,
+    OwnerSessionProof, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RemoteProvider,
+    RuntimeAsset, RuntimeBundle, SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode,
+    ServiceLifecycleState, ServiceStatusSnapshot, StageRejection, StageRuntimeOutcome,
+    StartClashRequest, StartClashResult, WriterConfig, mihomo_ipc_path, owner_key,
 };
 pub use core::{OwnerPaths, ServicePaths, service_paths};
 
@@ -81,6 +81,12 @@ pub static IPC_AUTH_EXPECT: &str = r#"A thing of beauty is a joy for ever. Its l
 
 pub static VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_EPOCH: u16 = 2;
-pub const PROTOCOL_REVISION: u16 = 1;
+pub const PROTOCOL_REVISION: u16 = 2;
 pub const MIN_SUPPORTED_CLIENT_REVISION: u16 = 1;
 pub const MIN_REQUIRED_SERVICE_REVISION: u16 = 1;
+/// Revision that introduced `/clash/stage-runtime`.
+///
+/// Kept apart from `MIN_REQUIRED_SERVICE_REVISION`, which must stay at the oldest revision a
+/// client can still talk to: an installed service without staging is fully usable and must not
+/// be pushed into a reinstall just because it cannot take the fast path.
+pub const MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING: u16 = 2;

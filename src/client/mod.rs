@@ -16,8 +16,8 @@ mod windows_identity;
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
     MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof,
-    ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, ServiceStatusSnapshot, StartClashRequest,
-    StartClashResult, WriterConfig,
+    ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, ServiceStatusSnapshot,
+    StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
@@ -209,6 +209,33 @@ pub async fn stop_clash(
         .send()
         .await?
         .json::<Response<()>>()?;
+    Ok(response)
+}
+
+/// Ask the service to make the running core's generation match `body`, without restarting it.
+///
+/// Returns what the service decided, not whether it worked: a service that declines reports
+/// `RestartRequired` with a `code` of zero. Only the caller can act on that, by stopping and
+/// starting the core the way it did before staging existed. Gate the call on
+/// [`ProtocolInfo::supports_runtime_staging`] — an older service has no such route at all.
+pub async fn stage_runtime(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    body: &RuntimeBundle,
+) -> Result<Response<StageRuntimeOutcome>> {
+    let client = connect().await?;
+    let payload = AuthenticatedSessionRequest {
+        credentials: credentials.clone(),
+        session: session.clone(),
+        payload: body.clone(),
+    }
+    .to_json_value()?;
+    let response = protected(client.put(IpcCommand::StageRuntime.as_ref()))
+        .timeout(LIFECYCLE_TIMEOUT)
+        .json_body(&payload)
+        .send()
+        .await?
+        .json::<Response<StageRuntimeOutcome>>()?;
     Ok(response)
 }
 

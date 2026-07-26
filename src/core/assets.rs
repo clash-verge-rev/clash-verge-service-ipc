@@ -205,7 +205,10 @@ async fn remove_runtime_directory(path: &Path, operation: &str) -> std::io::Resu
 }
 
 #[cfg(windows)]
-fn runtime_cleanup_retry_delay(error: &std::io::Error, retry_index: usize) -> Option<Duration> {
+pub(crate) fn runtime_cleanup_retry_delay(
+    error: &std::io::Error,
+    retry_index: usize,
+) -> Option<Duration> {
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_DELETE_PENDING, ERROR_DIR_NOT_EMPTY, ERROR_SHARING_VIOLATION,
     };
@@ -223,7 +226,10 @@ fn runtime_cleanup_retry_delay(error: &std::io::Error, retry_index: usize) -> Op
 }
 
 #[cfg(not(windows))]
-fn runtime_cleanup_retry_delay(_error: &std::io::Error, _retry_index: usize) -> Option<Duration> {
+pub(crate) fn runtime_cleanup_retry_delay(
+    _error: &std::io::Error,
+    _retry_index: usize,
+) -> Option<Duration> {
     None
 }
 
@@ -348,7 +354,7 @@ async fn materialize_runtime(
     Ok(())
 }
 
-fn validate_core_path(
+pub(crate) fn validate_core_path(
     owner: &AuthenticatedOwner,
     core_path: &str,
 ) -> Result<PathBuf, ServiceError> {
@@ -382,7 +388,7 @@ fn validate_core_path(
     Ok(canonical)
 }
 
-fn validate_source(
+pub(crate) fn validate_source(
     owner: &AuthenticatedOwner,
     app_bundle_root: Option<&Path>,
     source: &str,
@@ -417,7 +423,7 @@ fn canonical_regular_file(path: &Path, label: &str) -> Result<PathBuf, ServiceEr
         .map_err(|error| invalid_asset(format!("failed to canonicalize {label}: {error}")))
 }
 
-fn validate_destination(destination: &str) -> Result<PathBuf, ServiceError> {
+pub(crate) fn validate_destination(destination: &str) -> Result<PathBuf, ServiceError> {
     let path = Path::new(destination);
     if path.as_os_str().is_empty()
         || path.is_absolute()
@@ -432,7 +438,7 @@ fn validate_destination(destination: &str) -> Result<PathBuf, ServiceError> {
     Ok(path.to_path_buf())
 }
 
-fn application_bundle_root(core_path: &Path) -> Option<PathBuf> {
+pub(crate) fn application_bundle_root(core_path: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         core_path
@@ -447,7 +453,7 @@ fn application_bundle_root(core_path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn invalid_asset(message: impl Into<String>) -> ServiceError {
+pub(crate) fn invalid_asset(message: impl Into<String>) -> ServiceError {
     ServiceError::new(ServiceErrorCode::InvalidRuntimeAsset, message)
 }
 
@@ -625,6 +631,7 @@ mod tests {
                     .into_owned(),
                 destination: "providers/copied.yaml".to_string(),
             }],
+            remote_providers: Vec::new(),
             core_path: app_root.join("mihomo").to_string_lossy().into_owned(),
         };
 
@@ -664,6 +671,7 @@ mod tests {
                 source: canonical_source.to_string_lossy().into_owned(),
                 destination: "providers/copied.yaml".to_string(),
             }],
+            remote_providers: Vec::new(),
             core_path: app_root.join("mihomo").to_string_lossy().into_owned(),
         };
 
@@ -693,6 +701,7 @@ mod tests {
         let valid = RuntimeBundle {
             yaml: "mode: rule\n".to_string(),
             assets: vec![],
+            remote_providers: Vec::new(),
             core_path: app_root.join("mihomo").to_string_lossy().into_owned(),
         };
         let prepared = prepare_runtime(&owner, &valid).await?;
@@ -706,6 +715,7 @@ mod tests {
                     .into_owned(),
                 destination: "../escape".to_string(),
             }],
+            remote_providers: Vec::new(),
             core_path: valid.core_path,
         };
 

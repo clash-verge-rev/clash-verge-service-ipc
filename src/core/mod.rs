@@ -5,9 +5,10 @@ pub mod structure;
 pub use structure::{
     AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreConfig, MacosProxyConfig,
     OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, OwnerSessionHandle, OwnerSessionProof,
-    ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeAsset, RuntimeBundle,
+    ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RemoteProvider, RuntimeAsset, RuntimeBundle,
     SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState,
-    ServiceStatusSnapshot, StartClashRequest, StartClashResult, WriterConfig, owner_key,
+    ServiceStatusSnapshot, StageRejection, StageRuntimeOutcome, StartClashRequest,
+    StartClashResult, WriterConfig, owner_key,
 };
 
 pub mod paths;
@@ -45,6 +46,8 @@ mod repair;
 mod runtime;
 #[cfg(feature = "standalone")]
 mod server;
+#[cfg(feature = "standalone")]
+mod staging;
 #[cfg(feature = "standalone")]
 mod state;
 #[cfg(feature = "standalone")]
