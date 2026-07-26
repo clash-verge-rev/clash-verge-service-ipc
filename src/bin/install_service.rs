@@ -194,7 +194,9 @@ fn wait_for_service_ready() -> Result<(), Error> {
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
+// Only launchd code calls this, and the tests below exercise the plan classifier rather than the
+// target string — so widening the gate to `test` only made it dead code everywhere but macOS.
+#[cfg(target_os = "macos")]
 fn launchd_service_target() -> String {
     format!("system/{}", clash_verge_service_ipc::MACOS_SERVICE_ID)
 }

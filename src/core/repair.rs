@@ -38,7 +38,7 @@ pub fn acquire_service_repair_gate() -> Result<Option<ServiceRepairGate>> {
         if error.kind() == std::io::ErrorKind::WouldBlock {
             return Ok(None);
         }
-        return Err(error).with_context(|| format!("failed to lock service repair gate {path:?}"));
+        Err(error).with_context(|| format!("failed to lock service repair gate {path:?}"))
     }
 
     #[cfg(windows)]
