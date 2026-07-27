@@ -768,6 +768,15 @@ mod tests {
     use serial_test::serial;
 
     fn test_owner(app_data_root: std::path::PathBuf) -> AuthenticatedOwner {
+        // `ensure_service_directory` creates one level and then hardens it, so it needs its parent
+        // to exist. In production the installer provides that; the integration tests get it as a
+        // side effect of starting the IPC server. These tests start nothing, so they provide it —
+        // relaxing the hardening helper into `create_dir_all` instead would create the
+        // intermediate directories of a privileged path unhardened.
+        if let Some(root) = std::path::Path::new(crate::IPC_PATH).parent() {
+            std::fs::create_dir_all(root).expect("test IPC root must be creatable");
+        }
+
         let uid = unsafe { platform_lib::geteuid() };
         let gid = unsafe { platform_lib::getegid() };
         AuthenticatedOwner {

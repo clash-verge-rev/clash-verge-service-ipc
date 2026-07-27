@@ -38,6 +38,7 @@ async fn wait_for_ipc() -> Result<()> {
     anyhow::bail!("IPC server did not become ready")
 }
 
+#[cfg(unix)]
 async fn proxy_barrier_post(action: &str) -> Result<()> {
     let client = connect().await?;
     let response = client
@@ -52,6 +53,7 @@ async fn proxy_barrier_post(action: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 async fn proxy_barrier_wait(event: &str) -> Result<()> {
     let client = connect().await?;
     let response = client
