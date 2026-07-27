@@ -204,6 +204,20 @@ async fn remove_runtime_directory(path: &Path, operation: &str) -> std::io::Resu
     }
 }
 
+/// Whether a Windows failure is one that another attempt could get past.
+///
+/// The first four are what a handle held on a file or directory produces while it is being removed.
+/// The `MoveFileEx` codes were added when this started being used for *replacing* a file and not
+/// only for removing a directory: a replacement whose target is in the delete-pending state a held
+/// handle leaves behind fails with one of them rather than with a sharing violation.
+///
+/// `ERROR_USER_MAPPED_FILE` is the one a memory-mapped file gives, and retrying it will not help
+/// while the mapping lives — it is here so the wait is bounded and the caller reaches its "give up
+/// and restart the core" path rather than treating it as a hard failure.
+///
+/// Which of these actually occur cannot be established on a machine that cannot build for Windows;
+/// the set errs towards retrying, and the cost of a wrong guess is a bounded delay before the
+/// caller falls back.
 #[cfg(windows)]
 pub(crate) fn runtime_cleanup_retry_delay(
     error: &std::io::Error,
@@ -211,6 +225,8 @@ pub(crate) fn runtime_cleanup_retry_delay(
 ) -> Option<Duration> {
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_DELETE_PENDING, ERROR_DIR_NOT_EMPTY, ERROR_SHARING_VIOLATION,
+        ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2,
+        ERROR_UNABLE_TO_REMOVE_REPLACED, ERROR_USER_MAPPED_FILE,
     };
 
     matches!(
@@ -220,6 +236,10 @@ pub(crate) fn runtime_cleanup_retry_delay(
                 || code == ERROR_SHARING_VIOLATION as i32
                 || code == ERROR_DIR_NOT_EMPTY as i32
                 || code == ERROR_DELETE_PENDING as i32
+                || code == ERROR_UNABLE_TO_REMOVE_REPLACED as i32
+                || code == ERROR_UNABLE_TO_MOVE_REPLACEMENT as i32
+                || code == ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32
+                || code == ERROR_USER_MAPPED_FILE as i32
     )
     .then(|| WINDOWS_RUNTIME_RETRY_DELAYS.get(retry_index).copied())
     .flatten()
@@ -325,21 +345,45 @@ async fn materialize_runtime(
     set_private_directory_permissions(runtime).await?;
 
     let app_bundle_root = application_bundle_root(core_path);
+    let mut manifest = crate::core::staging::RuntimeManifest::default();
+    let mut asset_destinations = std::collections::BTreeSet::new();
     for asset in &bundle.assets {
         let source = validate_source(owner, app_bundle_root.as_deref(), &asset.source)?;
-        let destination = validate_destination(&asset.destination)?;
-        let target = runtime.join(destination);
+        let key = destination_key(&validate_destination(&asset.destination)?)?;
+        let target = runtime.join(&key);
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|error| {
                 invalid_asset(format!("failed to create runtime asset directory: {error}"))
             })?;
         }
+        let metadata = tokio::fs::metadata(&source).await.map_err(|error| {
+            invalid_asset(format!(
+                "failed to inspect runtime asset {source:?}: {error}"
+            ))
+        })?;
         tokio::fs::copy(&source, &target).await.map_err(|error| {
             invalid_asset(format!("failed to copy runtime asset {source:?}: {error}"))
         })?;
+        asset_destinations.insert(key.clone());
+        manifest.assets.insert(
+            key,
+            crate::core::staging::SourceIdentity {
+                source: source.to_string_lossy().into_owned(),
+                len: metadata.len(),
+                mtime_ns: crate::core::staging::modified_nanos(&metadata),
+            },
+        );
+    }
+    for provider in crate::core::staging::declared_remote_providers(
+        &bundle.remote_providers,
+        &asset_destinations,
+    )? {
+        manifest
+            .remote_providers
+            .insert(provider.destination, provider.url);
     }
 
-    let config_path = runtime.join("config.yaml");
+    let config_path = runtime.join(RUNTIME_CONFIG_FILE_NAME);
     let mut config = tokio::fs::File::create(&config_path)
         .await
         .map_err(|error| invalid_asset(format!("failed to create runtime config: {error}")))?;
@@ -351,6 +395,30 @@ async fn materialize_runtime(
         .sync_all()
         .await
         .map_err(|error| invalid_asset(format!("failed to sync runtime config: {error}")))?;
+
+    // Record what was just written, so the first staging into this generation can tell an
+    // unchanged asset from a changed one and a reusable download cache from a stale one. Without
+    // it that first staging re-copies every geo database and discards every cache the core has
+    // fetched since start — correct, but paying the whole cost staging exists to avoid.
+    //
+    // A manifest that cannot be written is not a reason to refuse to start a core. Its absence is
+    // already a defined state: the next staging proves nothing and does the slow thing.
+    let manifest_path = runtime.join(crate::core::staging::MANIFEST_FILE_NAME);
+    match serde_json::to_vec(&manifest) {
+        Ok(encoded) => {
+            if let Err(error) =
+                crate::core::staging::write_atomically(&manifest_path, &encoded).await
+            {
+                tracing::warn!(
+                    error = %error,
+                    "Started without a runtime manifest; the first configuration change will re-copy every asset"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "Could not encode the initial runtime manifest")
+        }
+    }
     Ok(())
 }
 
@@ -436,6 +504,65 @@ pub(crate) fn validate_destination(destination: &str) -> Result<PathBuf, Service
         ));
     }
     Ok(path.to_path_buf())
+}
+
+/// The file a runtime generation's configuration always lives in.
+pub(crate) const RUNTIME_CONFIG_FILE_NAME: &str = "config.yaml";
+/// The infix every file staging writes as a temporary carries.
+pub(crate) const STAGING_TEMP_INFIX: &str = ".staging-";
+
+/// Reduce a validated destination to the single string form used as its key everywhere.
+///
+/// Built by reassembling the validated components, never by rewriting separators in the client's
+/// own string. That distinction is the whole point: `validate_destination` accepts a destination
+/// because every component is `Normal`, and on Unix a backslash is an ordinary character *inside*
+/// a component — so rewriting `\` to `/` afterwards turns a filename the validator accepted back
+/// into a path, and `..\..\etc\thing` becomes a traversal the validator already approved.
+///
+/// Also refuses the names the generation directory owns. A bundle that could claim `config.yaml`
+/// could have its configuration deleted by the next staging's housekeeping sweep; one that could
+/// claim the manifest could rewrite the record staging trusts; one that could claim a staging
+/// temporary could be clobbered mid-write.
+pub(crate) fn destination_key(destination: &Path) -> Result<String, ServiceError> {
+    let mut parts = Vec::new();
+    for component in destination.components() {
+        let Component::Normal(part) = component else {
+            return Err(invalid_asset(
+                "runtime asset destination must be a non-traversing relative path",
+            ));
+        };
+        let part = part.to_string_lossy();
+        if part.contains(STAGING_TEMP_INFIX) {
+            return Err(invalid_asset(format!(
+                "runtime asset destination {part:?} is reserved for staging temporaries"
+            )));
+        }
+        parts.push(part.into_owned());
+    }
+    match parts.as_slice() {
+        [] => Err(invalid_asset("runtime asset destination is empty")),
+        [only]
+            if only == RUNTIME_CONFIG_FILE_NAME
+                || only == crate::core::staging::MANIFEST_FILE_NAME =>
+        {
+            Err(invalid_asset(format!(
+                "runtime asset destination {only:?} is owned by the runtime generation"
+            )))
+        }
+        _ => Ok(parts.join("/")),
+    }
+}
+
+/// Resolve a recorded destination inside `generation`, refusing anything that would leave it.
+///
+/// Applied to keys read back from the manifest as well as to keys from the bundle: the manifest is
+/// a file, and a file is a thing that can be wrong.
+pub(crate) fn resolve_in_generation(
+    generation: &Path,
+    destination: &str,
+) -> Result<PathBuf, ServiceError> {
+    let key = destination_key(&validate_destination(destination)?)?;
+    Ok(generation.join(key))
 }
 
 pub(crate) fn application_bundle_root(core_path: &Path) -> Option<PathBuf> {

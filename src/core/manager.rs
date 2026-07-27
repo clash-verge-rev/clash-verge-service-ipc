@@ -290,16 +290,24 @@ impl CoreManager {
         }
     }
 
-    /// The configuration a core is currently running with, if one is.
+    /// The pid and configuration of the core currently running, if one is.
     ///
     /// Staging is defined relative to a live core: it writes into the generation that core was
     /// started in and reasons about the binary it was started from. Both facts live only here,
     /// which is why the decision to stage or to restart cannot be made by the client.
-    pub(super) async fn running_core_config(&self) -> Option<ClashConfig> {
-        if self.running_pid.load(Ordering::Relaxed) == 0 {
+    ///
+    /// The pid is read *after* the configuration guard is held, and it is returned alongside the
+    /// configuration rather than merely checked. The watchdog clears it from a task that holds no
+    /// lock, so reading it first would let this hand back the configuration of a core that had
+    /// already died; and the caller needs the value itself in order to notice a core replaced
+    /// underneath it later on.
+    pub(super) async fn running_core_config(&self) -> Option<(u32, ClashConfig)> {
+        let config = self.running_config.lock().await;
+        let pid = self.running_pid.load(Ordering::Acquire);
+        if pid == 0 {
             return None;
         }
-        self.running_config.lock().await.clone()
+        config.clone().map(|config| (pid, config))
     }
 
     pub async fn start_core(&self, config: ClashConfig, owner: OwnerIdentity) -> Result<()> {
@@ -334,7 +342,7 @@ impl CoreManager {
             if let Err(kill_error) = child_guard.kill_now().await {
                 let now_secs = unix_timestamp_secs();
                 self.running_pid
-                    .store(child_pid.unwrap_or_default(), Ordering::Relaxed);
+                    .store(child_pid.unwrap_or_default(), Ordering::Release);
                 *self.running_config.lock().await = Some(config.clone());
                 *self.core_start_time.lock().await = Some(Instant::now());
                 self.core_started_at.store(now_secs, Ordering::Relaxed);
@@ -362,7 +370,7 @@ impl CoreManager {
             if let Err(kill_error) = child_guard.kill_now().await {
                 let now_secs = unix_timestamp_secs();
                 self.running_pid
-                    .store(child_pid.unwrap_or_default(), Ordering::Relaxed);
+                    .store(child_pid.unwrap_or_default(), Ordering::Release);
                 *self.running_config.lock().await = Some(config.clone());
                 *self.core_start_time.lock().await = Some(Instant::now());
                 self.core_started_at.store(now_secs, Ordering::Relaxed);
@@ -379,7 +387,7 @@ impl CoreManager {
         self.core_started_at
             .store(unix_timestamp_secs(), Ordering::Relaxed);
         self.running_pid
-            .store(child_pid.unwrap_or_default(), Ordering::Relaxed);
+            .store(child_pid.unwrap_or_default(), Ordering::Release);
         *self.running_config.lock().await = Some(config.clone());
 
         self.start_watchdog(child_guard, config, owner).await;
@@ -405,7 +413,7 @@ impl CoreManager {
             watchdog_result?;
         }
 
-        self.running_pid.store(0, Ordering::Relaxed);
+        self.running_pid.store(0, Ordering::Release);
         *self.core_start_time.lock().await = None;
         self.core_started_at.store(0, Ordering::Relaxed);
 
@@ -494,7 +502,7 @@ impl CoreManager {
                 set_core_lifecycle_state(ServiceLifecycleState::RecoveringCore);
 
                 let _ = current_guard.take();
-                running_pid_arc.store(0, Ordering::Relaxed);
+                running_pid_arc.store(0, Ordering::Release);
                 started_at_arc.store(0, Ordering::Relaxed);
                 remove_core_runtime_record().await;
 
@@ -616,7 +624,7 @@ impl CoreManager {
                                 recovery_exhausted = true;
                                 break 'watchdog;
                             }
-                            running_pid_arc.store(new_pid.unwrap_or_default(), Ordering::Relaxed);
+                            running_pid_arc.store(new_pid.unwrap_or_default(), Ordering::Release);
                             *start_time_arc.lock().await = Some(Instant::now());
                             let now_secs = unix_timestamp_secs();
                             started_at_arc.store(now_secs, Ordering::Relaxed);
@@ -644,7 +652,7 @@ impl CoreManager {
                 }
             }
 
-            running_pid_arc.store(0, Ordering::Relaxed);
+            running_pid_arc.store(0, Ordering::Release);
             *start_time_arc.lock().await = None;
             started_at_arc.store(0, Ordering::Relaxed);
             remove_core_runtime_record().await;

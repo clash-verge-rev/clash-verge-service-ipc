@@ -104,6 +104,15 @@ struct RunningCore {
 }
 
 async fn start_core(label: &str, initial: &str) -> Result<RunningCore> {
+    let initial = initial.to_owned();
+    start_core_with(label, move |app_root| Ok(bundle(app_root, &initial))).await
+}
+
+/// Start a core from a bundle the caller builds, for tests about what the *start* path recorded.
+async fn start_core_with<Build>(label: &str, build: Build) -> Result<RunningCore>
+where
+    Build: FnOnce(&Path) -> Result<RuntimeBundle>,
+{
     let app_root =
         std::env::temp_dir().join(format!("service-ipc-stage-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&app_root);
@@ -114,7 +123,7 @@ async fn start_core(label: &str, initial: &str) -> Result<RunningCore> {
     let start = start_clash(
         &credentials,
         &StartClashRequest {
-            runtime: bundle(&app_root, initial),
+            runtime: build(&app_root)?,
             proposed_session_token: token.clone(),
             macos_proxy: None,
         },
@@ -127,6 +136,11 @@ async fn start_core(label: &str, initial: &str) -> Result<RunningCore> {
         .session
         .generation;
     let status = get_status(&credentials).await?.data.context("no status")?;
+    anyhow::ensure!(
+        status.core_pid.is_some(),
+        "the service must report a pid for the core it just started — without this, every later \
+         pid comparison in these tests would pass by both sides being absent"
+    );
 
     Ok(RunningCore {
         generation: sole_generation(&credentials)?,
@@ -403,9 +417,198 @@ async fn staging_rejects_a_session_that_no_longer_owns_the_core() -> Result<()> 
     .await
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn staging_declines_when_a_replacement_cannot_be_performed() -> Result<()> {
+async fn a_destination_that_is_a_filename_on_this_platform_stays_a_filename() -> Result<()> {
+    with_service(|| async {
+        let core = start_core("traversal", "mode: rule\n").await?;
+        std::fs::write(core.app_root.join("payload"), b"owned\n")?;
+        let escape = core
+            .generation
+            .parent()
+            .context("generation has no parent")?
+            .join("escaped-by-staging");
+        let _ = std::fs::remove_file(&escape);
+
+        let mut declared = bundle(&core.app_root, "mode: global\n");
+        // A backslash is an ordinary character in a Unix filename, so this is one component and the
+        // destination validator accepts it. It must still be treated as the filename it is: the
+        // moment anything rewrites the separator afterwards, an accepted destination becomes a
+        // traversal, and the service writes client-controlled bytes wherever it points.
+        declared.assets = vec![RuntimeAsset {
+            source: core.app_root.join("payload").to_string_lossy().into_owned(),
+            destination: r"..\escaped-by-staging".to_owned(),
+        }];
+
+        let outcome = core.stage(&declared).await;
+
+        assert!(
+            !escape.exists(),
+            "staging wrote outside the generation it was given"
+        );
+        match outcome {
+            Ok(StageRuntimeOutcome::Staged { .. }) => {
+                assert!(
+                    core.generation.join(r"..\escaped-by-staging").exists(),
+                    "the destination should have become a file of that literal name"
+                );
+            }
+            Ok(other) => anyhow::bail!("unexpected outcome {other:?}"),
+            Err(_) => {}
+        }
+
+        core.shut_down().await
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn staging_refuses_to_let_a_bundle_claim_the_names_the_generation_owns() -> Result<()> {
+    with_service(|| async {
+        let core = start_core("reserved", "mode: rule\n").await?;
+        std::fs::write(core.app_root.join("payload"), b"owned\n")?;
+
+        for reserved in ["config.yaml", ".runtime-manifest.json"] {
+            let mut declared = bundle(&core.app_root, "mode: global\n");
+            declared.assets = vec![RuntimeAsset {
+                source: core.app_root.join("payload").to_string_lossy().into_owned(),
+                destination: reserved.to_owned(),
+            }];
+
+            let response = stage_runtime(&core.credentials, &core.session, &declared).await?;
+
+            assert_ne!(
+                response.code, 0,
+                "{reserved} must not be claimable: the housekeeping sweep would later delete it"
+            );
+        }
+        assert_eq!(
+            core.staged_config()?,
+            "mode: rule\n",
+            "a refused bundle must not have written anything"
+        );
+
+        core.shut_down().await
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn staging_refuses_a_destination_claimed_twice() -> Result<()> {
+    with_service(|| async {
+        let core = start_core("conflict", "mode: rule\n").await?;
+        std::fs::write(core.app_root.join("payload"), b"owned\n")?;
+
+        let mut both_kinds = bundle(&core.app_root, "mode: global\n");
+        both_kinds.assets = vec![RuntimeAsset {
+            source: core.app_root.join("payload").to_string_lossy().into_owned(),
+            destination: "providers/p.yaml".to_owned(),
+        }];
+        both_kinds.remote_providers = vec![RemoteProvider {
+            destination: "providers/p.yaml".to_owned(),
+            url: "https://one.example/p.yaml".to_owned(),
+        }];
+        assert_ne!(
+            stage_runtime(&core.credentials, &core.session, &both_kinds)
+                .await?
+                .code,
+            0,
+            "one destination cannot be both copied by the service and downloaded by the core"
+        );
+
+        let mut two_sources = bundle(&core.app_root, "mode: global\n");
+        two_sources.remote_providers = vec![
+            RemoteProvider {
+                destination: "rules/ads.yaml".to_owned(),
+                url: "https://one.example/ads.yaml".to_owned(),
+            },
+            RemoteProvider {
+                destination: "rules/ads.yaml".to_owned(),
+                url: "https://two.example/ads.yaml".to_owned(),
+            },
+        ];
+        assert_ne!(
+            stage_runtime(&core.credentials, &core.session, &two_sources)
+                .await?
+                .code,
+            0,
+            "staging cannot know which of two sources produced the cache on disk"
+        );
+
+        assert_eq!(core.staged_config()?, "mode: rule\n");
+
+        core.shut_down().await
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn the_first_staging_after_a_start_reuses_what_the_start_wrote() -> Result<()> {
+    with_service(|| async {
+        let core = start_core_with("firstskip", |app_root| {
+            std::fs::write(app_root.join("geo.dat"), b"geo payload")?;
+            let mut initial = bundle(app_root, "mode: rule\n");
+            initial.assets = vec![RuntimeAsset {
+                source: app_root.join("geo.dat").to_string_lossy().into_owned(),
+                destination: "geo.dat".to_owned(),
+            }];
+            initial.remote_providers = vec![RemoteProvider {
+                destination: "rules/ads.yaml".to_owned(),
+                url: "https://one.example/ads.yaml".to_owned(),
+            }];
+            Ok(initial)
+        })
+        .await?;
+
+        // Stand in for the download the core would have made under the configuration it started
+        // with. Nothing about it changed, so the first configuration change must not throw it away.
+        let cache = core.generation.join("rules/ads.yaml");
+        std::fs::create_dir_all(cache.parent().context("no parent")?)?;
+        std::fs::write(&cache, b"from source one\n")?;
+        // A marker only a re-copy would destroy.
+        std::fs::write(core.generation.join("geo.dat"), b"untouched marker")?;
+
+        let mut declared = bundle(&core.app_root, "mode: global\n");
+        declared.assets = vec![RuntimeAsset {
+            source: core.app_root.join("geo.dat").to_string_lossy().into_owned(),
+            destination: "geo.dat".to_owned(),
+        }];
+        declared.remote_providers = vec![RemoteProvider {
+            destination: "rules/ads.yaml".to_owned(),
+            url: "https://one.example/ads.yaml".to_owned(),
+        }];
+        core.stage(&declared).await?;
+
+        assert_eq!(
+            std::fs::read(core.generation.join("geo.dat"))?,
+            b"untouched marker",
+            "the start path must record what it copied, or the first change re-copies every asset"
+        );
+        assert!(
+            cache.exists(),
+            "the start path must record its providers, or the first change re-downloads every one"
+        );
+
+        core.shut_down().await
+    })
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn staging_declines_when_it_cannot_write_into_the_generation() -> Result<()> {
+    #[cfg(unix)]
+    if unsafe { platform_lib::geteuid() } == 0 {
+        // The Unix half of this test blocks staging by making a directory unwritable, and root
+        // ignores that. Running anyway would assert the opposite of what the test means.
+        eprintln!("skipping: cannot make a directory unwritable to root");
+        return Ok(());
+    }
+
     with_service(|| async {
         let core = start_core("blocked", "mode: rule\n").await?;
         std::fs::write(core.app_root.join("provider.yaml"), b"proxies: []\n")?;
@@ -422,7 +625,7 @@ async fn staging_declines_when_a_replacement_cannot_be_performed() -> Result<()>
         let blocked = core.generation.join("providers/copied.yaml");
         std::fs::create_dir_all(blocked.parent().context("no parent")?)?;
         std::fs::write(&blocked, b"previous\n")?;
-        let guard = block_replacement(&blocked)?;
+        let guard = block_new_file(&blocked)?;
 
         let outcome = core.stage(&declared).await?;
 
@@ -447,13 +650,16 @@ async fn staging_declines_when_a_replacement_cannot_be_performed() -> Result<()>
     .await
 }
 
-/// Make replacing `path` fail, by whatever means the platform actually offers.
+/// Stop staging from being able to put a new file in place, by whatever means the platform offers.
 ///
-/// The two platforms differ in kind, not degree. Nothing a Unix process can do to a file stops
-/// another from replacing it, so the containing directory is made unwritable instead. On Windows
-/// a held handle is exactly the obstacle, and a stand-in process supplies one — which is also the
-/// obstacle a real core produces, since it keeps handles on every provider file it loaded.
-fn block_replacement(path: &Path) -> Result<ReplacementBlock> {
+/// The two platforms are blocked at different steps, and it is worth being precise about which.
+/// On Unix nothing a process can do to a file stops another from replacing it, so the containing
+/// directory is made unwritable and staging fails while *creating its temporary* — the rename is
+/// never reached. On Windows a held handle blocks the rename itself, which is the step a real core
+/// interferes with, since it keeps handles on every provider file it loaded. What both share, and
+/// what the test asserts, is that staging declines instead of committing a directory it could not
+/// finish correcting.
+fn block_new_file(path: &Path) -> Result<ReplacementBlock> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

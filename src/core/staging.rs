@@ -21,14 +21,14 @@
 //! staging was supposed to save. The manifest records what each copy was made from instead.
 
 use crate::core::assets::{
-    application_bundle_root, invalid_asset, runtime_cleanup_retry_delay, validate_core_path,
-    validate_destination, validate_source,
+    application_bundle_root, destination_key, invalid_asset, resolve_in_generation,
+    runtime_cleanup_retry_delay, validate_core_path, validate_destination, validate_source,
 };
 use crate::core::auth::{AuthenticatedOwner, ServiceError};
 use crate::core::manager::CORE_MANAGER;
 use crate::{RemoteProvider, RuntimeAsset, RuntimeBundle, StageRejection, StageRuntimeOutcome};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -39,12 +39,25 @@ pub(crate) const MANIFEST_FILE_NAME: &str = ".runtime-manifest.json";
 ///
 /// Length and modification time rather than a digest: the point of skipping an unchanged asset
 /// is to not read it. A source rewritten in place, to the same length, with its modification
-/// time restored would be missed; nothing in this system produces that.
+/// time deliberately restored would be missed; nothing in this system produces that, and the
+/// alternative is hashing tens of megabytes of geo data on every profile switch.
+///
+/// `mtime_ns` is optional because a filesystem that cannot report a modification time leaves
+/// nothing to compare. Collapsing that case into a number would make every same-length change
+/// look unchanged, silently and forever — so an unknown time simply never matches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SourceIdentity {
     pub source: String,
     pub len: u64,
-    pub mtime_ns: u128,
+    #[serde(default)]
+    pub mtime_ns: Option<u128>,
+}
+
+impl SourceIdentity {
+    /// Whether a copy made under `self` can be trusted to still match a source seen as `current`.
+    fn still_matches(&self, current: &Self) -> bool {
+        self.mtime_ns.is_some() && self == current
+    }
 }
 
 /// What the previous staging (or start) left in a generation.
@@ -89,7 +102,7 @@ pub(crate) struct StagePlan {
 pub(crate) struct AssetSource {
     pub asset: RuntimeAsset,
     pub len: u64,
-    pub mtime_ns: u128,
+    pub mtime_ns: Option<u128>,
 }
 
 /// Decide what staging must do. Pure: every fact it needs has already been read.
@@ -107,7 +120,11 @@ pub(crate) fn plan_stage(
             mtime_ns: source.mtime_ns,
         };
         let destination = source.asset.destination.clone();
-        if previous.assets.get(&destination) == Some(&identity) {
+        if previous
+            .assets
+            .get(&destination)
+            .is_some_and(|recorded| recorded.still_matches(&identity))
+        {
             plan.skipped.push(destination.clone());
         } else {
             plan.copies.push(PlannedCopy {
@@ -141,35 +158,51 @@ pub(crate) fn plan_stage(
             plan.hygiene_deletes.push(recorded.clone());
         }
     }
+    // A destination recorded as both an asset and a remote provider appears twice; the two chained
+    // maps are each sorted but their concatenation is not, so `dedup` alone would not notice.
+    // Sorting first is what makes it a deduplication rather than a no-op.
+    plan.hygiene_deletes.sort();
     plan.hygiene_deletes.dedup();
 
     plan
 }
 
-/// The remote providers a bundle declares, deduplicated by destination.
+/// The remote providers a bundle declares, keyed by destination.
 ///
-/// Two providers pointing the same `path` at different urls is a configuration the client should
-/// not produce; if it does, the conflict resolves towards deleting the cache, since neither url
-/// can be shown to have produced it.
-pub(crate) fn declared_remote_providers(bundle: &RuntimeBundle) -> Vec<RemoteProvider> {
-    let mut seen: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for provider in &bundle.remote_providers {
-        seen.entry(provider.destination.clone())
-            .and_modify(|url| {
-                if url.as_deref() != Some(provider.url.as_str()) {
-                    *url = None;
-                }
-            })
-            .or_insert_with(|| Some(provider.url.clone()));
+/// A destination declared twice with different urls, or declared as both a copied asset and a
+/// remote provider, is refused rather than reconciled. The two declarations disagree about who
+/// owns the file, and staging has no way to settle it: it cannot know which url produced the cache
+/// on disk, and copying an asset over what the core fetched would pin the wrong content — silently
+/// and permanently, because the next staging would find both records matching and skip both.
+pub(crate) fn declared_remote_providers(
+    declared: &[RemoteProvider],
+    asset_destinations: &BTreeSet<String>,
+) -> Result<Vec<RemoteProvider>, ServiceError> {
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for provider in declared {
+        let destination = destination_key(&validate_destination(&provider.destination)?)?;
+        if asset_destinations.contains(&destination) {
+            return Err(invalid_asset(format!(
+                "runtime destination {destination:?} is declared both as a copied asset and as a remote provider"
+            )));
+        }
+        match seen.entry(destination) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(provider.url.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(slot) if slot.get() == &provider.url => {}
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                return Err(invalid_asset(format!(
+                    "runtime destination {:?} is declared for two different provider sources",
+                    slot.key()
+                )));
+            }
+        }
     }
-    seen.into_iter()
-        .map(|(destination, url)| RemoteProvider {
-            destination,
-            // A conflicting declaration is given a url no record can match, so the cache is
-            // always discarded rather than silently attributed to one of the two sources.
-            url: url.unwrap_or_else(|| "\u{0}conflicting-declaration".to_owned()),
-        })
-        .collect()
+    Ok(seen
+        .into_iter()
+        .map(|(destination, url)| RemoteProvider { destination, url })
+        .collect())
 }
 
 /// Make the generation the core is running in match `bundle`, or decline and change nothing.
@@ -186,7 +219,7 @@ pub(crate) async fn stage_runtime(
     owner: &AuthenticatedOwner,
     bundle: &RuntimeBundle,
 ) -> Result<StageRuntimeOutcome, ServiceError> {
-    let Some(running) = CORE_MANAGER.lock().await.running_core_config().await else {
+    let Some((core_pid, running)) = CORE_MANAGER.lock().await.running_core_config().await else {
         return Ok(StageRuntimeOutcome::RestartRequired {
             reason: StageRejection::CoreNotRunning,
         });
@@ -202,33 +235,45 @@ pub(crate) async fn stage_runtime(
     let generation = PathBuf::from(&running.core_config.config_dir);
     let app_bundle_root = application_bundle_root(&core_path);
     let mut sources = Vec::with_capacity(bundle.assets.len());
+    let mut asset_keys = BTreeSet::new();
     for asset in &bundle.assets {
         let source = validate_source(owner, app_bundle_root.as_deref(), &asset.source)?;
-        let destination = validate_destination(&asset.destination)?;
+        let destination = destination_key(&validate_destination(&asset.destination)?)?;
         let metadata = tokio::fs::metadata(&source).await.map_err(|error| {
             invalid_asset(format!(
                 "failed to inspect runtime asset {source:?}: {error}"
             ))
         })?;
+        if !asset_keys.insert(destination.clone()) {
+            return Err(invalid_asset(format!(
+                "runtime destination {destination:?} is declared as a copied asset twice"
+            )));
+        }
         sources.push(AssetSource {
             asset: RuntimeAsset {
                 source: source.to_string_lossy().into_owned(),
-                destination: destination.to_string_lossy().replace('\\', "/"),
+                destination,
             },
             len: metadata.len(),
             mtime_ns: modified_nanos(&metadata),
         });
     }
 
-    let remote = declared_remote_providers(bundle);
-    for provider in &remote {
-        validate_destination(&provider.destination)?;
-    }
+    let remote = declared_remote_providers(&bundle.remote_providers, &asset_keys)?;
 
-    let plan = plan_stage(&read_manifest(&generation).await, &sources, &remote);
+    let previous = match read_manifest(&generation).await {
+        Ok(previous) => previous,
+        Err(detail) => {
+            return Ok(StageRuntimeOutcome::RestartRequired {
+                reason: StageRejection::RuntimeUnwritable { detail },
+            });
+        }
+    };
+    let plan = plan_stage(&previous, &sources, &remote);
 
     for destination in &plan.required_deletes {
-        if let Err(error) = remove_staged_file(&generation.join(destination)).await {
+        let target = resolve_in_generation(&generation, destination)?;
+        if let Err(error) = remove_staged_file(&target).await {
             return Ok(StageRuntimeOutcome::RestartRequired {
                 reason: StageRejection::RuntimeUnwritable {
                     detail: format!("failed to discard the stale cache {destination}: {error}"),
@@ -238,9 +283,8 @@ pub(crate) async fn stage_runtime(
     }
 
     for copy in &plan.copies {
-        if let Err(error) =
-            copy_staged_file(&copy.source, &generation.join(&copy.destination)).await
-        {
+        let target = resolve_in_generation(&generation, &copy.destination)?;
+        if let Err(error) = copy_staged_file(&copy.source, &target).await {
             return Ok(StageRuntimeOutcome::RestartRequired {
                 reason: StageRejection::RuntimeUnwritable {
                     detail: format!(
@@ -250,12 +294,56 @@ pub(crate) async fn stage_runtime(
                 },
             });
         }
+        // The identity was read before the copy, so a source rewritten in between would be
+        // recorded as the content that is no longer there — and then skipped forever, because the
+        // record matches the source it now names. Re-reading is one stat against a file already in
+        // cache; being wrong here pins the wrong bytes for the life of the generation.
+        if source_identity_changed(&copy.source, &copy.identity).await {
+            return Ok(StageRuntimeOutcome::RestartRequired {
+                reason: StageRejection::RuntimeUnwritable {
+                    detail: format!(
+                        "runtime asset {} changed while it was being copied",
+                        copy.destination
+                    ),
+                },
+            });
+        }
+    }
+
+    // The watchdog restarts a dead core without taking the lifecycle lock, and it restarts it in
+    // this same generation from whatever `config.yaml` is on disk. Had that happened while the
+    // assets above were being replaced, the core now running would not be the one this plan was
+    // built against: it may have re-fetched a cache the plan just deleted, and committing would
+    // record a provenance that never happened — which no later staging could ever detect, because
+    // the record would look correct. Declining sends the caller down the path that rebuilds the
+    // generation from nothing.
+    if CORE_MANAGER
+        .lock()
+        .await
+        .running_core_config()
+        .await
+        .map(|(pid, _)| pid)
+        != Some(core_pid)
+    {
+        return Ok(StageRuntimeOutcome::RestartRequired {
+            reason: StageRejection::CoreRestarted,
+        });
     }
 
     let config_path = PathBuf::from(&running.core_config.config_path);
     if let Err(error) =
         commit_staged_config(&generation, &config_path, &bundle.yaml, &plan.manifest).await
     {
+        // The manifest may already be in place while `config.yaml` is not, which would leave it
+        // claiming a remote cache belongs to a url the running core is not using. Discarding it
+        // costs the next staging its skips and its cache reuse; keeping it risks a cache that no
+        // staging will ever discard again.
+        if let Err(discard) = remove_staged_file(&generation.join(MANIFEST_FILE_NAME)).await {
+            tracing::warn!(
+                error = %discard,
+                "Left a manifest behind that describes an uncommitted configuration"
+            );
+        }
         return Ok(StageRuntimeOutcome::RestartRequired {
             reason: StageRejection::RuntimeUnwritable {
                 detail: format!("failed to commit the staged configuration: {error}"),
@@ -264,12 +352,21 @@ pub(crate) async fn stage_runtime(
     }
 
     for destination in &plan.hygiene_deletes {
-        if let Err(error) = remove_staged_file(&generation.join(destination)).await {
-            tracing::warn!(
+        match resolve_in_generation(&generation, destination) {
+            Ok(target) => {
+                if let Err(error) = remove_staged_file(&target).await {
+                    tracing::warn!(
+                        destination = %destination,
+                        error = %error,
+                        "Left an undeclared file behind in the staged runtime generation"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
                 destination = %destination,
                 error = %error,
-                "Left an undeclared file behind in the staged runtime generation"
-            );
+                "Refused to sweep a recorded destination that no longer validates"
+            ),
         }
     }
 
@@ -284,24 +381,41 @@ pub(crate) async fn stage_runtime(
     })
 }
 
-fn modified_nanos(metadata: &std::fs::Metadata) -> u128 {
+pub(crate) fn modified_nanos(metadata: &std::fs::Metadata) -> Option<u128> {
     metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |elapsed| elapsed.as_nanos())
+        .map(|elapsed| elapsed.as_nanos())
 }
 
-async fn read_manifest(generation: &Path) -> RuntimeManifest {
+/// Whether `source` still looks like what `recorded` says was copied from it.
+///
+/// Reads metadata only. An unreadable source counts as changed, since a copy that cannot be
+/// re-checked is a copy whose record cannot be trusted.
+async fn source_identity_changed(source: &str, recorded: &SourceIdentity) -> bool {
+    match tokio::fs::metadata(source).await {
+        Ok(metadata) => {
+            metadata.len() != recorded.len || modified_nanos(&metadata) != recorded.mtime_ns
+        }
+        Err(_) => true,
+    }
+}
+
+/// Read the previous manifest, distinguishing "no record" from "a record that cannot be read".
+///
+/// Absence is ordinary and merely costs the skips. A manifest that is present but unparseable is
+/// different: it means files were written here whose names can no longer be recovered, so they can
+/// never be swept. Reporting it lets the caller rebuild the generation from nothing instead.
+async fn read_manifest(generation: &Path) -> Result<RuntimeManifest, String> {
     let path = generation.join(MANIFEST_FILE_NAME);
     match tokio::fs::read(&path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-            // A manifest that cannot be parsed is treated exactly like a missing one: nothing can
-            // be proven, so nothing is skipped and no cache is trusted.
-            tracing::warn!(path = ?path, error = %error, "Ignoring an unreadable runtime manifest");
-            RuntimeManifest::default()
-        }),
-        Err(_) => RuntimeManifest::default(),
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("runtime manifest {path:?} is unreadable: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(RuntimeManifest::default())
+        }
+        Err(error) => Err(format!("runtime manifest {path:?} cannot be read: {error}")),
     }
 }
 
@@ -382,17 +496,31 @@ async fn commit_staged_config(
     write_atomically(config_path, yaml.as_bytes()).await
 }
 
-async fn write_atomically(destination: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt as _;
+pub(crate) async fn write_atomically(destination: &Path, contents: &[u8]) -> std::io::Result<()> {
+    async fn write_temp(staged: &Path, contents: &[u8]) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut file = tokio::fs::File::create(staged).await?;
+        file.write_all(contents).await?;
+        file.sync_all().await
+    }
 
     let staged = staging_temp_path(destination);
-    let mut file = tokio::fs::File::create(&staged).await?;
-    file.write_all(contents).await?;
-    file.sync_all().await?;
-    drop(file);
+    // A failure between creating the temporary and replacing with it would otherwise leave the
+    // temporary behind forever: housekeeping only visits names a manifest recorded, and this name
+    // is deliberately one no manifest can hold.
+    if let Err(error) = write_temp(&staged, contents).await {
+        let _ = tokio::fs::remove_file(&staged).await;
+        return Err(error);
+    }
     replace_staged_file(&staged, destination).await
 }
 
+/// Where a replacement is written before it takes the destination's place.
+///
+/// The name carries [`STAGING_TEMP_INFIX`], which no declared destination is allowed to contain —
+/// so a bundle cannot arrange for its own file to be the one a concurrent write is about to
+/// clobber.
 fn staging_temp_path(destination: &Path) -> PathBuf {
     let sequence = STAGING_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let name = destination.file_name().map_or_else(
@@ -412,7 +540,7 @@ mod tests {
         SourceIdentity {
             source: source.to_owned(),
             len,
-            mtime_ns,
+            mtime_ns: Some(mtime_ns),
         }
     }
 
@@ -423,7 +551,7 @@ mod tests {
                 destination: destination.to_owned(),
             },
             len,
-            mtime_ns,
+            mtime_ns: Some(mtime_ns),
         }
     }
 
@@ -615,40 +743,94 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_declarations_for_one_destination_discard_the_cache() {
-        let bundle = RuntimeBundle {
-            yaml: String::new(),
-            assets: Vec::new(),
-            remote_providers: vec![
-                remote("rules/ads.yaml", "https://one.example/ads.yaml"),
-                remote("rules/ads.yaml", "https://two.example/ads.yaml"),
-            ],
-            core_path: String::new(),
-        };
-        let previous = manifest(&[], &[("rules/ads.yaml", "https://one.example/ads.yaml")]);
+    fn one_destination_declared_for_two_sources_is_refused() {
+        let declared = [
+            remote("rules/ads.yaml", "https://one.example/ads.yaml"),
+            remote("rules/ads.yaml", "https://two.example/ads.yaml"),
+        ];
 
-        let declared = declared_remote_providers(&bundle);
-        let plan = plan_stage(&previous, &[], &declared);
+        let error = declared_remote_providers(&declared, &BTreeSet::new())
+            .expect_err("a destination cannot be owned by two sources at once");
 
-        assert_eq!(declared.len(), 1, "one destination yields one decision");
-        assert_eq!(plan.required_deletes, ["rules/ads.yaml"]);
+        assert!(
+            error.message.contains("two different provider sources"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
     fn repeating_one_provider_verbatim_still_keeps_its_cache() {
-        let bundle = RuntimeBundle {
-            yaml: String::new(),
-            assets: Vec::new(),
-            remote_providers: vec![
-                remote("rules/ads.yaml", "https://one.example/ads.yaml"),
-                remote("rules/ads.yaml", "https://one.example/ads.yaml"),
-            ],
-            core_path: String::new(),
-        };
+        let declared = [
+            remote("rules/ads.yaml", "https://one.example/ads.yaml"),
+            remote("rules/ads.yaml", "https://one.example/ads.yaml"),
+        ];
         let previous = manifest(&[], &[("rules/ads.yaml", "https://one.example/ads.yaml")]);
 
-        let plan = plan_stage(&previous, &[], &declared_remote_providers(&bundle));
+        let resolved = declared_remote_providers(&declared, &BTreeSet::new())
+            .expect("an identical repeat is not a conflict");
+        let plan = plan_stage(&previous, &[], &resolved);
 
-        assert!(plan.required_deletes.is_empty());
+        assert_eq!(resolved.len(), 1, "one destination yields one decision");
+        assert!(
+            plan.required_deletes.is_empty(),
+            "a cache attributable to the declared url must be reused"
+        );
+    }
+
+    #[test]
+    fn a_destination_claimed_by_both_an_asset_and_a_provider_is_refused() {
+        // The two declarations disagree about who owns the file: staging would delete the cache and
+        // then copy over the same name, pinning the app's content where the core expected its own —
+        // and every later staging would find both records matching and skip both.
+        let declared = [remote("providers/p.yaml", "https://one.example/p.yaml")];
+        let assets = BTreeSet::from(["providers/p.yaml".to_owned()]);
+
+        let error = declared_remote_providers(&declared, &assets)
+            .expect_err("one destination cannot be both copied and downloaded");
+
+        assert!(error.message.contains("copied asset"), "{}", error.message);
+    }
+
+    #[test]
+    fn an_asset_whose_modification_time_is_unknown_is_never_skipped() {
+        // Collapsing an unreadable timestamp into a number would make every same-length change
+        // look unchanged, and the copy on disk would stay wrong for the life of the generation.
+        let unknown = SourceIdentity {
+            source: "/app/geo.dat".to_owned(),
+            len: 10,
+            mtime_ns: None,
+        };
+        let previous = manifest(&[("geo.dat", unknown.clone())], &[]);
+        let sources = [AssetSource {
+            asset: RuntimeAsset {
+                source: "/app/geo.dat".to_owned(),
+                destination: "geo.dat".to_owned(),
+            },
+            len: 10,
+            mtime_ns: None,
+        }];
+
+        let plan = plan_stage(&previous, &sources, &[]);
+
+        assert_eq!(plan.copies.len(), 1);
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_destination_recorded_as_both_kinds_is_swept_once() {
+        // The two maps are each sorted but their concatenation is not, so a key present in both
+        // survives a bare `dedup` whenever another key sorts between them.
+        let previous = manifest(
+            &[
+                ("a.yaml", identity("/app/a.yaml", 1, 1)),
+                ("z.yaml", identity("/app/z.yaml", 1, 1)),
+            ],
+            &[("a.yaml", "https://one.example/a.yaml")],
+        );
+
+        let plan = plan_stage(&previous, &[], &[]);
+
+        assert_eq!(plan.hygiene_deletes, ["a.yaml", "z.yaml"]);
     }
 }

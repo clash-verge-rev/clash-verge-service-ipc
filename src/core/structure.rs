@@ -211,6 +211,11 @@ pub enum StageRejection {
     /// A file that had to be replaced or removed could not be. Expected on Windows, where the
     /// running core holds handles on its provider files.
     RuntimeUnwritable { detail: String },
+    /// The core was replaced while the runtime was being staged, so the work done so far was done
+    /// for a core that is no longer there. The service's own watchdog can do this, and it restarts
+    /// the core from the configuration still on disk — meaning the generation may now be serving a
+    /// mixture nothing recorded.
+    CoreRestarted,
 }
 
 #[repr(u16)]
@@ -406,6 +411,37 @@ mod tests {
             Some(current)
         );
         assert!(ProtocolVersion::parse_header(crate::VERSION).is_none());
+    }
+
+    #[test]
+    fn staging_is_gated_separately_from_compatibility() {
+        let mut older = ProtocolInfo::current();
+        older.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING - 1;
+
+        assert!(
+            older.supports_client(
+                ProtocolVersion::current(),
+                crate::MIN_REQUIRED_SERVICE_REVISION
+            ),
+            "a service without staging is still a service this client can talk to"
+        );
+        assert!(
+            !older.supports_runtime_staging(),
+            "but it must not be asked to stage a runtime"
+        );
+        assert!(ProtocolInfo::current().supports_runtime_staging());
+    }
+
+    #[test]
+    fn staging_does_not_survive_an_epoch_change() {
+        let mut newer_epoch = ProtocolInfo::current();
+        newer_epoch.protocol.epoch += 1;
+        newer_epoch.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING;
+
+        assert!(
+            !newer_epoch.supports_runtime_staging(),
+            "a revision number means nothing across an epoch boundary"
+        );
     }
 
     #[test]
