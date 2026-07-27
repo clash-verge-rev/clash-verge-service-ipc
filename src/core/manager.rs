@@ -576,7 +576,7 @@ impl CoreManager {
                                     );
                                     let now_secs = unix_timestamp_secs();
                                     running_pid_arc
-                                        .store(new_pid.unwrap_or_default(), Ordering::Relaxed);
+                                        .store(new_pid.unwrap_or_default(), Ordering::Release);
                                     *start_time_arc.lock().await = Some(Instant::now());
                                     started_at_arc.store(now_secs, Ordering::Relaxed);
                                     if let Err(record_error) = write_runtime_record_for_config(
@@ -612,7 +612,7 @@ impl CoreManager {
                                 if let Err(kill_error) = new_guard.kill_now().await {
                                     let now_secs = unix_timestamp_secs();
                                     running_pid_arc
-                                        .store(new_pid.unwrap_or_default(), Ordering::Relaxed);
+                                        .store(new_pid.unwrap_or_default(), Ordering::Release);
                                     *start_time_arc.lock().await = Some(Instant::now());
                                     started_at_arc.store(now_secs, Ordering::Relaxed);
                                     *failed_child_arc.lock().await = Some(new_guard);

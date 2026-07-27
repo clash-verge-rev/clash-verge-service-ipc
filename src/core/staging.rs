@@ -393,7 +393,7 @@ pub(crate) fn modified_nanos(metadata: &std::fs::Metadata) -> Option<u128> {
 ///
 /// Reads metadata only. An unreadable source counts as changed, since a copy that cannot be
 /// re-checked is a copy whose record cannot be trusted.
-async fn source_identity_changed(source: &str, recorded: &SourceIdentity) -> bool {
+pub(crate) async fn source_identity_changed(source: &str, recorded: &SourceIdentity) -> bool {
     match tokio::fs::metadata(source).await {
         Ok(metadata) => {
             metadata.len() != recorded.len || modified_nanos(&metadata) != recorded.mtime_ns
@@ -815,6 +815,52 @@ mod tests {
 
         assert_eq!(plan.copies.len(), 1);
         assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_name_shaped_like_a_staging_temporary_is_refused_but_a_lookalike_is_not() {
+        use crate::core::assets::destination_key;
+        use std::path::Path;
+
+        for temporary in [".config.yaml.staging-123-4", ".geoip.metadb.staging-1-0"] {
+            assert!(
+                destination_key(Path::new(temporary)).is_err(),
+                "{temporary} is one of staging's own temporaries"
+            );
+        }
+        for legitimate in [
+            "company.staging-prod.yaml",
+            "providers/x.staging-.yaml",
+            ".hidden.staging-notanumber",
+        ] {
+            assert!(
+                destination_key(Path::new(legitimate)).is_ok(),
+                "{legitimate} is an ordinary name the core would happily load"
+            );
+        }
+    }
+
+    #[test]
+    fn the_names_the_generation_owns_are_refused_whatever_their_case() {
+        use crate::core::assets::destination_key;
+        use std::path::Path;
+
+        // Most Windows filesystems are case-insensitive, so `Config.yaml` would be a second
+        // manifest key for the one live configuration — and the sweep runs after the commit.
+        for reserved in [
+            "config.yaml",
+            "Config.yaml",
+            "CONFIG.YAML",
+            ".runtime-manifest.json",
+            ".Runtime-Manifest.JSON",
+        ] {
+            assert!(
+                destination_key(Path::new(reserved)).is_err(),
+                "{reserved} names a file the generation owns"
+            );
+        }
+        // Only at the top level: nothing owns a file of that name inside a subdirectory.
+        assert!(destination_key(Path::new("providers/config.yaml")).is_ok());
     }
 
     #[test]

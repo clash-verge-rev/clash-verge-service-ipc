@@ -447,16 +447,16 @@ async fn a_destination_that_is_a_filename_on_this_platform_stays_a_filename() ->
             !escape.exists(),
             "staging wrote outside the generation it was given"
         );
-        match outcome {
-            Ok(StageRuntimeOutcome::Staged { .. }) => {
-                assert!(
-                    core.generation.join(r"..\escaped-by-staging").exists(),
-                    "the destination should have become a file of that literal name"
-                );
-            }
-            Ok(other) => anyhow::bail!("unexpected outcome {other:?}"),
-            Err(_) => {}
-        }
+        // Insisting on `Staged` is the point: swallowing an error here would make the test blind
+        // to the opposite mistake, where the fix over-corrects and refuses an ordinary filename.
+        let outcome = outcome?;
+        let StageRuntimeOutcome::Staged { .. } = outcome else {
+            anyhow::bail!("an ordinary Unix filename must still be accepted, got {outcome:?}");
+        };
+        assert!(
+            core.generation.join(r"..\escaped-by-staging").exists(),
+            "the destination should have become a file of that literal name"
+        );
 
         core.shut_down().await
     })
@@ -479,9 +479,15 @@ async fn staging_refuses_to_let_a_bundle_claim_the_names_the_generation_owns() -
 
             let response = stage_runtime(&core.credentials, &core.session, &declared).await?;
 
-            assert_ne!(
-                response.code, 0,
-                "{reserved} must not be claimable: the housekeeping sweep would later delete it"
+            assert_eq!(
+                response.code,
+                ServiceErrorCode::InvalidRuntimeAsset as u16,
+                "{reserved} must be refused as an invalid asset, not fail for some other reason"
+            );
+            assert!(
+                response.message.contains("owned by the runtime generation"),
+                "{reserved}: {}",
+                response.message
             );
         }
         assert_eq!(
@@ -511,12 +517,12 @@ async fn staging_refuses_a_destination_claimed_twice() -> Result<()> {
             destination: "providers/p.yaml".to_owned(),
             url: "https://one.example/p.yaml".to_owned(),
         }];
-        assert_ne!(
-            stage_runtime(&core.credentials, &core.session, &both_kinds)
-                .await?
-                .code,
-            0,
-            "one destination cannot be both copied by the service and downloaded by the core"
+        let refused = stage_runtime(&core.credentials, &core.session, &both_kinds).await?;
+        assert_eq!(refused.code, ServiceErrorCode::InvalidRuntimeAsset as u16);
+        assert!(
+            refused.message.contains("copied asset"),
+            "one destination cannot be both copied by the service and downloaded by the core: {}",
+            refused.message
         );
 
         let mut two_sources = bundle(&core.app_root, "mode: global\n");
@@ -530,12 +536,12 @@ async fn staging_refuses_a_destination_claimed_twice() -> Result<()> {
                 url: "https://two.example/ads.yaml".to_owned(),
             },
         ];
-        assert_ne!(
-            stage_runtime(&core.credentials, &core.session, &two_sources)
-                .await?
-                .code,
-            0,
-            "staging cannot know which of two sources produced the cache on disk"
+        let refused = stage_runtime(&core.credentials, &core.session, &two_sources).await?;
+        assert_eq!(refused.code, ServiceErrorCode::InvalidRuntimeAsset as u16);
+        assert!(
+            refused.message.contains("two different provider sources"),
+            "staging cannot know which of two sources produced the cache on disk: {}",
+            refused.message
         );
 
         assert_eq!(core.staged_config()?, "mode: rule\n");

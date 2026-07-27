@@ -364,15 +364,30 @@ async fn materialize_runtime(
         tokio::fs::copy(&source, &target).await.map_err(|error| {
             invalid_asset(format!("failed to copy runtime asset {source:?}: {error}"))
         })?;
-        asset_destinations.insert(key.clone());
-        manifest.assets.insert(
-            key,
-            crate::core::staging::SourceIdentity {
-                source: source.to_string_lossy().into_owned(),
-                len: metadata.len(),
-                mtime_ns: crate::core::staging::modified_nanos(&metadata),
-            },
-        );
+        if !asset_destinations.insert(key.clone()) {
+            return Err(invalid_asset(format!(
+                "runtime destination {key:?} is declared as a copied asset twice"
+            )));
+        }
+        let identity = crate::core::staging::SourceIdentity {
+            source: source.to_string_lossy().into_owned(),
+            len: metadata.len(),
+            mtime_ns: crate::core::staging::modified_nanos(&metadata),
+        };
+        // The identity was read before the copy, so a source rewritten in between would be recorded
+        // as content that is not on disk — and then skipped by every staging that follows, because
+        // the record matches the source it still names. Staging re-checks for exactly this; the
+        // start path has to as well, now that it writes the record. Omitting the entry is enough
+        // here: a destination the manifest does not mention is one nothing can be proven about, and
+        // the next staging simply copies it again.
+        if crate::core::staging::source_identity_changed(&identity.source, &identity).await {
+            tracing::warn!(
+                destination = %key,
+                "Runtime asset changed while being copied; not recording what it was copied from"
+            );
+        } else {
+            manifest.assets.insert(key, identity);
+        }
     }
     for provider in crate::core::staging::declared_remote_providers(
         &bundle.remote_providers,
@@ -532,7 +547,7 @@ pub(crate) fn destination_key(destination: &Path) -> Result<String, ServiceError
             ));
         };
         let part = part.to_string_lossy();
-        if part.contains(STAGING_TEMP_INFIX) {
+        if is_staging_temporary(&part) {
             return Err(invalid_asset(format!(
                 "runtime asset destination {part:?} is reserved for staging temporaries"
             )));
@@ -541,9 +556,12 @@ pub(crate) fn destination_key(destination: &Path) -> Result<String, ServiceError
     }
     match parts.as_slice() {
         [] => Err(invalid_asset("runtime asset destination is empty")),
+        // Compared without regard to case, because most Windows filesystems are: `Config.yaml`
+        // would be a different manifest key naming the same file, and the housekeeping sweep — which
+        // runs after the configuration is committed — would then delete the live configuration.
         [only]
-            if only == RUNTIME_CONFIG_FILE_NAME
-                || only == crate::core::staging::MANIFEST_FILE_NAME =>
+            if only.eq_ignore_ascii_case(RUNTIME_CONFIG_FILE_NAME)
+                || only.eq_ignore_ascii_case(crate::core::staging::MANIFEST_FILE_NAME) =>
         {
             Err(invalid_asset(format!(
                 "runtime asset destination {only:?} is owned by the runtime generation"
@@ -551,6 +569,26 @@ pub(crate) fn destination_key(destination: &Path) -> Result<String, ServiceError
         }
         _ => Ok(parts.join("/")),
     }
+}
+
+/// Whether a name is shaped like one of staging's own temporaries, `.{name}.staging-{pid}-{seq}`.
+///
+/// Matched on the shape rather than on the infix alone: a provider legitimately called
+/// `company.staging-prod.yaml` is not a temporary, and refusing it would keep a configuration the
+/// core is willing to load from ever being materialised.
+fn is_staging_temporary(name: &str) -> bool {
+    let Some(tail) = name
+        .strip_prefix('.')
+        .and_then(|rest| rest.rsplit_once(STAGING_TEMP_INFIX))
+        .map(|(_, tail)| tail)
+    else {
+        return false;
+    };
+    matches!(tail.split_once('-'), Some((pid, sequence))
+        if !pid.is_empty()
+            && !sequence.is_empty()
+            && pid.bytes().all(|byte| byte.is_ascii_digit())
+            && sequence.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Resolve a recorded destination inside `generation`, refusing anything that would leave it.
