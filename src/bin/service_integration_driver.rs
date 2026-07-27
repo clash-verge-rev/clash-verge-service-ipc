@@ -1,5 +1,6 @@
 #![cfg(feature = "client")]
 
+use anyhow::Context as _;
 #[cfg(feature = "test")]
 use clash_verge_service_ipc::test_owner_credentials;
 use clash_verge_service_ipc::{
@@ -139,12 +140,17 @@ async fn stop_flow() -> anyhow::Result<()> {
 }
 
 fn session_token() -> anyhow::Result<String> {
-    Ok(std::env::var("CLASH_VERGE_TEST_SESSION_TOKEN")?)
+    std::env::var("CLASH_VERGE_TEST_SESSION_TOKEN")
+        .context("CLASH_VERGE_TEST_SESSION_TOKEN is required")
 }
 
 fn session_proof() -> anyhow::Result<OwnerSessionProof> {
+    let generation = std::env::var("CLASH_VERGE_TEST_SESSION_GENERATION")
+        .context("CLASH_VERGE_TEST_SESSION_GENERATION is required")?;
     Ok(OwnerSessionProof {
-        generation: std::env::var("CLASH_VERGE_TEST_SESSION_GENERATION")?.parse()?,
+        generation: generation
+            .parse()
+            .context("CLASH_VERGE_TEST_SESSION_GENERATION must be an unsigned integer")?,
         token: session_token()?,
     })
 }

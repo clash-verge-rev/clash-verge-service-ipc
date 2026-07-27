@@ -58,12 +58,13 @@ jobs:
 
   service-flow:
     name: Service Integration (${{ matrix.os }})
-    needs: cargo-tests
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      CLASH_VERGE_TEST_SESSION_TOKEN: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -85,20 +86,35 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo systemctl is-active clash-verge-service.service
 
-      - name: Run mock_binary (Linux)
+      - name: Start mock_binary (Linux)
+        id: start_linux
         if: runner.os == 'Linux'
         run: |
-          target/release/service-integration-driver start
+          generation="$(target/release/service-integration-driver start)"
+          if [[ ! "$generation" =~ ^[0-9]+$ ]]; then
+            echo "service-integration-driver returned invalid generation: '$generation'" >&2
+            exit 1
+          fi
+          echo "generation=$generation" >> "$GITHUB_OUTPUT"
+
+      - name: Verify mock_binary (Linux)
+        if: runner.os == 'Linux'
+        run: |
           sleep 2
           pgrep -f mock_binary
 
       - name: Stop mock_binary (Linux)
-        if: runner.os == 'Linux'
+        if: ${{ always() && runner.os == 'Linux' && steps.start_linux.outputs.generation != '' }}
+        env:
+          CLASH_VERGE_TEST_SESSION_GENERATION: ${{ steps.start_linux.outputs.generation }}
         run: target/release/service-integration-driver stop
 
       - name: Uninstall service (Linux)
-        if: runner.os == 'Linux'
-        run: sudo target/release/clash-verge-service-uninstall --debug
+        if: ${{ always() && runner.os == 'Linux' }}
+        run: |
+          if [ -x target/release/clash-verge-service-uninstall ]; then
+            sudo target/release/clash-verge-service-uninstall --debug
+          fi
 
       - name: Install service (macOS)
         if: runner.os == 'macOS'
@@ -108,20 +124,35 @@ jobs:
         if: runner.os == 'macOS'
         run: sudo launchctl list | grep io.github.clash-verge-rev.clash-verge-rev.service
 
-      - name: Run mock_binary (macOS)
+      - name: Start mock_binary (macOS)
+        id: start_macos
         if: runner.os == 'macOS'
         run: |
-          target/release/service-integration-driver start
+          generation="$(target/release/service-integration-driver start)"
+          if [[ ! "$generation" =~ ^[0-9]+$ ]]; then
+            echo "service-integration-driver returned invalid generation: '$generation'" >&2
+            exit 1
+          fi
+          echo "generation=$generation" >> "$GITHUB_OUTPUT"
+
+      - name: Verify mock_binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
           sleep 2
           pgrep -f mock_binary
 
       - name: Stop mock_binary (macOS)
-        if: runner.os == 'macOS'
+        if: ${{ always() && runner.os == 'macOS' && steps.start_macos.outputs.generation != '' }}
+        env:
+          CLASH_VERGE_TEST_SESSION_GENERATION: ${{ steps.start_macos.outputs.generation }}
         run: target/release/service-integration-driver stop
 
       - name: Uninstall service (macOS)
-        if: runner.os == 'macOS'
-        run: sudo target/release/clash-verge-service-uninstall --debug
+        if: ${{ always() && runner.os == 'macOS' }}
+        run: |
+          if [ -x target/release/clash-verge-service-uninstall ]; then
+            sudo target/release/clash-verge-service-uninstall --debug
+          fi
 
       - name: Install service (Windows)
         if: runner.os == 'Windows'
@@ -137,24 +168,48 @@ jobs:
           $state = sc query clash_verge_service | Select-String "STATE"
           if ($state -notmatch "RUNNING") { exit 1 }
 
-      - name: Run mock_binary (Windows)
+      - name: Start mock_binary (Windows)
+        id: start_windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & "$env:GITHUB_WORKSPACE\\target\\release\\service-integration-driver.exe" start
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $driver = "$env:GITHUB_WORKSPACE\\target\\release\\service-integration-driver.exe"
+          $output = & $driver start
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) { exit $exitCode }
+          $generation = [string]($output | Select-Object -Last 1)
+          $generation = $generation.Trim()
+          if ($generation -notmatch '^[0-9]+$') {
+            throw "service-integration-driver returned invalid generation: '$generation'"
+          }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "generation=$generation" -Encoding utf8
+
+      - name: Verify mock_binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
           Start-Sleep -Seconds 2
           Get-Process -Name mock_binary
 
       - name: Stop mock_binary (Windows)
-        if: runner.os == 'Windows'
+        if: ${{ always() && runner.os == 'Windows' && steps.start_windows.outputs.generation != '' }}
+        env:
+          CLASH_VERGE_TEST_SESSION_GENERATION: ${{ steps.start_windows.outputs.generation }}
         shell: pwsh
         run: |
           & "$env:GITHUB_WORKSPACE\\target\\release\\service-integration-driver.exe" stop
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Uninstall service (Windows)
-        if: runner.os == 'Windows'
+        if: ${{ always() && runner.os == 'Windows' }}
         shell: pwsh
         run: |
-          & "$env:GITHUB_WORKSPACE\\target\\release\\clash-verge-service-uninstall.exe"
+          $service = Get-Service -Name "clash_verge_service" -ErrorAction SilentlyContinue
+          if ($null -ne $service) {
+            $uninstaller = "$env:GITHUB_WORKSPACE\\target\\release\\clash-verge-service-uninstall.exe"
+            if (-not (Test-Path -LiteralPath $uninstaller)) {
+              throw "service is installed but the uninstaller was not built"
+            }
+            & $uninstaller
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
