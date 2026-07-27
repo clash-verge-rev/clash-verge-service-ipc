@@ -59,8 +59,9 @@ mod windows {
         SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, SetFileSecurityW, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        DACL_SECURITY_INFORMATION, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetFileSecurityW, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -165,7 +166,7 @@ mod windows {
 
     impl SecurityDescriptor {
         fn for_owner(sid: &str) -> Result<Self> {
-            let sddl = format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)");
+            let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)");
             let mut wide: Vec<u16> = sddl.encode_utf16().collect();
             wide.push(0);
             let mut descriptor = std::ptr::null_mut();
@@ -190,7 +191,9 @@ mod windows {
             if unsafe {
                 SetFileSecurityW(
                     wide.as_ptr(),
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    OWNER_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION
+                        | PROTECTED_DACL_SECURITY_INFORMATION,
                     self.0,
                 )
             } == 0

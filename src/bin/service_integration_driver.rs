@@ -72,13 +72,20 @@ async fn wait_protocol_ready() -> anyhow::Result<()> {
 
     let result: anyhow::Result<()> = async {
         let deadline = Instant::now() + IPC_READY_TIMEOUT;
+        let mut last_error = None;
         while Instant::now() < deadline {
-            if probe_protocol().await.is_ok() {
-                return Ok(());
+            match probe_protocol().await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
             }
             sleep(IPC_PROBE_INTERVAL).await;
         }
-        anyhow::bail!("service protocol did not become ready within {IPC_READY_TIMEOUT:?}")
+        if let Some(error) = last_error {
+            anyhow::bail!(
+                "service protocol did not become ready within {IPC_READY_TIMEOUT:?}; last failure: {error:#}"
+            );
+        }
+        anyhow::bail!("service protocol did not become ready within {IPC_READY_TIMEOUT:?}");
     }
     .await;
 
