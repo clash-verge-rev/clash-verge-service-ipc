@@ -12,32 +12,14 @@ mod common;
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::{
     OwnerCredentials, OwnerSessionProof, RemoteProvider, RuntimeAsset, RuntimeBundle,
-    ServiceErrorCode, StageRejection, StageRuntimeOutcome, StartClashRequest, connect, get_status,
+    ServiceErrorCode, StageRejection, StageRuntimeOutcome, StartClashRequest, get_status,
     run_ipc_server, service_paths, stage_runtime, start_clash, stop_clash, stop_ipc_server,
     test_owner_credentials,
 };
 use serial_test::serial;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::time::{Duration, Instant};
-
-fn test_bin_path(name: &str) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("target");
-    path.push("debug");
-    path.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-    path
-}
-
-async fn wait_for_ipc() -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if connect().await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    anyhow::bail!("IPC server did not become ready")
-}
 
 /// An owner whose application root is canonical, since that is what the service authenticates
 /// against and what every declared asset source is then required to sit below.
@@ -88,7 +70,7 @@ fn core_file_name() -> String {
 /// a real client's would.
 fn install_mock_core(app_root: &Path) -> Result<()> {
     std::fs::copy(
-        test_bin_path("mock_binary"),
+        common::test_bin_path("mock_binary"),
         app_root.join(core_file_name()),
     )
     .context("mock core must be built before these tests run")?;
@@ -182,7 +164,7 @@ where
     common::init_tracing_for_tests();
     let _ = stop_ipc_server().await;
     let server = run_ipc_server().await?;
-    wait_for_ipc().await?;
+    common::wait_for_ipc().await?;
     let result = body().await;
     stop_ipc_server().await?;
     server.await??;
@@ -363,7 +345,7 @@ async fn staging_declines_when_the_bundle_names_a_different_core() -> Result<()>
     with_service(|| async {
         let core = start_core("core-path", "mode: rule\n").await?;
         let other = core.app_root.join("other_core");
-        std::fs::copy(test_bin_path("mock_binary"), &other)?;
+        std::fs::copy(common::test_bin_path("mock_binary"), &other)?;
 
         let mut declared = bundle(&core.app_root, "mode: global\n");
         declared.core_path = other.to_string_lossy().into_owned();
@@ -685,7 +667,7 @@ fn block_new_file(path: &Path) -> Result<ReplacementBlock> {
     {
         let sentinel = path.with_extension("held");
         let _ = std::fs::remove_file(&sentinel);
-        let holder = std::process::Command::new(test_bin_path("asset_lock_holder"))
+        let holder = std::process::Command::new(common::test_bin_path("asset_lock_holder"))
             .arg(path)
             .arg(&sentinel)
             .spawn()

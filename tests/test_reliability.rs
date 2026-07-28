@@ -23,16 +23,8 @@ mod tests {
 
     use crate::common;
 
-    fn test_bin_path(name: &str) -> PathBuf {
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("target");
-        path.push("debug");
-        path.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        path
-    }
-
     fn ensure_test_bin(name: &str) -> Result<PathBuf> {
-        let path = test_bin_path(name);
+        let path = common::test_bin_path(name);
         if path.exists() {
             return Ok(path);
         }

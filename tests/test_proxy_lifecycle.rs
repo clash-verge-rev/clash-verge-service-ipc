@@ -10,32 +10,11 @@ use clash_verge_service_ipc::{
 };
 use serde::Deserialize;
 use serial_test::serial;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 #[derive(Debug, Deserialize)]
 struct WireResponse<T> {
     code: u16,
     data: Option<T>,
-}
-
-fn test_bin_path(name: &str) -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("target");
-    path.push("debug");
-    path.push(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-    path
-}
-
-async fn wait_for_ipc() -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if connect().await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    anyhow::bail!("IPC server did not become ready")
 }
 
 #[cfg(unix)]
@@ -74,14 +53,16 @@ async fn client_uses_versioned_session_aware_proxy_lifecycle() -> Result<()> {
     common::init_tracing_for_tests();
     let _ = stop_ipc_server().await;
     let server_handle = run_ipc_server().await?;
-    wait_for_ipc().await?;
+    common::wait_for_ipc().await?;
 
     let credentials = common::owner_credentials();
     let bundle = RuntimeBundle {
         yaml: "mode: rule\n".to_owned(),
         assets: vec![],
         remote_providers: Vec::new(),
-        core_path: test_bin_path("mock_binary").to_string_lossy().into_owned(),
+        core_path: common::test_bin_path("mock_binary")
+            .to_string_lossy()
+            .into_owned(),
     };
     let proposed_session_token = "11".repeat(32);
     let start = start_clash(
@@ -119,7 +100,9 @@ async fn client_uses_versioned_session_aware_proxy_lifecycle() -> Result<()> {
                 yaml: "mode: rule\n".to_owned(),
                 assets: vec![],
                 remote_providers: Vec::new(),
-                core_path: test_bin_path("mock_binary").to_string_lossy().into_owned(),
+                core_path: common::test_bin_path("mock_binary")
+                    .to_string_lossy()
+                    .into_owned(),
             },
             proposed_session_token: "22".repeat(32),
             macos_proxy: None,
@@ -146,7 +129,7 @@ async fn owner_b_cannot_overtake_owner_a_proxy_operation() -> Result<()> {
     common::init_tracing_for_tests();
     let _ = stop_ipc_server().await;
     let server_handle = run_ipc_server().await?;
-    wait_for_ipc().await?;
+    common::wait_for_ipc().await?;
 
     let owner_a = clash_verge_service_ipc::test_owner_credentials_for_uid(
         &std::env::temp_dir().join(format!("service-ipc-proxy-race-{}-a", std::process::id())),
@@ -160,7 +143,9 @@ async fn owner_b_cannot_overtake_owner_a_proxy_operation() -> Result<()> {
         yaml: "mode: rule\n".to_owned(),
         assets: vec![],
         remote_providers: Vec::new(),
-        core_path: test_bin_path("mock_binary").to_string_lossy().into_owned(),
+        core_path: common::test_bin_path("mock_binary")
+            .to_string_lossy()
+            .into_owned(),
     };
 
     let token_a = "aa".repeat(32);
