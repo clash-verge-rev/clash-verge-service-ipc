@@ -126,10 +126,6 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
             .clash_config()
             .clone();
         let core_manager = CORE_MANAGER.lock().await;
-        self.prepared_runtime
-            .as_mut()
-            .context("prepared runtime disappeared before core start")?
-            .mark_may_be_in_use();
         let start_result = core_manager
             .start_core(clash_config, self.owner.identity.clone())
             .await;
@@ -141,13 +137,9 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
                 ));
             }
             let _ = persist_owner_core_stopped(self.owner).await;
-            if let Some(prepared_runtime) = self.prepared_runtime.take()
-                && let Err(cleanup_error) = prepared_runtime.discard_after_core_stopped().await
-            {
-                return Err(anyhow!(
-                    "{error:#}; failed to discard rejected runtime generation: {cleanup_error}"
-                ));
-            }
+            // The generation stays. It is the owner's one runtime directory, holding the core's
+            // own state, and what it describes now is a configuration this service accepted — the
+            // same one a retry would write again.
             return Err(error);
         }
         Ok(())
@@ -180,34 +172,15 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
 }
 
 impl StartOwnerTransition<'_> {
-    async fn discard_unstarted_runtime(&mut self) -> AnyResult<()> {
-        let Some(prepared_runtime) = self.prepared_runtime.as_ref() else {
-            return Ok(());
-        };
-        if !prepared_runtime.is_unused() {
-            return Ok(());
-        }
-        self.prepared_runtime
-            .take()
-            .context("unused prepared runtime disappeared before discard")?
-            .discard_after_core_stopped()
-            .await
-            .map_err(anyhow::Error::new)
-    }
-
     async fn rollback_commit_failure<T>(&mut self, error: anyhow::Error) -> AnyResult<T> {
         if let Err(rollback_error) = rollback_started_owner(self.owner).await {
             return Err(anyhow!(
                 "{error:#}; failed to roll back uncommitted owner core: {rollback_error:#}"
             ));
         }
-        if let Some(prepared_runtime) = self.prepared_runtime.take()
-            && let Err(cleanup_error) = prepared_runtime.discard_after_core_stopped().await
-        {
-            return Err(anyhow!(
-                "{error:#}; failed to discard uncommitted runtime generation: {cleanup_error}"
-            ));
-        }
+        // The prepared runtime is dropped rather than discarded: the generation is the owner's
+        // durable directory, so rolling back the *owner* leaves nothing on disk to undo.
+        self.prepared_runtime.take();
         Err(error)
     }
 }
@@ -748,14 +721,7 @@ fn create_ipc_router() -> Result<Router> {
             };
             let (active, proxy_outcome) = match owner_proxy_transition(&mut transition).await {
                 Ok(result) => result,
-                Err(mut error) => {
-                    if let Err(cleanup_error) = transition.discard_unstarted_runtime().await {
-                        error.message.push_str(&format!(
-                            "; failed to discard unused runtime generation: {cleanup_error:#}"
-                        ));
-                    }
-                    return service_error(error);
-                }
+                Err(error) => return service_error(error),
             };
             if let Err(error) = cleanup_legacy_owner_files(&owner).await {
                 warn!(

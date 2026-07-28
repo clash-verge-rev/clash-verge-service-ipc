@@ -286,9 +286,12 @@ async fn assert_new_runtime_config(
     expected_yaml: &str,
 ) -> Result<PathBuf> {
     let current = active_runtime_config_path(credentials).await?;
+    // The path is deliberately the same one: an owner keeps a single generation, so that the core
+    // keeps the state it writes there — `cache.db`, and with it the node the user picked. What a
+    // start must replace is the configuration inside it, not the directory around it.
     anyhow::ensure!(
-        current != previous,
-        "same-owner Start reused runtime generation {previous:?}"
+        current == previous,
+        "same-owner Start moved the runtime generation from {previous:?} to {current:?}"
     );
     anyhow::ensure!(
         std::fs::read_to_string(&current)? == expected_yaml,

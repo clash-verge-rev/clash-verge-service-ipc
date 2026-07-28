@@ -21,8 +21,8 @@
 //! staging was supposed to save. The manifest records what each copy was made from instead.
 
 use super::assets::{
-    application_bundle_root, destination_key, invalid_asset, resolve_in_generation,
-    runtime_cleanup_retry_delay, validate_core_path, validate_destination, validate_source,
+    destination_key, invalid_asset, resolve_in_generation, runtime_cleanup_retry_delay,
+    validate_core_path, validate_destination,
 };
 use crate::core::auth::{AuthenticatedOwner, ServiceError};
 use crate::core::manager::CORE_MANAGER;
@@ -233,33 +233,8 @@ pub(crate) async fn stage_runtime(
     }
 
     let generation = PathBuf::from(&running.core_config.config_dir);
-    let app_bundle_root = application_bundle_root(&core_path);
-    let mut sources = Vec::with_capacity(bundle.assets.len());
-    let mut asset_keys = BTreeSet::new();
-    for asset in &bundle.assets {
-        let source = validate_source(owner, app_bundle_root.as_deref(), &asset.source)?;
-        let destination = destination_key(&validate_destination(&asset.destination)?)?;
-        let metadata = tokio::fs::metadata(&source).await.map_err(|error| {
-            invalid_asset(format!(
-                "failed to inspect runtime asset {source:?}: {error}"
-            ))
-        })?;
-        if !asset_keys.insert(destination.clone()) {
-            return Err(invalid_asset(format!(
-                "runtime destination {destination:?} is declared as a copied asset twice"
-            )));
-        }
-        sources.push(AssetSource {
-            asset: RuntimeAsset {
-                source: source.to_string_lossy().into_owned(),
-                destination,
-            },
-            len: metadata.len(),
-            mtime_ns: modified_nanos(&metadata),
-        });
-    }
-
-    let remote = declared_remote_providers(&bundle.remote_providers, &asset_keys)?;
+    let super::assets::GatheredBundle { sources, remote } =
+        super::assets::gather_bundle(owner, bundle, &core_path).await?;
 
     let previous = match read_manifest(&generation).await {
         Ok(previous) => previous,
@@ -407,7 +382,7 @@ pub(super) async fn source_identity_changed(source: &str, recorded: &SourceIdent
 /// Absence is ordinary and merely costs the skips. A manifest that is present but unparseable is
 /// different: it means files were written here whose names can no longer be recovered, so they can
 /// never be swept. Reporting it lets the caller rebuild the generation from nothing instead.
-async fn read_manifest(generation: &Path) -> Result<RuntimeManifest, String> {
+pub(super) async fn read_manifest(generation: &Path) -> Result<RuntimeManifest, String> {
     let path = generation.join(MANIFEST_FILE_NAME);
     match tokio::fs::read(&path).await {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -445,7 +420,7 @@ where
     }
 }
 
-async fn remove_staged_file(path: &Path) -> std::io::Result<()> {
+pub(super) async fn remove_staged_file(path: &Path) -> std::io::Result<()> {
     while_the_core_lets_go(|| async {
         match tokio::fs::remove_file(path).await {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -469,7 +444,7 @@ async fn replace_staged_file(staged: &Path, destination: &Path) -> std::io::Resu
     result
 }
 
-async fn copy_staged_file(source: &str, destination: &Path) -> std::io::Result<()> {
+pub(super) async fn copy_staged_file(source: &str, destination: &Path) -> std::io::Result<()> {
     if let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -481,7 +456,7 @@ async fn copy_staged_file(source: &str, destination: &Path) -> std::io::Result<(
     replace_staged_file(&staged, destination).await
 }
 
-async fn commit_staged_config(
+pub(super) async fn commit_staged_config(
     generation: &Path,
     config_path: &Path,
     yaml: &str,

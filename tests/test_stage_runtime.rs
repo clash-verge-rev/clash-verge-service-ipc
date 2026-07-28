@@ -30,24 +30,17 @@ fn owner_in(app_root: &Path) -> Result<(OwnerCredentials, PathBuf)> {
     Ok((credentials, canonical))
 }
 
-/// The one generation directory the owner has. Staging is defined against it, so a test that
-/// found none — or several — is not testing what it thinks it is.
+/// The one generation directory the owner has. Staging is defined against it, and so is every
+/// start: an owner has exactly one, kept for the life of the installation.
 fn sole_generation(credentials: &OwnerCredentials) -> Result<PathBuf> {
-    let root = service_paths().for_owner(&credentials.identity);
-    let mut generations: Vec<PathBuf> = std::fs::read_dir(root.root())?
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("runtime.generation-"))
-        })
-        .collect();
+    let generation = service_paths()
+        .for_owner(&credentials.identity)
+        .runtime_dir();
     anyhow::ensure!(
-        generations.len() == 1,
-        "expected exactly one runtime generation, found {generations:?}"
+        generation.is_dir(),
+        "the owner has no runtime generation at {generation:?}"
     );
-    Ok(generations.remove(0))
+    Ok(generation)
 }
 
 fn bundle(app_root: &Path, yaml: &str) -> RuntimeBundle {
