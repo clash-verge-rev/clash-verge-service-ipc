@@ -1,4 +1,3 @@
-use super::state::IpcState;
 use crate::core::auth::{
     AuthenticatedOwner, ServiceError, authenticate_owner, hash_session_token,
     ipc_request_context_to_auth_context,
@@ -296,6 +295,29 @@ async fn rollback_started_owner(owner: &AuthenticatedOwner) -> AnyResult<()> {
 // 防止旧 listener 的清理删除 supervisor 刚创建的新 socket。
 static IPC_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+/// The listener and the two ends of its shutdown handshake.
+///
+/// One supervisor owns all three at a time — `IPC_LIFECYCLE_LOCK` is what makes that true — but
+/// each is taken and replaced independently as a listener is torn down and rebuilt, so they are
+/// three cells rather than one.
+static IPC_SERVER: Lazy<Mutex<Option<IpcHttpServer>>> = Lazy::new(|| Mutex::new(None));
+static IPC_SHUTDOWN_SENDER: Lazy<Mutex<Option<oneshot::Sender<()>>>> =
+    Lazy::new(|| Mutex::new(None));
+static IPC_SHUTDOWN_DONE: Lazy<Mutex<Option<oneshot::Receiver<()>>>> =
+    Lazy::new(|| Mutex::new(None));
+
+/// Tell the listener to stop, then forget it.
+///
+/// The order matters and is the only reason this is a function: dropping the handle without
+/// calling `shutdown` leaves the listener running with nobody holding it.
+async fn shutdown_ipc_server() {
+    let mut guard = IPC_SERVER.lock().await;
+    if let Some(server) = guard.as_mut() {
+        server.shutdown();
+    }
+    *guard = None;
+}
+
 pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     let _lifecycle_guard = IPC_LIFECYCLE_LOCK.lock().await;
 
@@ -306,10 +328,10 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let (done_tx, done_rx) = oneshot::channel::<()>();
 
-    IpcState::global().set_sender(shutdown_tx).await;
-    IpcState::global().set_done(done_rx).await;
+    *IPC_SHUTDOWN_SENDER.lock().await = Some(shutdown_tx);
+    *IPC_SHUTDOWN_DONE.lock().await = Some(done_rx);
 
-    if let Some(mut server) = IpcState::global().take_server().await {
+    if let Some(mut server) = IPC_SERVER.lock().await.take() {
         let handle = tokio::spawn(async move {
             let res = tokio::select! {
                 res = server.serve() => res,
@@ -337,15 +359,15 @@ pub async fn stop_ipc_server() -> Result<()> {
         .await
         .map_err(|error| kode_bridge::KodeBridgeError::custom(error.to_string()))?;
 
-    if let Some(sender) = IpcState::global().take_sender().await {
+    if let Some(sender) = IPC_SHUTDOWN_SENDER.lock().await.take() {
         let _ = sender.send(());
     }
 
-    if let Some(done) = IpcState::global().take_done().await {
+    if let Some(done) = IPC_SHUTDOWN_DONE.lock().await.take() {
         let _ = done.await;
     }
 
-    IpcState::global().shutdown_server().await;
+    shutdown_ipc_server().await;
 
     cleanup_ipc_path().await?;
     #[cfg(windows)]
@@ -515,7 +537,7 @@ async fn init_ipc_state() -> Result<()> {
     let server = create_ipc_server()?;
     let router = create_ipc_router()?;
     let server = server.router(router);
-    IpcState::global().set_server(server).await;
+    *IPC_SERVER.lock().await = Some(server);
     Ok(())
 }
 
