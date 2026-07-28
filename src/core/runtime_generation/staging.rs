@@ -20,7 +20,7 @@
 //! mean hashing tens of megabytes of geo data on every profile switch, which is most of what
 //! staging was supposed to save. The manifest records what each copy was made from instead.
 
-use crate::core::assets::{
+use super::assets::{
     application_bundle_root, destination_key, invalid_asset, resolve_in_generation,
     runtime_cleanup_retry_delay, validate_core_path, validate_destination, validate_source,
 };
@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The name staging keeps its own bookkeeping under, inside the generation.
-pub(crate) const MANIFEST_FILE_NAME: &str = ".runtime-manifest.json";
+pub(super) const MANIFEST_FILE_NAME: &str = ".runtime-manifest.json";
 
 /// Identity of a copy's source at the moment the copy was made.
 ///
@@ -46,7 +46,7 @@ pub(crate) const MANIFEST_FILE_NAME: &str = ".runtime-manifest.json";
 /// nothing to compare. Collapsing that case into a number would make every same-length change
 /// look unchanged, silently and forever — so an unknown time simply never matches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SourceIdentity {
+pub(super) struct SourceIdentity {
     pub source: String,
     pub len: u64,
     #[serde(default)]
@@ -66,7 +66,7 @@ impl SourceIdentity {
 /// it means nothing can be proven, so nothing is skipped, nothing is swept, and every declared
 /// remote cache is discarded rather than trusted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RuntimeManifest {
+pub(super) struct RuntimeManifest {
     #[serde(default)]
     pub assets: BTreeMap<String, SourceIdentity>,
     #[serde(default)]
@@ -75,7 +75,7 @@ pub(crate) struct RuntimeManifest {
 
 /// A copy staging intends to make, with the identity to record once it succeeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PlannedCopy {
+pub(super) struct PlannedCopy {
     pub source: String,
     pub destination: String,
     pub identity: SourceIdentity,
@@ -83,7 +83,7 @@ pub(crate) struct PlannedCopy {
 
 /// The full set of changes that turn a generation into the bundle, ordered by when they matter.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct StagePlan {
+pub(super) struct StagePlan {
     /// Stale remote caches. Must be gone before the core reloads.
     pub required_deletes: Vec<String>,
     /// Assets whose source changed since the copy on disk was made.
@@ -99,14 +99,14 @@ pub(crate) struct StagePlan {
 
 /// Freshly stat'd metadata for one declared asset's source, gathered by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AssetSource {
+pub(super) struct AssetSource {
     pub asset: RuntimeAsset,
     pub len: u64,
     pub mtime_ns: Option<u128>,
 }
 
 /// Decide what staging must do. Pure: every fact it needs has already been read.
-pub(crate) fn plan_stage(
+pub(super) fn plan_stage(
     previous: &RuntimeManifest,
     sources: &[AssetSource],
     remote: &[RemoteProvider],
@@ -174,7 +174,7 @@ pub(crate) fn plan_stage(
 /// owns the file, and staging has no way to settle it: it cannot know which url produced the cache
 /// on disk, and copying an asset over what the core fetched would pin the wrong content — silently
 /// and permanently, because the next staging would find both records matching and skip both.
-pub(crate) fn declared_remote_providers(
+pub(super) fn declared_remote_providers(
     declared: &[RemoteProvider],
     asset_destinations: &BTreeSet<String>,
 ) -> Result<Vec<RemoteProvider>, ServiceError> {
@@ -381,7 +381,7 @@ pub(crate) async fn stage_runtime(
     })
 }
 
-pub(crate) fn modified_nanos(metadata: &std::fs::Metadata) -> Option<u128> {
+pub(super) fn modified_nanos(metadata: &std::fs::Metadata) -> Option<u128> {
     metadata
         .modified()
         .ok()
@@ -393,7 +393,7 @@ pub(crate) fn modified_nanos(metadata: &std::fs::Metadata) -> Option<u128> {
 ///
 /// Reads metadata only. An unreadable source counts as changed, since a copy that cannot be
 /// re-checked is a copy whose record cannot be trusted.
-pub(crate) async fn source_identity_changed(source: &str, recorded: &SourceIdentity) -> bool {
+pub(super) async fn source_identity_changed(source: &str, recorded: &SourceIdentity) -> bool {
     match tokio::fs::metadata(source).await {
         Ok(metadata) => {
             metadata.len() != recorded.len || modified_nanos(&metadata) != recorded.mtime_ns
@@ -496,7 +496,7 @@ async fn commit_staged_config(
     write_atomically(config_path, yaml.as_bytes()).await
 }
 
-pub(crate) async fn write_atomically(destination: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(super) async fn write_atomically(destination: &Path, contents: &[u8]) -> std::io::Result<()> {
     async fn write_temp(staged: &Path, contents: &[u8]) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt as _;
 
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn a_name_shaped_like_a_staging_temporary_is_refused_but_a_lookalike_is_not() {
-        use crate::core::assets::destination_key;
+        use super::destination_key;
         use std::path::Path;
 
         for temporary in [".config.yaml.staging-123-4", ".geoip.metadb.staging-1-0"] {
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn the_names_the_generation_owns_are_refused_whatever_their_case() {
-        use crate::core::assets::destination_key;
+        use super::destination_key;
         use std::path::Path;
 
         // Most Windows filesystems are case-insensitive, so `Config.yaml` would be a second

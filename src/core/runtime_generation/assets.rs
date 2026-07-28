@@ -219,7 +219,7 @@ async fn remove_runtime_directory(path: &Path, operation: &str) -> std::io::Resu
 /// the set errs towards retrying, and the cost of a wrong guess is a bounded delay before the
 /// caller falls back.
 #[cfg(windows)]
-pub(crate) fn runtime_cleanup_retry_delay(
+pub(super) fn runtime_cleanup_retry_delay(
     error: &std::io::Error,
     retry_index: usize,
 ) -> Option<Duration> {
@@ -246,7 +246,7 @@ pub(crate) fn runtime_cleanup_retry_delay(
 }
 
 #[cfg(not(windows))]
-pub(crate) fn runtime_cleanup_retry_delay(
+pub(super) fn runtime_cleanup_retry_delay(
     _error: &std::io::Error,
     _retry_index: usize,
 ) -> Option<Duration> {
@@ -345,7 +345,7 @@ async fn materialize_runtime(
     set_private_directory_permissions(runtime).await?;
 
     let app_bundle_root = application_bundle_root(core_path);
-    let mut manifest = crate::core::staging::RuntimeManifest::default();
+    let mut manifest = super::staging::RuntimeManifest::default();
     let mut asset_destinations = std::collections::BTreeSet::new();
     for asset in &bundle.assets {
         let source = validate_source(owner, app_bundle_root.as_deref(), &asset.source)?;
@@ -369,10 +369,10 @@ async fn materialize_runtime(
                 "runtime destination {key:?} is declared as a copied asset twice"
             )));
         }
-        let identity = crate::core::staging::SourceIdentity {
+        let identity = super::staging::SourceIdentity {
             source: source.to_string_lossy().into_owned(),
             len: metadata.len(),
-            mtime_ns: crate::core::staging::modified_nanos(&metadata),
+            mtime_ns: super::staging::modified_nanos(&metadata),
         };
         // The identity was read before the copy, so a source rewritten in between would be recorded
         // as content that is not on disk — and then skipped by every staging that follows, because
@@ -380,7 +380,7 @@ async fn materialize_runtime(
         // start path has to as well, now that it writes the record. Omitting the entry is enough
         // here: a destination the manifest does not mention is one nothing can be proven about, and
         // the next staging simply copies it again.
-        if crate::core::staging::source_identity_changed(&identity.source, &identity).await {
+        if super::staging::source_identity_changed(&identity.source, &identity).await {
             tracing::warn!(
                 destination = %key,
                 "Runtime asset changed while being copied; not recording what it was copied from"
@@ -389,10 +389,9 @@ async fn materialize_runtime(
             manifest.assets.insert(key, identity);
         }
     }
-    for provider in crate::core::staging::declared_remote_providers(
-        &bundle.remote_providers,
-        &asset_destinations,
-    )? {
+    for provider in
+        super::staging::declared_remote_providers(&bundle.remote_providers, &asset_destinations)?
+    {
         manifest
             .remote_providers
             .insert(provider.destination, provider.url);
@@ -418,12 +417,10 @@ async fn materialize_runtime(
     //
     // A manifest that cannot be written is not a reason to refuse to start a core. Its absence is
     // already a defined state: the next staging proves nothing and does the slow thing.
-    let manifest_path = runtime.join(crate::core::staging::MANIFEST_FILE_NAME);
+    let manifest_path = runtime.join(super::staging::MANIFEST_FILE_NAME);
     match serde_json::to_vec(&manifest) {
         Ok(encoded) => {
-            if let Err(error) =
-                crate::core::staging::write_atomically(&manifest_path, &encoded).await
-            {
+            if let Err(error) = super::staging::write_atomically(&manifest_path, &encoded).await {
                 tracing::warn!(
                     error = %error,
                     "Started without a runtime manifest; the first configuration change will re-copy every asset"
@@ -437,7 +434,7 @@ async fn materialize_runtime(
     Ok(())
 }
 
-pub(crate) fn validate_core_path(
+pub(super) fn validate_core_path(
     owner: &AuthenticatedOwner,
     core_path: &str,
 ) -> Result<PathBuf, ServiceError> {
@@ -471,7 +468,7 @@ pub(crate) fn validate_core_path(
     Ok(canonical)
 }
 
-pub(crate) fn validate_source(
+pub(super) fn validate_source(
     owner: &AuthenticatedOwner,
     app_bundle_root: Option<&Path>,
     source: &str,
@@ -506,7 +503,7 @@ fn canonical_regular_file(path: &Path, label: &str) -> Result<PathBuf, ServiceEr
         .map_err(|error| invalid_asset(format!("failed to canonicalize {label}: {error}")))
 }
 
-pub(crate) fn validate_destination(destination: &str) -> Result<PathBuf, ServiceError> {
+pub(super) fn validate_destination(destination: &str) -> Result<PathBuf, ServiceError> {
     let path = Path::new(destination);
     if path.as_os_str().is_empty()
         || path.is_absolute()
@@ -522,9 +519,9 @@ pub(crate) fn validate_destination(destination: &str) -> Result<PathBuf, Service
 }
 
 /// The file a runtime generation's configuration always lives in.
-pub(crate) const RUNTIME_CONFIG_FILE_NAME: &str = "config.yaml";
+pub(super) const RUNTIME_CONFIG_FILE_NAME: &str = "config.yaml";
 /// The infix every file staging writes as a temporary carries.
-pub(crate) const STAGING_TEMP_INFIX: &str = ".staging-";
+pub(super) const STAGING_TEMP_INFIX: &str = ".staging-";
 
 /// Reduce a validated destination to the single string form used as its key everywhere.
 ///
@@ -538,7 +535,7 @@ pub(crate) const STAGING_TEMP_INFIX: &str = ".staging-";
 /// could have its configuration deleted by the next staging's housekeeping sweep; one that could
 /// claim the manifest could rewrite the record staging trusts; one that could claim a staging
 /// temporary could be clobbered mid-write.
-pub(crate) fn destination_key(destination: &Path) -> Result<String, ServiceError> {
+pub(super) fn destination_key(destination: &Path) -> Result<String, ServiceError> {
     let mut parts = Vec::new();
     for component in destination.components() {
         let Component::Normal(part) = component else {
@@ -561,7 +558,7 @@ pub(crate) fn destination_key(destination: &Path) -> Result<String, ServiceError
         // runs after the configuration is committed — would then delete the live configuration.
         [only]
             if only.eq_ignore_ascii_case(RUNTIME_CONFIG_FILE_NAME)
-                || only.eq_ignore_ascii_case(crate::core::staging::MANIFEST_FILE_NAME) =>
+                || only.eq_ignore_ascii_case(super::staging::MANIFEST_FILE_NAME) =>
         {
             Err(invalid_asset(format!(
                 "runtime asset destination {only:?} is owned by the runtime generation"
@@ -595,7 +592,7 @@ fn is_staging_temporary(name: &str) -> bool {
 ///
 /// Applied to keys read back from the manifest as well as to keys from the bundle: the manifest is
 /// a file, and a file is a thing that can be wrong.
-pub(crate) fn resolve_in_generation(
+pub(super) fn resolve_in_generation(
     generation: &Path,
     destination: &str,
 ) -> Result<PathBuf, ServiceError> {
@@ -603,7 +600,7 @@ pub(crate) fn resolve_in_generation(
     Ok(generation.join(key))
 }
 
-pub(crate) fn application_bundle_root(core_path: &Path) -> Option<PathBuf> {
+pub(super) fn application_bundle_root(core_path: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         core_path
@@ -618,7 +615,7 @@ pub(crate) fn application_bundle_root(core_path: &Path) -> Option<PathBuf> {
     }
 }
 
-pub(crate) fn invalid_asset(message: impl Into<String>) -> ServiceError {
+pub(super) fn invalid_asset(message: impl Into<String>) -> ServiceError {
     ServiceError::new(ServiceErrorCode::InvalidRuntimeAsset, message)
 }
 

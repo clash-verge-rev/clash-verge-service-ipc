@@ -1,5 +1,4 @@
 use super::state::IpcState;
-use crate::core::assets::{PreparedRuntime, prepare_runtime};
 use crate::core::auth::{
     AuthenticatedOwner, ServiceError, authenticate_owner, hash_session_token,
     ipc_request_context_to_auth_context,
@@ -13,7 +12,7 @@ use crate::core::legacy_cleanup::cleanup_legacy_owner_files;
 use crate::core::logger::set_or_update_writer;
 use crate::core::manager::{CORE_MANAGER, LOGGER_MANAGER};
 use crate::core::paths::service_paths;
-use crate::core::staging::stage_runtime;
+use crate::core::runtime_generation::{PreparedRuntime, prepare_runtime, stage_runtime};
 use crate::core::state::{set_core_lifecycle_state, set_service_lifecycle_state};
 use crate::core::status::service_status_snapshot;
 use crate::core::structure::{OwnerSessionProof, Response, ServiceLifecycleState};

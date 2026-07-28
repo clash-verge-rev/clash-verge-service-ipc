@@ -17,8 +17,6 @@ pub use paths::prepare_service_install_directory;
 pub use paths::{OwnerPaths, ServicePaths, mihomo_ipc_path, service_paths};
 
 #[cfg(feature = "standalone")]
-mod assets;
-#[cfg(feature = "standalone")]
 mod atomic_file;
 #[cfg(feature = "standalone")]
 mod auth;
@@ -45,9 +43,10 @@ mod repair;
 #[cfg(feature = "standalone")]
 mod runtime;
 #[cfg(feature = "standalone")]
+mod runtime_generation;
+#[cfg(feature = "standalone")]
 mod server;
 #[cfg(feature = "standalone")]
-mod staging;
 #[cfg(feature = "standalone")]
 mod state;
 #[cfg(feature = "standalone")]
