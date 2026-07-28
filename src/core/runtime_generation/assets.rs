@@ -450,10 +450,7 @@ pub(super) fn validate_core_path(
                 .flatten()
         });
         let allowed = cfg!(feature = "test")
-            || canonical.starts_with("/Applications")
-            || home_applications
-                .as_ref()
-                .is_some_and(|root| canonical.starts_with(root));
+            || is_permitted_macos_core_location(&canonical, home_applications.as_deref());
         if !allowed {
             return Err(ServiceError::new(
                 ServiceErrorCode::InvalidInstallLocation,
@@ -466,6 +463,21 @@ pub(super) fn validate_core_path(
     let _ = owner;
 
     Ok(canonical)
+}
+
+/// Where a macOS core binary is allowed to live.
+///
+/// This is the whole security value of the macOS arm of [`validate_core_path`]: a core outside an
+/// Applications directory is one the owner could have written wherever it liked, without the
+/// protections macOS gives an installed application.
+///
+/// It takes plain paths rather than an owner so the rule can be checked without a filesystem, a
+/// running service, or a particular build. The `test` escape hatch stays at the call site — this
+/// function always answers the production question.
+#[cfg(target_os = "macos")]
+fn is_permitted_macos_core_location(canonical: &Path, home_applications: Option<&Path>) -> bool {
+    canonical.starts_with("/Applications")
+        || home_applications.is_some_and(|root| canonical.starts_with(root))
 }
 
 pub(super) fn validate_source(
@@ -688,10 +700,13 @@ async fn prepare_owner_ipc_directory(owner: &AuthenticatedOwner) -> Result<(), S
         let inspected = unsafe { platform_lib::fstat(fd, &mut stat) } == 0;
         let effective_uid = unsafe { platform_lib::geteuid() };
         let test_process_owned = cfg!(feature = "test") && stat.st_uid == effective_uid;
-        if !inspected
-            || stat.st_mode & platform_lib::S_IFMT != platform_lib::S_IFDIR
-            || (stat.st_uid != 0 && stat.st_uid != uid && !test_process_owned)
-        {
+        if !owner_ipc_directory_is_usable(
+            inspected,
+            stat.st_mode,
+            stat.st_uid,
+            uid,
+            test_process_owned,
+        ) {
             unsafe { platform_lib::close(fd) };
             return Err(invalid_asset(
                 "owner IPC directory has an unexpected owner or file type",
@@ -713,6 +728,117 @@ async fn prepare_owner_ipc_directory(owner: &AuthenticatedOwner) -> Result<(), S
     let _ = owner;
 
     Ok(())
+}
+
+/// Whether an already-open directory is one the service may use as an owner's IPC directory.
+///
+/// Root owns it when the installer made it; the owner owns it after a handover. Anything else is
+/// a directory somebody else can write to, and the core's socket must not be created inside one.
+///
+/// The facts arrive as plain values so the rule can be checked without an `fstat`, a real
+/// directory, or root. `process_owned` is the caller's `test`-build concession — no test runs as
+/// root — and this function stays honest about the rest regardless of build.
+#[cfg(unix)]
+fn owner_ipc_directory_is_usable(
+    inspected: bool,
+    mode: platform_lib::mode_t,
+    directory_uid: u32,
+    owner_uid: u32,
+    process_owned: bool,
+) -> bool {
+    inspected
+        && mode & platform_lib::S_IFMT == platform_lib::S_IFDIR
+        && (directory_uid == 0 || directory_uid == owner_uid || process_owned)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_core_location_tests {
+    use super::is_permitted_macos_core_location;
+    use std::path::Path;
+
+    #[test]
+    fn accepts_a_system_applications_core() {
+        assert!(is_permitted_macos_core_location(
+            Path::new("/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn accepts_a_core_under_the_owners_own_applications() {
+        assert!(is_permitted_macos_core_location(
+            Path::new("/Users/someone/Applications/Clash Verge.app/core"),
+            Some(Path::new("/Users/someone/Applications")),
+        ));
+    }
+
+    #[test]
+    fn rejects_a_core_the_owner_could_have_dropped_anywhere() {
+        assert!(!is_permitted_macos_core_location(
+            Path::new("/tmp/verge-mihomo"),
+            Some(Path::new("/Users/someone/Applications")),
+        ));
+        assert!(!is_permitted_macos_core_location(
+            Path::new("/Users/someone/Downloads/verge-mihomo"),
+            Some(Path::new("/Users/someone/Applications")),
+        ));
+    }
+
+    #[test]
+    fn rejects_another_users_applications_directory() {
+        assert!(!is_permitted_macos_core_location(
+            Path::new("/Users/someone-else/Applications/evil.app/core"),
+            Some(Path::new("/Users/someone/Applications")),
+        ));
+    }
+
+    #[test]
+    fn does_not_accept_a_prefix_that_merely_looks_alike() {
+        assert!(!is_permitted_macos_core_location(
+            Path::new("/Applications-elsewhere/verge-mihomo"),
+            None,
+        ));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod owner_ipc_directory_tests {
+    use super::owner_ipc_directory_is_usable;
+
+    const DIR: platform_lib::mode_t = platform_lib::S_IFDIR | 0o700;
+    const FILE: platform_lib::mode_t = platform_lib::S_IFREG | 0o600;
+
+    #[test]
+    fn accepts_a_root_owned_directory() {
+        assert!(owner_ipc_directory_is_usable(true, DIR, 0, 501, false));
+    }
+
+    #[test]
+    fn accepts_a_directory_already_handed_to_the_owner() {
+        assert!(owner_ipc_directory_is_usable(true, DIR, 501, 501, false));
+    }
+
+    #[test]
+    fn rejects_a_directory_belonging_to_somebody_else() {
+        assert!(!owner_ipc_directory_is_usable(true, DIR, 502, 501, false));
+    }
+
+    #[test]
+    fn accepts_somebody_elses_directory_only_when_the_caller_allows_it() {
+        assert!(owner_ipc_directory_is_usable(true, DIR, 502, 501, true));
+    }
+
+    #[test]
+    fn rejects_anything_that_is_not_a_directory() {
+        assert!(!owner_ipc_directory_is_usable(true, FILE, 0, 501, false));
+        assert!(!owner_ipc_directory_is_usable(true, FILE, 501, 501, true));
+    }
+
+    #[test]
+    fn rejects_a_directory_it_could_not_inspect() {
+        assert!(!owner_ipc_directory_is_usable(false, DIR, 0, 501, false));
+        assert!(!owner_ipc_directory_is_usable(false, DIR, 501, 501, true));
+    }
 }
 
 #[cfg(test)]
