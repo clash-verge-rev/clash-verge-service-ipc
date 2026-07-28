@@ -38,11 +38,25 @@ pub(crate) struct PreparedRuntime {
     clash_config: ClashConfig,
     runtime: PathBuf,
     stale_runtime_paths: Vec<PathBuf>,
+    plan: super::staging::StagePlan,
+    yaml: String,
 }
 
 impl PreparedRuntime {
     pub(crate) fn clash_config(&self) -> &ClashConfig {
         &self.clash_config
+    }
+
+    /// Write the planned changes into the generation.
+    ///
+    /// Separate from planning them because the generation is now the *same* directory the
+    /// outgoing core is running in, and this rewrites it. Planning happens before anything is
+    /// stopped, so a bundle the service will not accept still costs no outage; writing happens
+    /// after, so nothing is replaced under a core that still has it open. On Windows that is the
+    /// difference between a restart and a failed one — a geo database the running core has
+    /// memory-mapped cannot be replaced at all while it lives.
+    pub(crate) async fn materialize(&self) -> Result<(), ServiceError> {
+        materialize_plan(&self.runtime, &self.plan, &self.yaml).await
     }
 
     /// The core started against this generation: retire whatever the old layout left behind.
@@ -271,45 +285,67 @@ pub(crate) async fn prepare_runtime(
         },
         runtime: runtime.clone(),
         stale_runtime_paths: Vec::new(),
+        plan: plan_runtime_refresh(owner, bundle, &core_path, &runtime).await?,
+        yaml: bundle.yaml.clone(),
     };
-    refresh_runtime(owner, bundle, &core_path, &runtime).await?;
     prepared.stale_runtime_paths = snapshot_stale_runtime_directories(owner_root, &runtime).await;
     Ok(prepared)
 }
 
-/// Make the owner's generation match `bundle`, ready for a core to be started against it.
+/// Work out what would make the owner's generation match `bundle`. Writes nothing.
 ///
-/// The same plan `stage_runtime` uses, for the same reasons: an asset is re-copied only when
-/// its source changed, a remote provider's download cache is discarded exactly when its url
-/// changed, and nothing is deleted that the previous manifest did not record. That last rule is
-/// what carries the core's own files — `cache.db` above all — across a restart, and it is the
-/// point of running the plan here rather than copying blindly into an empty directory.
-///
-/// The order is the plan's own, and it is the same order staging applies: stale caches go before
-/// the copies, and `config.yaml` is committed last and atomically. No core is reading yet, so the
-/// ordering is not about what a live core might see — it is about what is on disk if this fails.
-/// A failure before the commit leaves the generation still describing the configuration the
-/// previous core ran, which is exactly what the desired-state restore would start again.
+/// The same plan `stage_runtime` uses, for the same reasons: an asset is re-copied only when its
+/// source changed, a remote provider's download cache is discarded exactly when its url changed,
+/// and nothing is deleted that the previous manifest did not record. That last rule is what
+/// carries the core's own files — `cache.db` above all — across a restart, and it is the point of
+/// running the plan here rather than copying blindly into an empty directory.
 ///
 /// A first start finds no manifest, which the plan reads as "nothing can be proven": it copies
 /// every asset and skips nothing, which is what building an empty generation always did.
-async fn refresh_runtime(
+async fn plan_runtime_refresh(
     owner: &AuthenticatedOwner,
     bundle: &RuntimeBundle,
     core_path: &Path,
     runtime: &Path,
-) -> Result<(), ServiceError> {
-    // Everything the bundle declares is validated and stat'd before a single byte moves, so a
-    // bundle this service will not accept cannot leave the generation half-rewritten.
+) -> Result<super::staging::StagePlan, ServiceError> {
     let gathered = gather_bundle(owner, bundle, core_path).await?;
-
+    // A manifest that cannot be read is not a reason to refuse to start a core. It is the same
+    // state as no manifest at all — nothing can be proven — and the plan already answers that by
+    // copying everything and sweeping nothing. Staging can afford to decline and let the caller
+    // restart; a start has nowhere to fall back to, and the caller's fallback for a declined
+    // staging *is* a start. Refusing here turns a corrupt bookkeeping file into no core at all,
+    // with every retry hitting the same file.
     let previous = super::staging::read_manifest(runtime)
         .await
-        .map_err(|detail| {
-            invalid_asset(format!("failed to read the runtime manifest: {detail}"))
-        })?;
-    let plan = super::staging::plan_stage(&previous, &gathered.sources, &gathered.remote);
+        .unwrap_or_else(|detail| {
+            tracing::warn!(
+                detail = %detail,
+                "Rebuilding the runtime generation from nothing: its manifest could not be read"
+            );
+            super::staging::RuntimeManifest::default()
+        });
+    Ok(super::staging::plan_stage(
+        &previous,
+        &gathered.sources,
+        &gathered.remote,
+    ))
+}
 
+/// Apply a plan to the generation.
+///
+/// The order is the plan's own, and the same one staging applies: stale caches before the copies,
+/// `config.yaml` committed last and atomically. Here it is not about what a live core might see —
+/// the caller has already stopped it — but about what is on disk if this fails part way. A failure
+/// before the commit leaves the generation still describing the configuration the previous core
+/// ran, which is what the desired-state restore would start again.
+async fn materialize_plan(
+    runtime: &Path,
+    plan: &super::staging::StagePlan,
+    yaml: &str,
+) -> Result<(), ServiceError> {
+    // The plan is shared, so what gets recorded is corrected here: a copy whose source moved
+    // under it loses its entry rather than the whole start losing.
+    let mut manifest = plan.manifest.clone();
     for destination in &plan.required_deletes {
         let target = resolve_in_generation(runtime, destination)?;
         super::staging::remove_staged_file(&target)
@@ -335,16 +371,22 @@ async fn refresh_runtime(
         // content that is no longer there, and every later staging would then skip it because
         // the record still matches the source. One stat against a warm file beats pinning the
         // wrong bytes for the life of the generation.
+        //
+        // Staging turns this into a restart; a start cannot, and does not need to. Dropping the
+        // entry says the same thing the manifest says about any destination it omits — nothing is
+        // proven about it — so the next staging copies it again. A geo database being rewritten
+        // while the core starts must not be a start failure.
         if super::staging::source_identity_changed(&copy.source, &copy.identity).await {
-            return Err(invalid_asset(format!(
-                "runtime asset {} changed while it was being copied",
-                copy.destination
-            )));
+            tracing::warn!(
+                destination = %copy.destination,
+                "Runtime asset changed while being copied; not recording what it was copied from"
+            );
+            manifest.assets.remove(&copy.destination);
         }
     }
 
     let config_path = runtime.join(RUNTIME_CONFIG_FILE_NAME);
-    super::staging::commit_staged_config(runtime, &config_path, &bundle.yaml, &plan.manifest)
+    super::staging::commit_staged_config(runtime, &config_path, yaml, &manifest)
         .await
         .map_err(|error| {
             invalid_asset(format!(
@@ -879,10 +921,23 @@ mod runtime_gc_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{PreparedRuntime, prepare_runtime};
-    use crate::core::auth::AuthenticatedOwner;
+    use crate::core::auth::{AuthenticatedOwner, ServiceError};
     use crate::{OwnerIdentity, RuntimeAsset, RuntimeBundle, ServiceErrorCode};
     use serial_test::serial;
     use std::path::PathBuf;
+
+    /// Plan and then write, which is the pair the start path performs.
+    ///
+    /// They are separate in production because the write happens only once the previous core has
+    /// been stopped; a test with no core running can do both at once.
+    async fn prepare_and_materialize(
+        owner: &AuthenticatedOwner,
+        bundle: &RuntimeBundle,
+    ) -> Result<PreparedRuntime, ServiceError> {
+        let prepared = prepare_runtime(owner, bundle).await?;
+        prepared.materialize().await?;
+        Ok(prepared)
+    }
 
     fn test_owner(app_data_root: std::path::PathBuf) -> AuthenticatedOwner {
         // `ensure_service_directory` creates one level and then hardens it, so it needs its parent
@@ -926,7 +981,7 @@ mod tests {
             core_path: app_root.join("mihomo").to_string_lossy().into_owned(),
         };
 
-        let prepared = prepare_runtime(&owner, &bundle).await?;
+        let prepared = prepare_and_materialize(&owner, &bundle).await?;
 
         assert_eq!(
             std::fs::read_to_string(&prepared.clash_config.core_config.config_path)?,
@@ -966,7 +1021,7 @@ mod tests {
             core_path: app_root.join("mihomo").to_string_lossy().into_owned(),
         };
 
-        let prepared = prepare_runtime(&owner, &bundle).await?;
+        let prepared = prepare_and_materialize(&owner, &bundle).await?;
         std::fs::remove_file(source)?;
 
         assert_eq!(
@@ -995,7 +1050,7 @@ mod tests {
             remote_providers: Vec::new(),
             core_path: app_root.join("mihomo").to_string_lossy().into_owned(),
         };
-        let prepared = prepare_runtime(&owner, &valid).await?;
+        let prepared = prepare_and_materialize(&owner, &valid).await?;
         let invalid = RuntimeBundle {
             yaml: "mode: global\n".to_string(),
             assets: vec![RuntimeAsset {
@@ -1050,10 +1105,10 @@ mod tests {
             core_path: app_root.join("mihomo").to_string_lossy().into_owned(),
         };
 
-        let first = prepare_runtime(&owner, &bundle).await?;
+        let first = prepare_and_materialize(&owner, &bundle).await?;
         std::fs::write(core_owned_state(&first), b"the node the user picked")?;
 
-        let second = prepare_runtime(&owner, &bundle).await?;
+        let second = prepare_and_materialize(&owner, &bundle).await?;
 
         assert_eq!(
             second.clash_config.core_config.config_dir, first.clash_config.core_config.config_dir,
@@ -1088,7 +1143,7 @@ mod tests {
             remote_providers: Vec::new(),
             core_path: app_root.join("mihomo").to_string_lossy().into_owned(),
         };
-        let prepared = prepare_runtime(&owner, &valid).await?;
+        let prepared = prepare_and_materialize(&owner, &valid).await?;
         std::fs::write(core_owned_state(&prepared), b"the node the user picked")?;
 
         let invalid = RuntimeBundle {
@@ -1118,6 +1173,238 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn planning_a_start_writes_nothing_into_the_generation() -> anyhow::Result<()> {
+        // The generation is the directory the *outgoing* core is still running in when a start is
+        // planned, so planning may not touch it. Only `materialize`, which the caller runs once
+        // that core has been stopped, is allowed to write. On Windows the difference is whether a
+        // restart works at all: a geo database the running core has memory-mapped cannot be
+        // replaced while it lives.
+        let app_root =
+            std::env::temp_dir().join(format!("service-runtime-planonly-{}", std::process::id()));
+        std::fs::create_dir_all(&app_root)?;
+        std::fs::write(app_root.join("asset"), b"new asset")?;
+        std::fs::write(app_root.join("mihomo"), b"mock core")?;
+        let owner = test_owner(std::fs::canonicalize(&app_root)?);
+        let core_path = app_root.join("mihomo").to_string_lossy().into_owned();
+        let running = RuntimeBundle {
+            yaml: "mode: rule\n".to_string(),
+            assets: vec![],
+            remote_providers: Vec::new(),
+            core_path: core_path.clone(),
+        };
+        let prepared = prepare_and_materialize(&owner, &running).await?;
+
+        let candidate = RuntimeBundle {
+            yaml: "mode: global\n".to_string(),
+            assets: vec![RuntimeAsset {
+                source: owner
+                    .app_data_root
+                    .join("asset")
+                    .to_string_lossy()
+                    .into_owned(),
+                destination: "providers/new.yaml".to_string(),
+            }],
+            remote_providers: Vec::new(),
+            core_path,
+        };
+        let planned = prepare_runtime(&owner, &candidate).await?;
+
+        let generation = PathBuf::from(&prepared.clash_config.core_config.config_dir);
+        assert_eq!(
+            std::fs::read_to_string(&prepared.clash_config.core_config.config_path)?,
+            "mode: rule\n",
+            "planning must leave the running core's configuration alone"
+        );
+        assert!(
+            !generation.join("providers/new.yaml").exists(),
+            "planning must not copy assets into a directory a core is running in"
+        );
+
+        planned.materialize().await?;
+
+        assert_eq!(
+            std::fs::read_to_string(&prepared.clash_config.core_config.config_path)?,
+            "mode: global\n"
+        );
+        assert!(generation.join("providers/new.yaml").exists());
+        std::fs::remove_dir_all(app_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn planning_a_start_writes_nothing() -> anyhow::Result<()> {
+        // The generation is the directory the outgoing core is still running in when a start is
+        // being planned — `StartClash` prepares before the owner transition stops anything. So
+        // planning has to be readable-only: a bundle is validated against a live core's directory
+        // and only written into it once that core is gone.
+        let app_root =
+            std::env::temp_dir().join(format!("service-runtime-planonly-{}", std::process::id()));
+        std::fs::create_dir_all(&app_root)?;
+        std::fs::write(app_root.join("provider.yaml"), b"first\n")?;
+        std::fs::write(app_root.join("mihomo"), b"mock core")?;
+        let owner = test_owner(std::fs::canonicalize(&app_root)?);
+        let asset = owner
+            .app_data_root
+            .join("provider.yaml")
+            .to_string_lossy()
+            .into_owned();
+        let running = RuntimeBundle {
+            yaml: "mode: rule\n".to_string(),
+            assets: vec![RuntimeAsset {
+                source: asset.clone(),
+                destination: "providers/one.yaml".to_string(),
+            }],
+            remote_providers: Vec::new(),
+            core_path: app_root.join("mihomo").to_string_lossy().into_owned(),
+        };
+        let live = prepare_and_materialize(&owner, &running).await?;
+        let generation = PathBuf::from(&live.clash_config.core_config.config_dir);
+
+        std::fs::write(app_root.join("provider.yaml"), b"second\n")?;
+        let next = RuntimeBundle {
+            yaml: "mode: global\n".to_string(),
+            ..running
+        };
+        let planned = prepare_runtime(&owner, &next).await?;
+
+        assert_eq!(
+            std::fs::read_to_string(&live.clash_config.core_config.config_path)?,
+            "mode: rule\n",
+            "planning must not replace the configuration the running core is using"
+        );
+        assert_eq!(
+            std::fs::read(generation.join("providers/one.yaml"))?,
+            b"first\n",
+            "planning must not replace an asset the running core has open"
+        );
+
+        planned.materialize().await?;
+
+        assert_eq!(
+            std::fs::read_to_string(&live.clash_config.core_config.config_path)?,
+            "mode: global\n"
+        );
+        assert_eq!(
+            std::fs::read(generation.join("providers/one.yaml"))?,
+            b"second\n"
+        );
+        std::fs::remove_dir_all(app_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn an_unreadable_manifest_rebuilds_rather_than_refusing_to_start() -> anyhow::Result<()> {
+        // The manifest is bookkeeping the user never sees. Staging can decline a corrupt one and
+        // let the caller restart — but the caller's fallback *is* a start, so if a start refused
+        // too, a truncated JSON file would leave the machine with no core and every retry would
+        // hit the same file.
+        let app_root =
+            std::env::temp_dir().join(format!("service-runtime-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(&app_root)?;
+        std::fs::write(app_root.join("provider.yaml"), b"proxies: []\n")?;
+        std::fs::write(app_root.join("mihomo"), b"mock core")?;
+        let owner = test_owner(std::fs::canonicalize(&app_root)?);
+        let bundle = RuntimeBundle {
+            yaml: "mode: rule\n".to_string(),
+            assets: vec![RuntimeAsset {
+                source: owner
+                    .app_data_root
+                    .join("provider.yaml")
+                    .to_string_lossy()
+                    .into_owned(),
+                destination: "providers/one.yaml".to_string(),
+            }],
+            remote_providers: Vec::new(),
+            core_path: app_root.join("mihomo").to_string_lossy().into_owned(),
+        };
+        let first = prepare_and_materialize(&owner, &bundle).await?;
+        let generation = PathBuf::from(&first.clash_config.core_config.config_dir);
+        std::fs::write(
+            generation.join(super::super::staging::MANIFEST_FILE_NAME),
+            b"{ this is not json",
+        )?;
+        std::fs::write(core_owned_state(&first), b"the node the user picked")?;
+        std::fs::remove_file(generation.join("providers/one.yaml"))?;
+
+        let second = prepare_and_materialize(&owner, &bundle).await?;
+
+        assert_eq!(
+            std::fs::read(generation.join("providers/one.yaml"))?,
+            b"proxies: []\n",
+            "proving nothing means copying everything, not giving up"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second.clash_config.core_config.config_path)?,
+            "mode: rule\n"
+        );
+        assert_eq!(
+            std::fs::read(core_owned_state(&second))?,
+            b"the node the user picked",
+            "rebuilding is not a reason to take the core's own state away"
+        );
+        std::fs::remove_dir_all(app_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_destination_the_manifest_omits_is_copied_again() -> anyhow::Result<()> {
+        // An asset rewritten while it was being copied is dropped from the manifest rather than
+        // failing the start — a geo database being updated must not leave the machine with no
+        // core. This tests what that costs, which is the whole claim: a destination nothing is
+        // proven about is copied again, so the omission is self-correcting.
+        //
+        // Driven by editing the manifest rather than by racing the copy, because the branch that
+        // omits the entry only fires on a rewrite between two stats microseconds apart. The
+        // omission is what it produces, and the omission is what has to be safe.
+        let app_root =
+            std::env::temp_dir().join(format!("service-runtime-omitted-{}", std::process::id()));
+        std::fs::create_dir_all(&app_root)?;
+        std::fs::write(app_root.join("geo.dat"), b"geo bytes")?;
+        std::fs::write(app_root.join("mihomo"), b"mock core")?;
+        let owner = test_owner(std::fs::canonicalize(&app_root)?);
+        let bundle = RuntimeBundle {
+            yaml: "mode: rule\n".to_string(),
+            assets: vec![RuntimeAsset {
+                source: owner
+                    .app_data_root
+                    .join("geo.dat")
+                    .to_string_lossy()
+                    .into_owned(),
+                destination: "geo.dat".to_string(),
+            }],
+            remote_providers: Vec::new(),
+            core_path: app_root.join("mihomo").to_string_lossy().into_owned(),
+        };
+
+        let first = prepare_and_materialize(&owner, &bundle).await?;
+        let generation = PathBuf::from(&first.clash_config.core_config.config_dir);
+        let manifest_path = generation.join(super::super::staging::MANIFEST_FILE_NAME);
+        let recorded: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        assert!(
+            recorded["assets"].get("geo.dat").is_some(),
+            "a copy that went through cleanly is recorded"
+        );
+
+        // What the tolerant branch leaves behind: the copy, without a record of what it was from.
+        std::fs::write(&manifest_path, br#"{"assets":{},"remote_providers":{}}"#)?;
+        std::fs::remove_file(generation.join("geo.dat"))?;
+
+        prepare_and_materialize(&owner, &bundle).await?;
+
+        assert_eq!(
+            std::fs::read(generation.join("geo.dat"))?,
+            b"geo bytes",
+            "a destination the manifest omits must be copied again, not skipped"
+        );
+        std::fs::remove_dir_all(app_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn a_bundle_this_service_will_not_accept_changes_nothing() -> anyhow::Result<()> {
         // Everything is validated and stat'd before a byte moves, so a bundle that is rejected
         // half way through its asset list cannot leave the generation describing neither the old
@@ -1135,7 +1422,7 @@ mod tests {
             remote_providers: Vec::new(),
             core_path: core_path.clone(),
         };
-        let prepared = prepare_runtime(&owner, &good).await?;
+        let prepared = prepare_and_materialize(&owner, &good).await?;
 
         let asset_source = owner.app_data_root.join("first");
         let half_bad = RuntimeBundle {

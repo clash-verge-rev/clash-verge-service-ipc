@@ -119,12 +119,18 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
     }
 
     async fn start_new_core(&mut self) -> AnyResult<()> {
-        let clash_config = self
+        let prepared = self
             .prepared_runtime
             .as_ref()
-            .context("prepared runtime is unavailable")?
-            .clash_config()
-            .clone();
+            .context("prepared runtime is unavailable")?;
+        let clash_config = prepared.clash_config().clone();
+        // Only now, with the previous core stopped, is the generation safe to rewrite: it is the
+        // same directory that core was running in. Planning happened before anything was stopped,
+        // so a bundle the service refuses still costs no outage.
+        prepared
+            .materialize()
+            .await
+            .context("failed to materialize the runtime generation")?;
         let core_manager = CORE_MANAGER.lock().await;
         let start_result = core_manager
             .start_core(clash_config, self.owner.identity.clone())
