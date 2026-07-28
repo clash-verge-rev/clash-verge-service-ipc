@@ -57,6 +57,7 @@ pub fn uninstall_old_service() -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn run_command(cmd: &str, args: &[&str], debug: bool) -> Result<(), Error> {
     if debug {
         println!("Executing: {} {}", cmd, args.join(" "));

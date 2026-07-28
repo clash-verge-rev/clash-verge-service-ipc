@@ -6,9 +6,11 @@ fn main() {
 mod shared;
 
 use anyhow::Error;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use shared::run_command;
 #[cfg(all(target_os = "macos", not(feature = "development-channel")))]
 use shared::uninstall_old_service;
-use shared::{enter_repair_gate, run_command, run_maintenance_if_requested};
+use shared::{enter_repair_gate, run_maintenance_if_requested};
 
 #[cfg(any(windows, test))]
 fn poll_until<T>(

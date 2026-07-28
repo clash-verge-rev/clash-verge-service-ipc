@@ -47,7 +47,6 @@ mod runtime_generation;
 #[cfg(feature = "standalone")]
 mod server;
 #[cfg(feature = "standalone")]
-#[cfg(feature = "standalone")]
 mod state;
 #[cfg(feature = "standalone")]
 mod status;

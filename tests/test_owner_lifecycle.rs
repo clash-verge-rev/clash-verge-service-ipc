@@ -623,26 +623,26 @@ async fn windows_restart_does_not_wait_for_locked_stale_runtime_cleanup() -> Res
             "active runtime config is missing at {runtime_file:?}"
         );
 
+        let stale_generation = owner_paths.root().join("runtime.generation-locked");
+        std::fs::create_dir(&stale_generation)?;
+        let stale_generation_file = stale_generation.join("stale.lock");
+        std::fs::write(&stale_generation_file, b"stale")?;
         bundle.yaml = "mode: direct\n".to_owned();
         let restart_token = "a2".repeat(32);
         let (_, holder) = start_clash_while_runtime_file_is_locked(
             &credentials,
             &bundle,
             &restart_token,
-            &runtime_file,
+            &stale_generation_file,
         )
         .await?;
         let restarted_runtime_file =
             assert_new_runtime_config(&credentials, &runtime_file, "mode: direct\n").await?;
-        let previous_runtime = runtime_file
-            .parent()
-            .context("runtime config has no parent directory")?
-            .to_path_buf();
-        tokio::fs::symlink_metadata(&previous_runtime)
+        tokio::fs::symlink_metadata(&stale_generation)
             .await
-            .context("locked runtime generation disappeared before handle release")?;
+            .context("locked stale runtime generation disappeared before handle release")?;
         holder.release().await?;
-        wait_for_path_removal(&previous_runtime).await?;
+        wait_for_path_removal(&stale_generation).await?;
 
         let backup = owner_paths.root().join("runtime.backup");
         std::fs::create_dir(&backup)?;

@@ -8,9 +8,11 @@ mod shared;
 use anyhow::Error;
 use anyhow::{Context as _, bail};
 use sha2::{Digest as _, Sha256};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use shared::run_command;
 #[cfg(all(target_os = "macos", not(feature = "development-channel")))]
 use shared::uninstall_old_service;
-use shared::{enter_repair_gate, run_command, run_maintenance_if_requested};
+use shared::{enter_repair_gate, run_maintenance_if_requested};
 use std::fs::{File, OpenOptions};
 use std::io::Read as _;
 #[cfg(unix)]
