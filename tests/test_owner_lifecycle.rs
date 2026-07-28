@@ -477,6 +477,11 @@ async fn protected_routes_reject_protocol_mismatch_before_deserialization() -> R
             .send()
             .await?,
         client
+            .put(IpcCommand::StageRuntime.as_ref())
+            .json_body(&invalid)
+            .send()
+            .await?,
+        client
             .put(IpcCommand::UpdateWriter.as_ref())
             .json_body(&invalid)
             .send()
