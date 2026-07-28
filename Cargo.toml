@@ -125,7 +125,7 @@ clash_verge_logger = { git = "https://github.com/clash-verge-rev/clash-verge-log
 flexi_logger = { version = "0.31", optional = true }
 log = { version = "0.4.28", optional = true }
 tracing-log = { version = "0.2", optional = true }
-compact_str = { version = "0.9", features = ["serde"], optional = true }
+compact_str = { version = "0.10", features = ["serde"], optional = true }
 url = "2.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
