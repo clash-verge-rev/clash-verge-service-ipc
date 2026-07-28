@@ -1233,11 +1233,12 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn planning_a_start_writes_nothing() -> anyhow::Result<()> {
-        // The generation is the directory the outgoing core is still running in when a start is
-        // being planned — `StartClash` prepares before the owner transition stops anything. So
-        // planning has to be readable-only: a bundle is validated against a live core's directory
-        // and only written into it once that core is gone.
+    async fn planning_a_start_does_not_replace_an_asset_the_running_core_holds()
+    -> anyhow::Result<()> {
+        // The sibling test covers *adding* a destination while planning. This covers replacing one
+        // that is already there, which is the case Windows cares about: a geo database the running
+        // core has memory-mapped cannot be replaced while it lives, so a plan that overwrote in
+        // place would turn every same-owner restart into a failure.
         let app_root =
             std::env::temp_dir().join(format!("service-runtime-planonly-{}", std::process::id()));
         std::fs::create_dir_all(&app_root)?;
