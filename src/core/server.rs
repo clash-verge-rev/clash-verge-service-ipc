@@ -213,29 +213,30 @@ impl StartOwnerTransition<'_> {
     }
 }
 
-#[cfg(all(target_os = "macos", not(feature = "test")))]
+/// Whether this build drives the machine's proxy settings.
+///
+/// Only macOS has a backend behind `proxy`, and a `test` build must not reach the developer's
+/// real settings — so everywhere else the verbs below stay callable and do nothing, rather than
+/// each caller having to know which platform it is on.
+const SERVICE_PROXY_IS_LIVE: bool = cfg!(all(target_os = "macos", not(feature = "test")));
+
 async fn clear_service_proxy() -> AnyResult<()> {
-    clear_proxy().await
+    if SERVICE_PROXY_IS_LIVE {
+        clear_proxy().await
+    } else {
+        Ok(())
+    }
 }
 
-#[cfg(any(not(target_os = "macos"), feature = "test"))]
-async fn clear_service_proxy() -> AnyResult<()> {
-    let _ = clear_proxy;
-    Ok(())
-}
-
-#[cfg(all(target_os = "macos", not(feature = "test")))]
 async fn compensate_service_proxy() -> AnyResult<()> {
-    apply_proxy(&MacosProxyConfig::Disabled).await
+    if SERVICE_PROXY_IS_LIVE {
+        apply_proxy(&MacosProxyConfig::Disabled).await
+    } else {
+        Ok(())
+    }
 }
 
-#[cfg(any(not(target_os = "macos"), feature = "test"))]
-async fn compensate_service_proxy() -> AnyResult<()> {
-    let _ = apply_proxy;
-    Ok(())
-}
-
-#[cfg(all(target_os = "macos", not(feature = "test")))]
+#[cfg(not(feature = "test"))]
 async fn apply_service_proxy_or_direct(
     config: Option<&MacosProxyConfig>,
 ) -> AnyResult<ProxyApplyOutcome> {
@@ -253,13 +254,6 @@ async fn apply_service_proxy_or_direct(
     } else {
         ProxyApplyOutcome::NotRequested
     })
-}
-
-#[cfg(all(not(target_os = "macos"), not(feature = "test")))]
-async fn apply_service_proxy_or_direct(
-    config: Option<&MacosProxyConfig>,
-) -> AnyResult<ProxyApplyOutcome> {
-    apply_proxy_or_direct(config).await
 }
 
 async fn clear_proxy_with_direct_compensation() -> std::result::Result<(), ServiceError> {
