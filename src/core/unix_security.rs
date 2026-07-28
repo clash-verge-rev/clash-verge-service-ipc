@@ -2,6 +2,13 @@ use anyhow::{Context as _, Result, bail};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 
+/// Unix has no separate installer directory rule: the service's own privacy — root-owned, mode
+/// 0700 — is already what an installer needs. Named to match the Windows adapter so callers can
+/// ask for it without knowing which platform answers.
+pub(crate) fn ensure_private_installer_directory(path: &Path) -> Result<()> {
+    ensure_private_service_directory(path)
+}
+
 pub(crate) fn ensure_private_service_directory(path: &Path) -> Result<()> {
     ensure_service_directory(path, 0o700)
 }
@@ -33,7 +40,7 @@ pub(crate) fn ensure_service_directory(path: &Path, mode: platform_lib::mode_t) 
     result
 }
 
-pub(crate) fn secure_service_file_if_exists(path: &Path) -> Result<()> {
+pub(crate) fn secure_private_service_file_if_exists(path: &Path) -> Result<()> {
     let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| anyhow::anyhow!("service file path contains NUL"))?;
     let fd = unsafe {

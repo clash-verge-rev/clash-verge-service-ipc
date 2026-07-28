@@ -293,10 +293,7 @@ where
 {
     crate::core::paths::ensure_persistent_state_layout()?;
     if let Some(parent) = path.parent() {
-        #[cfg(unix)]
-        crate::core::unix_security::ensure_private_service_directory(parent)?;
-        #[cfg(windows)]
-        crate::core::windows_security::ensure_private_service_directory(parent)?;
+        crate::core::platform_security::ensure_private_service_directory(parent)?;
     }
 
     let temp_path = path.with_extension("json.tmp");
@@ -314,10 +311,7 @@ where
 }
 
 fn secure_state_file_if_exists(path: &std::path::Path) -> Result<()> {
-    #[cfg(unix)]
-    crate::core::unix_security::secure_service_file_if_exists(path)?;
-    #[cfg(windows)]
-    crate::core::windows_security::secure_private_service_file_if_exists(path)?;
+    crate::core::platform_security::secure_private_service_file_if_exists(path)?;
     Ok(())
 }
 

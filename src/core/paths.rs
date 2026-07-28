@@ -105,33 +105,16 @@ pub fn service_paths() -> ServicePaths {
 pub(crate) fn ensure_persistent_state_layout() -> anyhow::Result<()> {
     let paths = service_paths();
     let root = paths.persistent_state_dir();
-    #[cfg(unix)]
-    crate::core::unix_security::ensure_private_service_directory(root)?;
-    #[cfg(windows)]
-    crate::core::windows_security::ensure_private_service_directory(root)?;
+    use crate::core::platform_security;
+
+    platform_security::ensure_private_service_directory(root)?;
 
     let users = root.join("users");
     let install = paths.install_dir();
-    #[cfg(unix)]
-    crate::core::unix_security::ensure_private_service_directory(&users)?;
-    #[cfg(windows)]
-    crate::core::windows_security::ensure_private_service_directory(&users)?;
-    #[cfg(unix)]
-    crate::core::unix_security::ensure_private_service_directory(&install)?;
-    #[cfg(windows)]
-    crate::core::windows_security::ensure_private_service_directory(&install)?;
-    #[cfg(unix)]
-    crate::core::unix_security::secure_service_file_if_exists(&paths.active_owner_path())?;
-    #[cfg(windows)]
-    crate::core::windows_security::secure_private_service_file_if_exists(
-        &paths.active_owner_path(),
-    )?;
-    #[cfg(unix)]
-    crate::core::unix_security::secure_service_file_if_exists(&paths.owner_generation_path())?;
-    #[cfg(windows)]
-    crate::core::windows_security::secure_private_service_file_if_exists(
-        &paths.owner_generation_path(),
-    )?;
+    platform_security::ensure_private_service_directory(&users)?;
+    platform_security::ensure_private_service_directory(&install)?;
+    platform_security::secure_private_service_file_if_exists(&paths.active_owner_path())?;
+    platform_security::secure_private_service_file_if_exists(&paths.owner_generation_path())?;
     Ok(())
 }
 
@@ -140,16 +123,10 @@ pub fn prepare_service_install_directory() -> anyhow::Result<PathBuf> {
     let paths = service_paths();
     let root = paths.persistent_state_dir();
     let install = paths.install_dir();
-    #[cfg(unix)]
-    {
-        crate::core::unix_security::ensure_private_service_directory(root)?;
-        crate::core::unix_security::ensure_private_service_directory(&install)?;
-    }
-    #[cfg(windows)]
-    {
-        crate::core::windows_security::ensure_private_installer_directory(root)?;
-        crate::core::windows_security::ensure_private_installer_directory(&install)?;
-    }
+    use crate::core::platform_security;
+
+    platform_security::ensure_private_installer_directory(root)?;
+    platform_security::ensure_private_installer_directory(&install)?;
     Ok(install)
 }
 
@@ -157,10 +134,7 @@ pub fn prepare_service_install_directory() -> anyhow::Result<PathBuf> {
 pub(crate) fn ensure_owner_state_directory(identity: &OwnerIdentity) -> anyhow::Result<OwnerPaths> {
     ensure_persistent_state_layout()?;
     let owner = service_paths().for_owner(identity);
-    #[cfg(unix)]
-    crate::core::unix_security::ensure_private_service_directory(owner.root())?;
-    #[cfg(windows)]
-    crate::core::windows_security::ensure_private_service_directory(owner.root())?;
+    crate::core::platform_security::ensure_private_service_directory(owner.root())?;
     Ok(owner)
 }
 
