@@ -386,13 +386,28 @@ async fn materialize_plan(
     }
 
     let config_path = runtime.join(RUNTIME_CONFIG_FILE_NAME);
-    super::staging::commit_staged_config(runtime, &config_path, yaml, &manifest)
-        .await
-        .map_err(|error| {
-            invalid_asset(format!(
-                "failed to commit the runtime configuration: {error}"
-            ))
-        })?;
+    if let Err(error) =
+        super::staging::commit_staged_config(runtime, &config_path, yaml, &manifest).await
+    {
+        // The manifest goes in before the configuration, so it can be in place while the
+        // configuration is not — claiming a remote cache belongs to a url nothing is serving. Left
+        // there, the next plan believes the claim and never discards that cache, so the core keeps
+        // being handed provider data fetched from the previous url, with nothing to notice it.
+        // Discarding it costs the next start its skips and its cache reuse; keeping it costs
+        // correctness for as long as the generation lives. Staging makes the same trade.
+        if let Err(discard) =
+            super::staging::remove_staged_file(&runtime.join(super::staging::MANIFEST_FILE_NAME))
+                .await
+        {
+            tracing::warn!(
+                error = %discard,
+                "Left a manifest behind that describes an uncommitted configuration"
+            );
+        }
+        return Err(invalid_asset(format!(
+            "failed to commit the runtime configuration: {error}"
+        )));
+    }
 
     // Housekeeping: files a previous bundle declared and this one does not. Failing to remove one
     // changes nothing the core observes, so it is logged rather than returned — the configuration
