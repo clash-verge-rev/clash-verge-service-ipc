@@ -1,0 +1,35 @@
+#!/bin/sh
+#
+# PROVIDE: clash_verge_service
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# rc.d script for Clash Verge Service (FreeBSD).
+# Enable with: sysrc clash_verge_service_enable=YES
+
+. /etc/rc.subr
+
+name="clash_verge_service"
+rcvar="clash_verge_service_enable"
+
+load_rc_config $name
+
+: ${{clash_verge_service_enable:="NO"}}
+
+pidfile="/var/run/${{name}}.pid"
+procname="{exec_start}"
+command="/usr/sbin/daemon"
+command_args="-c -f -p ${{pidfile}} ${{procname}}"
+
+# Run the helper as root so it can manage the TUN device and routing.
+clash_verge_service_group="{group}"
+
+start_precmd="clash_verge_service_prestart"
+
+clash_verge_service_prestart()
+{{
+    install -d -m 0755 /var/run
+    return 0
+}}
+
+run_rc_command "$1"
