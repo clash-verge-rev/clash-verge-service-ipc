@@ -98,9 +98,17 @@ pub async fn load_active_owner() -> Result<Option<ActiveOwnerState>> {
     let path = service_paths().active_owner_path();
     secure_state_file_if_exists(&path)?;
     match tokio::fs::read(&path).await {
-        Ok(content) => serde_json::from_slice(&content)
-            .map(Some)
-            .with_context(|| format!("failed to parse active owner {path:?}")),
+        Ok(content) => match serde_json::from_slice(&content) {
+            Ok(state) => Ok(Some(state)),
+            Err(error) => {
+                warn!(
+                    "Active owner state {path:?} is corrupted ({error}); \
+                     backing it up and starting with no active owner"
+                );
+                backup_corrupt_state_file(&path).await?;
+                Ok(None)
+            }
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to read active owner {path:?}")),
     }
@@ -280,11 +288,40 @@ where
 {
     secure_state_file_if_exists(path)?;
     match tokio::fs::read(path).await {
-        Ok(content) => serde_json::from_slice(&content)
-            .with_context(|| format!("failed to parse state {path:?}")),
+        Ok(content) => match serde_json::from_slice(&content) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                warn!(
+                    "State file {path:?} is corrupted ({error}); \
+                     backing it up and resetting to defaults"
+                );
+                backup_corrupt_state_file(path).await?;
+                Ok(T::default())
+            }
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
         Err(error) => Err(error).with_context(|| format!("failed to read state {path:?}")),
     }
+}
+
+/// 状态文件损坏（例如写入被中断留下的全零文件）时备份为 *.corrupt.bak，
+/// 让后续流程可以从默认状态恢复，而不是每次都在解析处失败。
+async fn backup_corrupt_state_file(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let backup = path.with_extension("json.corrupt.bak");
+    match tokio::fs::remove_file(&backup).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to replace previous corrupt state backup {backup:?}")
+            });
+        }
+    }
+    tokio::fs::rename(path, &backup)
+        .await
+        .with_context(|| format!("failed to back up corrupted state {path:?} to {backup:?}"))?;
+    info!("Backed up corrupted state file {path:?} -> {backup:?}");
+    Ok(backup)
 }
 
 async fn write_json_atomic<T>(path: &std::path::Path, value: &T) -> Result<()>
@@ -475,6 +512,53 @@ mod owner_tests {
             br#"{"core_should_be_running":true}"#
         );
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupted_owner_desired_state_is_backed_up_and_reset() -> anyhow::Result<()> {
+        let owner = test_owner(90_008);
+        let config = ClashConfig {
+            core_config: CoreConfig {
+                core_path: "/tmp/mock-core-corrupt".to_string(),
+                ..Default::default()
+            },
+            log_config: Default::default(),
+        };
+        persist_owner_core_started(&owner, &config).await?;
+
+        // 模拟写盘被中断后留下的全零文件
+        let path = crate::service_paths()
+            .for_owner_key(&owner.key)
+            .desired_state_path();
+        std::fs::write(&path, vec![0u8; 64])?;
+
+        let state = load_owner_desired_state(&owner.key).await?;
+        assert!(!state.core_should_be_running);
+        assert!(!path.exists());
+
+        let backup = path.with_extension("json.corrupt.bak");
+        assert_eq!(std::fs::read(&backup)?, vec![0u8; 64]);
+        std::fs::remove_file(backup)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn corrupted_active_owner_is_backed_up_and_cleared() -> anyhow::Result<()> {
+        clear_active_owner().await?;
+        let owner = test_owner(90_009);
+        persist_active_owner(&owner).await?;
+
+        let path = crate::service_paths().active_owner_path();
+        std::fs::write(&path, b"not-valid-json{{{")?;
+
+        assert!(load_active_owner().await?.is_none());
+        assert!(!path.exists());
+
+        let backup = path.with_extension("json.corrupt.bak");
+        assert_eq!(std::fs::read(&backup)?, b"not-valid-json{{{");
+        std::fs::remove_file(backup)?;
         Ok(())
     }
 }
