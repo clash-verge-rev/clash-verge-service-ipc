@@ -7,11 +7,14 @@ use crate::{ClashConfig, OwnerIdentity, ServiceLifecycleState, WriterConfig};
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 static DESIRED_STATE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static STATE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DesiredState {
@@ -55,7 +58,7 @@ pub async fn load_owner_desired_state(owner_key: &str) -> Result<DesiredState> {
     let path = service_paths()
         .for_owner_key(owner_key)
         .desired_state_path();
-    read_json_or_default(&path).await
+    Ok(read_owner_desired_state_resilient(&path).await)
 }
 
 pub async fn persist_owner_core_started(
@@ -266,12 +269,69 @@ async fn update_owner_desired_state(
     let path = service_paths()
         .for_owner_key(owner_key)
         .desired_state_path();
-    let mut state = read_json_or_default(&path).await?;
+    let mut state = read_owner_desired_state_resilient(&path).await;
     update(&mut state);
     state.generation = state.generation.saturating_add(1);
     state.updated_at = unix_timestamp_secs();
-    write_json_atomic(&path, &state).await?;
+    if let Err(error) = write_json_atomic(&path, &state).await {
+        warn!(
+            "Failed to persist owner desired state {:?}; continuing with live core state: {error:#}",
+            path
+        );
+    }
     Ok(state)
+}
+
+// Desired state is best-effort; authorization state remains strict.
+async fn read_owner_desired_state_resilient(path: &std::path::Path) -> DesiredState {
+    if let Err(error) = secure_state_file_if_exists(path) {
+        warn!(
+            "Owner desired state {:?} cannot be secured; ignoring the persisted recovery hint: {error:#}",
+            path
+        );
+        return DesiredState::default();
+    }
+
+    let content = match tokio::fs::read(path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return DesiredState::default();
+        }
+        Err(error) => {
+            warn!(
+                "Owner desired state {:?} cannot be read; ignoring the persisted recovery hint: {error:#}",
+                path
+            );
+            return DesiredState::default();
+        }
+    };
+
+    match serde_json::from_slice(&content) {
+        Ok(state) => state,
+        Err(parse_error) => {
+            match quarantine_corrupt_owner_desired_state(path).await {
+                Ok(backup) => warn!(
+                    "Quarantined corrupt owner desired state {:?} at {:?}: {}",
+                    path, backup, parse_error
+                ),
+                Err(quarantine_error) => warn!(
+                    "Owner desired state {:?} is corrupt and could not be quarantined: {}; quarantine failed: {quarantine_error:#}",
+                    path, parse_error
+                ),
+            }
+            DesiredState::default()
+        }
+    }
+}
+
+async fn quarantine_corrupt_owner_desired_state(
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let backup = sibling_state_path(path, "corrupt");
+    tokio::fs::rename(path, &backup)
+        .await
+        .with_context(|| format!("failed to quarantine corrupt state {path:?} at {backup:?}"))?;
+    Ok(backup)
 }
 
 async fn read_json_or_default<T>(path: &std::path::Path) -> Result<T>
@@ -296,18 +356,57 @@ where
         crate::core::platform_security::ensure_private_service_directory(parent)?;
     }
 
-    let temp_path = path.with_extension("json.tmp");
+    let temp_path = sibling_state_path(path, "tmp");
     let json = serde_json::to_vec_pretty(value)?;
-    tokio::fs::write(&temp_path, json)
-        .await
-        .with_context(|| format!("failed to write state temp file {temp_path:?}"))?;
-    secure_state_file_if_exists(&temp_path)?;
-    crate::core::atomic_file::replace(&temp_path, path)
-        .await
-        .with_context(|| format!("failed to move state into {path:?}"))?;
-    secure_state_file_if_exists(path)?;
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await
+            .with_context(|| format!("failed to create state temp file {temp_path:?}"))?;
+        file.write_all(&json)
+            .await
+            .with_context(|| format!("failed to write state temp file {temp_path:?}"))?;
+        file.flush()
+            .await
+            .with_context(|| format!("failed to flush state temp file {temp_path:?}"))?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("failed to sync state temp file {temp_path:?}"))?;
+        drop(file);
+        secure_state_file_if_exists(&temp_path)?;
+        crate::core::atomic_file::replace(&temp_path, path)
+            .await
+            .with_context(|| format!("failed to move state into {path:?}"))?;
+        secure_state_file_if_exists(path)?;
+        Ok(())
+    }
+    .await;
 
-    Ok(())
+    if result.is_err()
+        && let Err(cleanup_error) = tokio::fs::remove_file(&temp_path).await
+        && cleanup_error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            "Failed to clean up state temp file {:?}: {}",
+            temp_path, cleanup_error
+        );
+    }
+    result
+}
+
+fn sibling_state_path(path: &std::path::Path, role: &str) -> std::path::PathBuf {
+    let sequence = STATE_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(
+        "{file_name}.{role}-{}-{timestamp}-{sequence}",
+        std::process::id()
+    ))
 }
 
 fn secure_state_file_if_exists(path: &std::path::Path) -> Result<()> {
@@ -453,6 +552,96 @@ mod owner_tests {
             assert!(commit_active_owner_session(&owner, &invalid).await.is_err());
         }
         assert!(load_active_owner().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn corrupt_owner_desired_state_is_quarantined_and_rebuilt() -> anyhow::Result<()> {
+        let owner = test_owner(90_008);
+        let owner_root = crate::service_paths()
+            .for_owner_key(&owner.key)
+            .root()
+            .to_path_buf();
+        let _ = std::fs::remove_dir_all(&owner_root);
+        std::fs::create_dir_all(&owner_root)?;
+        let path = owner_root.join("desired-state.json");
+        let damaged = b"\0damaged-json";
+        std::fs::write(&path, damaged)?;
+
+        let state = persist_owner_core_started(&owner, &ClashConfig::default()).await?;
+
+        assert!(state.core_should_be_running);
+        assert!(
+            load_owner_desired_state(&owner.key)
+                .await?
+                .core_should_be_running
+        );
+        let backups = std::fs::read_dir(&owner_root)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("desired-state.json.corrupt-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0])?, damaged);
+        std::fs::remove_dir_all(owner_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn corrupt_owner_desired_state_load_returns_safe_default() -> anyhow::Result<()> {
+        let owner = test_owner(90_010);
+        let owner_root = crate::service_paths()
+            .for_owner_key(&owner.key)
+            .root()
+            .to_path_buf();
+        let _ = std::fs::remove_dir_all(&owner_root);
+        std::fs::create_dir_all(&owner_root)?;
+        let path = owner_root.join("desired-state.json");
+        let damaged = b"\0damaged-before-restore";
+        std::fs::write(&path, damaged)?;
+
+        let state = load_owner_desired_state(&owner.key).await?;
+
+        assert!(!state.core_should_be_running);
+        assert!(state.last_clash_config.is_none());
+        assert!(!path.exists());
+        let backup = std::fs::read_dir(&owner_root)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("desired-state.json.corrupt-"))
+            })
+            .ok_or_else(|| anyhow::anyhow!("corrupt desired state was not quarantined"))?;
+        assert_eq!(std::fs::read(backup)?, damaged);
+        std::fs::remove_dir_all(owner_root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unavailable_owner_desired_state_does_not_reject_live_state_change()
+    -> anyhow::Result<()> {
+        let owner = test_owner(90_009);
+        let owner_root = crate::service_paths()
+            .for_owner_key(&owner.key)
+            .root()
+            .to_path_buf();
+        let _ = std::fs::remove_dir_all(&owner_root);
+        std::fs::create_dir_all(owner_root.join("desired-state.json"))?;
+
+        let state = persist_owner_core_started(&owner, &ClashConfig::default()).await?;
+
+        assert!(state.core_should_be_running);
+        assert!(owner_root.join("desired-state.json").is_dir());
+        std::fs::remove_dir_all(owner_root)?;
         Ok(())
     }
 
