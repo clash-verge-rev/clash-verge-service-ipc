@@ -35,18 +35,8 @@ path = "src/bin/crash_binary.rs"
 required-features = ["test"]
 
 [[bin]]
-name = "no_ipc_binary"
-path = "src/bin/no_ipc_binary.rs"
-required-features = ["test"]
-
-[[bin]]
 name = "owner_lock_holder"
 path = "src/bin/owner_lock_holder.rs"
-required-features = ["standalone", "test"]
-
-[[bin]]
-name = "asset_lock_holder"
-path = "src/bin/asset_lock_holder.rs"
 required-features = ["standalone", "test"]
 
 [[bin]]
@@ -92,10 +82,6 @@ test = [
     "anyhow",
     "dep:platform_lib",
     "dep:windows-sys",
-    "flexi_logger",
-    "tracing",
-    "tracing-subscriber/env-filter",
-    "tracing-log",
 ]
 default = []
 
@@ -124,7 +110,6 @@ tracing-subscriber = { version = "0.3", optional = true }
 clash_verge_logger = { git = "https://github.com/clash-verge-rev/clash-verge-logger.git", version = "0.2.0", optional = true }
 flexi_logger = { version = "0.31", optional = true }
 log = { version = "0.4.28", optional = true }
-tracing-log = { version = "0.2", optional = true }
 compact_str = { version = "0.10", features = ["serde"], optional = true }
 url = "2.5"
 

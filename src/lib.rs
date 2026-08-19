@@ -33,8 +33,6 @@ pub use core::test_owner_credentials;
 #[cfg(all(feature = "test", unix))]
 pub use core::test_owner_credentials_for_uid;
 #[cfg(all(feature = "standalone", feature = "test"))]
-pub use core::write_core_runtime_record_for_tests;
-#[cfg(all(feature = "standalone", feature = "test"))]
 pub use core::{CoreWatchdogTestConfig, set_core_watchdog_config_for_tests};
 
 #[cfg(feature = "client")]

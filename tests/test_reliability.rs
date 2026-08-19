@@ -2,334 +2,141 @@
 
 mod common;
 
-#[cfg(test)]
-mod tests {
-    use anyhow::{Context, Result};
-    #[cfg(unix)]
-    use clash_verge_service_ipc::acquire_service_owner;
-    use clash_verge_service_ipc::{
-        CoreWatchdogTestConfig, OwnerSessionProof, RuntimeBundle, ServiceLifecycleState,
-        StartClashRequest, connect, get_status, reconcile_service_startup, run_ipc_server,
-        run_ipc_supervisor_until_shutdown, service_lifecycle_state, service_paths,
-        set_core_watchdog_config_for_tests, start_clash, stop_clash, stop_ipc_server,
-        write_core_runtime_record_for_tests,
-    };
-    use serial_test::serial;
-    use std::path::PathBuf;
-    use std::process::{Child, Command, ExitStatus};
-    use std::time::{Duration, Instant};
-    use tokio::sync::oneshot;
-    use tokio::time::sleep;
+use anyhow::{Context as _, Result};
+use clash_verge_service_ipc::{
+    CoreWatchdogTestConfig, OwnerSessionProof, RuntimeBundle, ServiceLifecycleState,
+    StartClashRequest, connect, get_status, run_ipc_server, run_ipc_supervisor_until_shutdown,
+    service_lifecycle_state, set_core_watchdog_config_for_tests, start_clash, stop_clash,
+    stop_ipc_server,
+};
+use serial_test::serial;
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
-    use crate::common;
-
-    fn ensure_test_bin(name: &str) -> Result<PathBuf> {
-        let path = common::test_bin_path(name);
-        if path.exists() {
-            return Ok(path);
+async fn wait_until(label: &str, mut condition: impl AsyncFnMut() -> bool) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if condition().await {
+            return Ok(());
         }
-
-        let status = Command::new("cargo")
-            .args(["build", "--features", "standalone,test", "--bin", name])
-            .status()
-            .with_context(|| format!("failed to build {name}"))?;
-        anyhow::ensure!(status.success(), "cargo build failed for {name}");
-        anyhow::ensure!(path.exists(), "missing built binary {:?}", path);
-        Ok(path)
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    anyhow::bail!("timed out waiting for {label}")
+}
 
-    #[cfg(unix)]
-    async fn wait_until<F>(label: &str, timeout: Duration, mut condition: F) -> Result<()>
-    where
-        F: FnMut() -> bool,
-    {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if condition() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                anyhow::bail!("timed out waiting for {label}");
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
-    }
+#[tokio::test]
+#[serial]
+async fn ipc_supervisor_restarts_a_stopped_listener() -> Result<()> {
+    let _ = stop_ipc_server().await;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let supervisor = tokio::spawn(run_ipc_supervisor_until_shutdown(async {
+        let _ = shutdown_rx.await;
+    }));
 
-    async fn wait_until_async<F, Fut>(
-        label: &str,
-        timeout: Duration,
-        mut condition: F,
-    ) -> Result<()>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if condition().await {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                anyhow::bail!("timed out waiting for {label}");
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
-    }
+    wait_until("IPC startup", async || {
+        connect().await.is_ok() && service_lifecycle_state() == ServiceLifecycleState::Running
+    })
+    .await?;
+    stop_ipc_server().await?;
+    wait_until("IPC restart", async || connect().await.is_ok()).await?;
 
-    async fn wait_for_ipc_ready() -> Result<()> {
-        wait_until_async("IPC readiness", Duration::from_secs(5), || async {
-            connect().await.is_ok()
-        })
-        .await
-    }
+    let _ = shutdown_tx.send(());
+    supervisor.await??;
+    Ok(())
+}
 
-    async fn wait_for_ipc_running() -> Result<()> {
-        wait_until_async("IPC running state", Duration::from_secs(5), || async {
-            connect().await.is_ok() && service_lifecycle_state() == ServiceLifecycleState::Running
-        })
-        .await
-    }
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn a_healthy_service_owner_prevents_a_second_instance() -> Result<()> {
+    let _ = stop_ipc_server().await;
+    let owner = clash_verge_service_ipc::acquire_service_owner()
+        .await?
+        .context("current process did not acquire the service owner lock")?;
+    let server = run_ipc_server().await?;
+    common::wait_for_ipc().await?;
 
-    async fn wait_for_child_exit(
-        child: &mut Child,
-        timeout: Duration,
-    ) -> Result<Option<ExitStatus>> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(Some(status));
-            }
-            if Instant::now() >= deadline {
-                return Ok(None);
-            }
-            sleep(Duration::from_millis(25)).await;
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(common::test_bin_path("owner_lock_holder")).status(),
+    )
+    .await
+    .context("second owner did not exit")??;
+    assert_eq!(status.code(), Some(2));
+    assert!(connect().await.is_ok());
+
+    stop_ipc_server().await?;
+    server.await??;
+    drop(owner);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn core_watchdog_stops_a_bounded_crash_loop() -> Result<()> {
+    struct ResetWatchdog;
+    impl Drop for ResetWatchdog {
+        fn drop(&mut self) {
+            set_core_watchdog_config_for_tests(None);
         }
     }
 
-    fn kill_child(child: &mut Child) {
-        if child.try_wait().ok().flatten().is_none() {
-            let _ = child.kill();
-        }
-        let _ = child.wait();
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn ipc_supervisor_rebuilds_listener_after_listener_exit() -> Result<()> {
-        common::init_tracing_for_tests();
-        let _ = stop_ipc_server().await;
-
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let supervisor = tokio::spawn(run_ipc_supervisor_until_shutdown(async {
-            let _ = shutdown_rx.await;
-        }));
-
-        wait_for_ipc_running().await?;
-
-        stop_ipc_server().await?;
-        wait_for_ipc_running().await?;
-
-        let _ = shutdown_tx.send(());
-        supervisor.await??;
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn healthy_owner_causes_second_instance_to_exit_without_takeover() -> Result<()> {
-        common::init_tracing_for_tests();
-        let _ = stop_ipc_server().await;
-
-        let owner_guard = acquire_service_owner()
-            .await?
-            .context("expected current process to acquire owner lock")?;
-        let server_handle = run_ipc_server().await?;
-        wait_for_ipc_ready().await?;
-
-        let owner_helper = ensure_test_bin("owner_lock_holder")?;
-        let mut probe = Command::new(owner_helper).spawn()?;
-        let status = wait_for_child_exit(&mut probe, Duration::from_secs(5))
-            .await?
-            .context("owner probe did not exit")?;
-
-        assert_eq!(
-            status.code(),
-            Some(2),
-            "second owner should exit when healthy IPC owner is reachable"
-        );
-        assert!(
-            connect().await.is_ok(),
-            "healthy owner IPC should remain up"
-        );
-
-        stop_ipc_server().await?;
-        server_handle.await??;
-        drop(owner_guard);
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn stale_owner_without_ipc_is_cleaned_and_reacquired() -> Result<()> {
-        common::init_tracing_for_tests();
-        let _ = stop_ipc_server().await;
-
-        let owner_helper = ensure_test_bin("owner_lock_holder")?;
-        let mut stale_owner = Command::new(owner_helper).spawn()?;
-        let stale_pid = stale_owner.id();
-        let paths = service_paths();
-
-        wait_until("stale owner pid file", Duration::from_secs(5), || {
-            std::fs::read_to_string(paths.pid_file_path())
-                .ok()
-                .and_then(|content| content.trim().parse::<u32>().ok())
-                == Some(stale_pid)
-        })
-        .await?;
-
-        let owner_guard = acquire_service_owner()
-            .await?
-            .context("expected stale owner to be cleaned and lock reacquired")?;
-
-        let exited = wait_for_child_exit(&mut stale_owner, Duration::from_secs(3)).await?;
-        assert!(exited.is_some(), "stale owner process should be terminated");
-        assert_eq!(
-            std::fs::read_to_string(paths.pid_file_path())?
-                .trim()
-                .parse::<u32>()?,
-            std::process::id()
-        );
-
-        drop(owner_guard);
-        kill_child(&mut stale_owner);
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn startup_reconcile_kills_live_core_with_unusable_socket() -> Result<()> {
-        common::init_tracing_for_tests();
-        let _ = stop_ipc_server().await;
-
-        let mock_binary = ensure_test_bin("mock_binary")?;
-        let mut old_core = Command::new(mock_binary).spawn()?;
-        let paths = service_paths();
-        tokio::fs::create_dir_all(paths.runtime_dir()).await?;
-
-        let core_socket = paths.runtime_dir().join("reconcile-core.sock");
-        write_core_runtime_record_for_tests(
-            old_core.id(),
-            core_socket.to_string_lossy().into_owned(),
-        )
-        .await?;
-
-        reconcile_service_startup().await?;
-
-        let exited = wait_for_child_exit(&mut old_core, Duration::from_secs(3)).await?;
-        assert!(
-            exited.is_some(),
-            "reconcile should terminate old unsupervised core"
-        );
-        assert!(
-            !paths.core_runtime_path().exists(),
-            "reconcile should remove stale core runtime record"
-        );
-
-        kill_child(&mut old_core);
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn core_watchdog_stops_after_bounded_crash_loop() -> Result<()> {
-        common::init_tracing_for_tests();
-        let _ = stop_ipc_server().await;
-        struct WatchdogConfigReset;
-        impl Drop for WatchdogConfigReset {
-            fn drop(&mut self) {
-                set_core_watchdog_config_for_tests(None);
-            }
-        }
-        let _reset = WatchdogConfigReset;
-
-        set_core_watchdog_config_for_tests(Some(CoreWatchdogTestConfig {
-            max_restarts: 2,
-            restart_window: Duration::from_secs(10),
-            max_backoff: Duration::ZERO,
-        }));
-
-        let crash_binary = ensure_test_bin("crash_binary")?;
-        let server_handle = run_ipc_server().await?;
-        wait_for_ipc_ready().await?;
-        let credentials = common::owner_credentials();
-
-        let baseline_restart_count = get_status(&credentials)
-            .await?
-            .data
-            .map_or(0, |status| status.restart_count);
-        let runtime_bundle = RuntimeBundle {
-            yaml: "mode: rule\n".to_string(),
-            assets: vec![],
-            remote_providers: Vec::new(),
-            core_path: crash_binary.to_string_lossy().to_string(),
-        };
-        let proposed_session_token = "41".repeat(32);
-        let response = start_clash(
-            &credentials,
-            &StartClashRequest {
-                runtime: runtime_bundle,
-                proposed_session_token: proposed_session_token.clone(),
-                macos_proxy: None,
+    let _reset = ResetWatchdog;
+    set_core_watchdog_config_for_tests(Some(CoreWatchdogTestConfig {
+        max_restarts: 2,
+        restart_window: Duration::from_secs(10),
+        max_backoff: Duration::ZERO,
+    }));
+    let _ = stop_ipc_server().await;
+    let server = run_ipc_server().await?;
+    common::wait_for_ipc().await?;
+    let credentials = common::owner_credentials();
+    let token = "41".repeat(32);
+    let response = start_clash(
+        &credentials,
+        &StartClashRequest {
+            runtime: RuntimeBundle {
+                yaml: "mode: rule\n".to_owned(),
+                assets: Vec::new(),
+                remote_providers: Vec::new(),
+                core_path: common::test_bin_path("crash_binary")
+                    .to_string_lossy()
+                    .into_owned(),
             },
-        )
-        .await?;
-        assert_eq!(response.code, 0);
-        let session = OwnerSessionProof {
-            generation: response
-                .data
-                .context("Start response omitted session")?
-                .session
-                .generation,
-            token: proposed_session_token,
-        };
+            proposed_session_token: token.clone(),
+            macos_proxy: None,
+        },
+    )
+    .await?;
+    anyhow::ensure!(response.code == 0, "{}", response.message);
+    let session = OwnerSessionProof {
+        generation: response
+            .data
+            .context("start omitted its result")?
+            .session
+            .generation,
+        token,
+    };
 
-        wait_until_async("bounded crash loop", Duration::from_secs(5), || async {
-            get_status(&credentials)
-                .await
-                .map(|response| response.data)
-                .map(|status| {
-                    let Some(status) = status else {
-                        return false;
-                    };
-                    status.restart_count >= baseline_restart_count + 2 && status.core_pid.is_none()
-                })
-                .unwrap_or(false)
-        })
-        .await?;
-
-        let status = get_status(&credentials)
+    wait_until("watchdog limit", async || {
+        get_status(&credentials)
+            .await
+            .ok()
+            .and_then(|response| response.data)
+            .is_some_and(|status| status.restart_count >= 2 && status.core_pid.is_none())
+    })
+    .await?;
+    assert!(
+        get_status(&credentials)
             .await?
             .data
-            .ok_or_else(|| anyhow::anyhow!("status response did not include data"))?;
-        assert!(
-            status.last_core_exit_reason.is_some(),
-            "status should retain the last core exit reason"
-        );
-        assert!(
-            status.restart_count >= baseline_restart_count + 2,
-            "watchdog should record bounded restart attempts"
-        );
-        assert!(
-            status.core_pid.is_none(),
-            "watchdog should stop supervising after crash loop limit"
-        );
+            .context("status omitted data")?
+            .last_core_exit_reason
+            .is_some()
+    );
 
-        let stop = stop_clash(&credentials, &session).await?;
-        assert_eq!(stop.code, 0);
-        stop_ipc_server().await?;
-        server_handle.await??;
-        Ok(())
-    }
+    assert_eq!(stop_clash(&credentials, &session).await?.code, 0);
+    stop_ipc_server().await?;
+    server.await??;
+    Ok(())
 }

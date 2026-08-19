@@ -85,8 +85,6 @@ pub use proxy::{apply_proxy, apply_proxy_or_direct, clear_proxy, validate_proxy_
 pub use reconcile::reconcile_service_startup;
 #[cfg(feature = "standalone")]
 pub use repair::{REPAIR_IN_PROGRESS_EXIT_CODE, ServiceRepairGate, acquire_service_repair_gate};
-#[cfg(all(feature = "standalone", feature = "test"))]
-pub use runtime::write_core_runtime_record_for_tests;
 #[cfg(feature = "standalone")]
 pub use server::{run_ipc_server, run_ipc_supervisor_until_shutdown, stop_ipc_server};
 #[cfg(feature = "standalone")]
