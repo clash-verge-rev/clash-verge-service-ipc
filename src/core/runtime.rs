@@ -43,18 +43,6 @@ pub(super) async fn write_core_runtime_record(record: &CoreRuntimeRecord) -> Res
     Ok(())
 }
 
-#[cfg(feature = "test")]
-pub async fn write_core_runtime_record_for_tests(pid: u32, ipc_path: String) -> Result<()> {
-    let identity = crate::core::process::process_identity(pid)?
-        .with_context(|| format!("test core process {pid} is not running"))?;
-    write_core_runtime_record(&CoreRuntimeRecord {
-        pid,
-        ipc_path,
-        identity,
-    })
-    .await
-}
-
 pub(super) async fn read_core_runtime_record() -> Result<Option<CoreRuntimeRecord>> {
     let paths = service_paths();
     let content = match tokio::fs::read(paths.core_runtime_path()).await {

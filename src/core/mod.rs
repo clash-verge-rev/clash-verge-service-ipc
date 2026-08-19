@@ -59,10 +59,7 @@ mod windows_legacy_cleanup;
 #[cfg(all(feature = "standalone", windows))]
 mod windows_security;
 
-/// The platform's answer to "make this private to the service".
-///
-/// Two adapters, one name: every caller below asks `platform_security` and none of them repeats
-/// the `unix`/`windows` pair that used to sit at each call site.
+/// Platform-specific service directory hardening.
 #[cfg(all(feature = "standalone", unix))]
 pub(in crate::core) use unix_security as platform_security;
 #[cfg(all(feature = "standalone", windows))]
@@ -85,8 +82,6 @@ pub use proxy::{apply_proxy, apply_proxy_or_direct, clear_proxy, validate_proxy_
 pub use reconcile::reconcile_service_startup;
 #[cfg(feature = "standalone")]
 pub use repair::{REPAIR_IN_PROGRESS_EXIT_CODE, ServiceRepairGate, acquire_service_repair_gate};
-#[cfg(all(feature = "standalone", feature = "test"))]
-pub use runtime::write_core_runtime_record_for_tests;
 #[cfg(feature = "standalone")]
 pub use server::{run_ipc_server, run_ipc_supervisor_until_shutdown, stop_ipc_server};
 #[cfg(feature = "standalone")]

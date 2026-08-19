@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# 显示当前 Rust 版本
 rustc --version
 cargo --version
 

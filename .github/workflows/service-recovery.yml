@@ -58,9 +58,7 @@ jobs:
 
           service="clash-verge-service.service"
 
-          # `set -e` used to abort the job the moment the first ping failed, before reaching any of
-          # the diagnostics below — so a red run said only "not reachable within 20s" and nothing
-          # about why. Every failure path now reports first and exits second.
+          # Keep diagnostics reachable when the initial readiness probe fails.
           diagnose() {
             echo "::group::systemctl status"
             sudo systemctl status "$service" --no-pager --full || true
@@ -82,8 +80,7 @@ jobs:
             fi
           }
 
-          # Recovery is about the OS service process coming back. Probe the public protocol endpoint
-          # here; authenticated owner operations have their own fixtures in Service Integration.
+          # Recovery checks public protocol readiness; authenticated flows run in Service Integration.
           require_service_ready "IPC was not reachable after installing the service"
 
           old_pid="$(systemctl show "$service" --property=MainPID --value)"
@@ -135,8 +132,7 @@ jobs:
             fi
           }
 
-          # Recovery is about the OS service process coming back. Probe the public protocol endpoint
-          # here; authenticated owner operations have their own fixtures in Service Integration.
+          # Recovery checks public protocol readiness; authenticated flows run in Service Integration.
           require_service_ready "IPC was not reachable after installing the service"
 
           get_pid() {
@@ -191,8 +187,7 @@ jobs:
             Write-Host "::endgroup::"
           }
 
-          # Recovery is about the SCM-managed service process coming back. `ready` probes the public
-          # protocol endpoint without coupling this job to a synthetic user's credential fixture.
+          # Recovery checks public protocol readiness without a synthetic owner fixture.
           & $driver ready
           if ($LASTEXITCODE -ne 0) {
             Show-Diagnostics

@@ -13,8 +13,7 @@ fn main() {
     #[cfg(windows)]
     let _pipe = ipc_path.and_then(create_test_pipe);
 
-    // Leave enough time for Windows pipe verification and runtime-record
-    // persistence so this helper tests the watchdog's post-start crash path.
+    // Let pipe verification and runtime-record persistence finish before crashing.
     std::thread::sleep(std::time::Duration::from_millis(500));
     std::process::exit(1);
 }

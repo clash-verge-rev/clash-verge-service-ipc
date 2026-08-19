@@ -43,7 +43,6 @@ fn main() -> Result<(), Error> {
 
     #[cfg(not(feature = "development-channel"))]
     let _ = uninstall_old_service();
-    // 定义路径
     let bundle_path = format!(
         "/Library/PrivilegedHelperTools/{}.bundle",
         clash_verge_service_ipc::MACOS_SERVICE_ID
@@ -54,7 +53,6 @@ fn main() -> Result<(), Error> {
     );
     let service_id = clash_verge_service_ipc::MACOS_SERVICE_ID;
 
-    // 停止并卸载服务
     let _ = run_command("launchctl", &["stop", service_id], debug);
     let _ = run_command(
         "launchctl",
@@ -63,13 +61,11 @@ fn main() -> Result<(), Error> {
     );
     let _ = run_command("launchctl", &["bootout", "system", &plist_file], debug);
 
-    // 删除文件
     if Path::new(&plist_file).exists() {
         std::fs::remove_file(&plist_file)
             .map_err(|e| anyhow::anyhow!("Failed to remove plist file: {}", e))?;
     }
 
-    // 删除整个 bundle 目录
     if Path::new(&bundle_path).exists() {
         std::fs::remove_dir_all(&bundle_path)
             .map_err(|e| anyhow::anyhow!("Failed to remove bundle directory: {}", e))?;
@@ -89,7 +85,6 @@ fn main() -> Result<(), Error> {
     let debug = env::args().any(|arg| arg == "--debug");
     let service_name = clash_verge_service_ipc::SERVICE_SLUG;
 
-    // Stop and disable service
     let _ = run_command(
         "systemctl",
         &["stop", &format!("{}.service", service_name)],
@@ -101,14 +96,12 @@ fn main() -> Result<(), Error> {
         debug,
     );
 
-    // Remove service file
     let unit_file = format!("/etc/systemd/system/{}.service", service_name);
     if std::path::Path::new(&unit_file).exists() {
         std::fs::remove_file(&unit_file)
             .map_err(|e| anyhow::anyhow!("Failed to remove service file: {}", e))?;
     }
 
-    // Reload systemd
     let _ = run_command("systemctl", &["daemon-reload"], debug);
     let target =
         clash_verge_service_ipc::prepare_service_install_directory()?.join("clash-verge-service");
@@ -121,7 +114,6 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-/// stop and uninstall the service
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
     use platform_lib::{

@@ -60,11 +60,8 @@ impl ProtocolInfo {
             && client.revision >= self.min_client_revision
     }
 
-    /// Whether this service can stage a runtime in place instead of being stopped and restarted.
-    ///
-    /// Deliberately finer-grained than `supports_client`: an installed service that predates
-    /// staging is still fully *compatible*, so it must not be pushed into a reinstall. Callers
-    /// gate the fast path on this and fall back to stop + start when it is false.
+    /// Whether this service supports in-place runtime staging.
+    /// Unlike `supports_client`, this is a capability gate rather than a compatibility gate.
     pub const fn supports_runtime_staging(&self) -> bool {
         self.protocol.epoch == ProtocolVersion::current().epoch
             && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING
@@ -103,38 +100,26 @@ pub struct AuthenticatedSessionRequest<T> {
     pub payload: T,
 }
 
-/// A file the client owns and the service copies into the runtime generation.
-///
-/// The distinction from [`RemoteProvider`] is who writes the file: these are copied in by the
-/// service and can therefore be compared against their source, so an unchanged one is skipped.
+/// A client-owned file copied by the service into the runtime generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeAsset {
     pub source: String,
     pub destination: String,
 }
 
-/// A provider file the *core* fetches and owns; the service never writes it.
-///
-/// Recorded only so the service can tell a reusable download cache from a stale one. The core
-/// will not re-fetch a provider whose file already exists, so when `url` changes underneath an
-/// unchanged `destination` the cache must be deleted before the core reloads — otherwise it
-/// keeps serving the previous source's content until the provider's own interval elapses.
+/// A core-owned provider cache. The service tracks its URL only to invalidate stale downloads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteProvider {
     pub destination: String,
     pub url: String,
 }
 
-/// The complete declaration of what a runtime generation should contain.
-///
-/// "Complete" is load-bearing: staging decides what to delete by subtracting this declaration
-/// from what is on disk, so anything omitted here is something staging cannot reason about.
+/// Complete declaration of service-managed files in a runtime generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeBundle {
     pub yaml: String,
     pub assets: Vec<RuntimeAsset>,
-    /// Absent on the wire from clients older than revision 2; an empty list simply means
-    /// staging cannot distinguish a reusable cache from a stale one and keeps neither.
+    /// Defaults empty for clients older than revision 2, disabling provider-cache reuse.
     #[serde(default)]
     pub remote_providers: Vec<RemoteProvider>,
     pub core_path: String,
@@ -180,17 +165,12 @@ pub struct StartClashResult {
     pub proxy_outcome: ProxyApplyOutcome,
 }
 
-/// What staging a bundle into the running core's generation achieved.
-///
-/// `RestartRequired` is an outcome, not an error: staging is an optimisation that is allowed to
-/// decline. Every way of declining leaves the generation exactly as the running core left it,
-/// so the caller can fall back to stop + start — which builds a fresh generation and therefore
-/// has none of the constraints that made staging decline.
+/// Result of staging a bundle into the running core's generation.
+/// `RestartRequired` is a successful refusal that leaves stop-and-start as the fallback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum StageRuntimeOutcome {
-    /// The generation now matches the bundle. The core still runs the previous configuration
-    /// until the caller points it at `config_path`.
+    /// The generation is ready; the caller must still load `config_path` into the core.
     Staged {
         config_path: String,
     },
@@ -199,22 +179,18 @@ pub enum StageRuntimeOutcome {
     },
 }
 
-/// Why staging declined. Each variant is a fact only the service can establish.
+/// Why in-place staging declined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum StageRejection {
-    /// No core is running, so there is nothing to reload into.
     CoreNotRunning,
-    /// The bundle names a different core binary. A configuration reload would succeed and
-    /// silently leave the previous binary running, which is worse than declining.
+    /// The requested core binary differs from the running one.
     CorePathChanged,
-    /// A file that had to be replaced or removed could not be. Expected on Windows, where the
-    /// running core holds handles on its provider files.
-    RuntimeUnwritable { detail: String },
-    /// The core was replaced while the runtime was being staged, so the work done so far was done
-    /// for a core that is no longer there. The service's own watchdog can do this, and it restarts
-    /// the core from the configuration still on disk — meaning the generation may now be serving a
-    /// mixture nothing recorded.
+    /// A required file replacement or removal failed.
+    RuntimeUnwritable {
+        detail: String,
+    },
+    /// The running core changed during staging.
     CoreRestarted,
 }
 
@@ -342,25 +318,9 @@ impl Default for WriterConfig {
 
 #[cfg(feature = "client")]
 pub trait JsonConvert: Serialize + for<'de> Deserialize<'de> {
-    /// 转换为 JSON Value
     fn to_json_value(&self) -> Result<Value, serde_json::Error> {
         serde_json::to_value(self)
     }
-
-    // /// 从 JSON Value 转换
-    // fn from_json_value(value: Value) -> Result<Self, serde_json::Error> {
-    //     serde_json::from_value(value)
-    // }
-
-    // /// 序列化为 JSON 字符串
-    // fn to_json_string(&self) -> Result<String, serde_json::Error> {
-    //     serde_json::to_string(self)
-    // }
-
-    // /// 从 JSON 字符串转换
-    // fn from_json_string(json: &str) -> Result<Self, serde_json::Error> {
-    //     serde_json::from_str(json)
-    // }
 }
 #[cfg(feature = "client")]
 impl<T> JsonConvert for T where T: Serialize + for<'de> Deserialize<'de> {}

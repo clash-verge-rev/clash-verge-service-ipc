@@ -191,8 +191,7 @@ fn wait_for_service_ready() -> Result<(), Error> {
     })
 }
 
-// Only launchd code calls this, and the tests below exercise the plan classifier rather than the
-// target string — so widening the gate to `test` only made it dead code everywhere but macOS.
+// Only launchd code needs the concrete target; tests exercise the plan classifier instead.
 #[cfg(target_os = "macos")]
 fn launchd_service_target() -> String {
     format!("system/{}", clash_verge_service_ipc::MACOS_SERVICE_ID)
@@ -283,7 +282,6 @@ fn main() -> Result<(), Error> {
     let launchd_install_plan = probe_launchd_service(debug)?;
     let service_binary_path = bundled_service_binary()?;
 
-    // 定义 bundle 路径
     let bundle_path = PathBuf::from("/Library/PrivilegedHelperTools").join(format!(
         "{}.bundle",
         clash_verge_service_ipc::MACOS_SERVICE_ID
@@ -291,25 +289,20 @@ fn main() -> Result<(), Error> {
     let contents_path = bundle_path.join("Contents");
     let macos_path = contents_path.join("MacOS");
 
-    // 创建 bundle 目录结构
     std::fs::create_dir_all(&macos_path)
         .map_err(|e| anyhow::anyhow!("Failed to create bundle directories: {}", e))?;
 
-    // 复制二进制文件到 bundle 的 MacOS 目录
     let target_binary_path = macos_path.join("clash-verge-service");
     let staged = stage_service_binary(&service_binary_path, &target_binary_path)?;
 
-    // 创建并写入 Info.plist
     let info_plist_path = contents_path.join("Info.plist");
 
-    // 创建 LaunchDaemons 目录（如果不存在）
     let plist_dir = PathBuf::from("/Library/LaunchDaemons");
     if !plist_dir.exists() {
         std::fs::create_dir(&plist_dir)
             .map_err(|e| anyhow::anyhow!("Failed to create plist directory: {}", e))?;
     }
 
-    // 创建并写入 launchd plist
     let plist_file = plist_dir.join(format!(
         "{}.plist",
         clash_verge_service_ipc::MACOS_SERVICE_ID
@@ -341,20 +334,15 @@ fn main() -> Result<(), Error> {
         .and_then(|mut file| file.write_all(launchd_plist_content.as_bytes()))
         .map_err(|e| anyhow::anyhow!("Failed to write plist file: {}", e))?;
 
-    // 设置权限
-    // 设置 LaunchDaemons plist 权限
     run_command("chmod", &["644", &plist_path], debug)?;
     run_command("chown", &["root:wheel", &plist_path], debug)?;
 
-    // 设置二进制文件权限
     run_command("chmod", &["544", &target_path], debug)?;
     run_command("chown", &["root:wheel", &target_path], debug)?;
 
-    // 设置 bundle 目录及其内容的权限
     run_command("chmod", &["755", &bundle_path_string], debug)?;
     run_command("chown", &["-R", "root:wheel", &bundle_path_string], debug)?;
 
-    // 加载和启动服务
     let launchd_target = launchd_service_target();
     run_command("launchctl", &["enable", &launchd_target], debug)?;
     run_command("launchctl", &["bootstrap", "system", &plist_path], debug)?;
@@ -411,7 +399,6 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-/// install and start the service
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
     use platform_lib::{

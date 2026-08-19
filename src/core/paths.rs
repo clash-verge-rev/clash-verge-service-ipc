@@ -159,8 +159,8 @@ fn persistent_state_dir() -> PathBuf {
         std::env::temp_dir().join("clash-verge-service-ipc-test-state")
     }
 
-    // macOS：系统 daemon 以 root 运行,状态目录用系统级稳定位置,不依赖 launchd 下不可靠的
-    // HOME/XDG —— 否则 desired-state 可能写一处读另一处而丢失(issue #7333)。
+    // A root launchd daemon needs stable system state independent of unreliable HOME/XDG values
+    // (issue #7333).
     #[cfg(all(target_os = "macos", not(feature = "test")))]
     {
         PathBuf::from("/Library/Application Support").join(crate::SERVICE_SLUG)

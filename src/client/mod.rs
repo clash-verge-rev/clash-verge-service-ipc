@@ -36,8 +36,6 @@ fn protected<'a>(
     )
 }
 
-/// The verb a route answers on. Kept beside [`IpcCommand`], which deliberately carries only the
-/// path, so the two halves of a route's address travel together on this side of the wire.
 #[derive(Clone, Copy)]
 enum Verb {
     Get,
@@ -46,15 +44,8 @@ enum Verb {
     Delete,
 }
 
-/// One protected request: connect, wrap the payload in the envelope the route expects, declare
-/// the protocol revision, send, decode.
-///
-/// Every route below is this call with different data. Routing the protocol header through here
-/// rather than through each caller is the point — a request that reaches the service without it
-/// is refused, and forgetting it was previously a runtime failure rather than an impossible one.
-///
-/// `session` chooses the envelope: routes that need only an authenticated owner pass `None`,
-/// routes that need proof of the current session pass `Some`.
+/// Sends a versioned, authenticated request using the route's required envelope.
+/// `session` selects owner-only or active-session authentication.
 async fn protected_call<P, R>(
     verb: Verb,
     command: IpcCommand,
@@ -250,12 +241,9 @@ pub async fn stop_clash(
     .await
 }
 
-/// Ask the service to make the running core's generation match `body`, without restarting it.
-///
-/// Returns what the service decided, not whether it worked: a service that declines reports
-/// `RestartRequired` with a `code` of zero. Only the caller can act on that, by stopping and
-/// starting the core the way it did before staging existed. Gate the call on
-/// [`ProtocolInfo::supports_runtime_staging`] — an older service has no such route at all.
+/// Stages `body` into the running core's generation without restarting it.
+/// Call only when [`ProtocolInfo::supports_runtime_staging`] is true; `RestartRequired` is a
+/// successful response that asks the caller to fall back to stop and start.
 pub async fn stage_runtime(
     credentials: &OwnerCredentials,
     session: &OwnerSessionProof,
