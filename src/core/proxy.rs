@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 
 use anyhow::{Context, ensure};
+use tracing::warn;
 use url::{Host, Url};
 
 use crate::{MacosProxyConfig, ProxyApplyOutcome};
@@ -216,9 +217,20 @@ fn apply_proxy_or_direct_with(
     match apply(config) {
         Ok(()) => Ok(ProxyApplyOutcome::Applied),
         Err(apply_error) => {
-            apply(&MacosProxyConfig::Disabled).with_context(|| {
-                format!("failed to compensate proxy apply failure ({apply_error}) with direct mode")
-            })?;
+            // A lookup failure means no write of ours failed midway, so there is nothing to undo.
+            let nothing_to_undo = is_no_active_network_service(&apply_error);
+            match apply(&MacosProxyConfig::Disabled) {
+                Ok(()) => {}
+                Err(compensation_error)
+                    if nothing_to_undo && is_no_active_network_service(&compensation_error) => {}
+                Err(compensation_error) => {
+                    return Err(compensation_error).with_context(|| {
+                        format!(
+                            "failed to compensate proxy apply failure ({apply_error}) with direct mode"
+                        )
+                    });
+                }
+            }
             Ok(ProxyApplyOutcome::DirectFallback {
                 message: apply_error.to_string(),
             })
@@ -240,8 +252,31 @@ pub async fn apply_proxy(_config: &MacosProxyConfig) -> anyhow::Result<()> {
     anyhow::bail!("macOS proxy configuration is unsupported on this platform")
 }
 
+/// Succeeds when macOS has no active network service: with nothing to write to, the requested
+/// "no proxy" state already holds, and failing would block callers that clear before stopping.
 pub async fn clear_proxy() -> anyhow::Result<()> {
-    apply_proxy(&MacosProxyConfig::Disabled).await
+    match apply_proxy(&MacosProxyConfig::Disabled).await {
+        Err(error) if is_no_active_network_service(&error) => {
+            warn!("no active network service, nothing to clear: {error:#}");
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_no_active_network_service(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<sysproxy::Error>(),
+            Some(sysproxy::Error::NoActiveNetworkService)
+        )
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn is_no_active_network_service(_error: &anyhow::Error) -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -499,5 +534,48 @@ mod tests {
             }
         );
         assert_eq!(calls, [config, MacosProxyConfig::Disabled]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn missing_network_service_still_reports_direct_fallback() {
+        let config = MacosProxyConfig::Global {
+            host: "127.0.0.1".to_owned(),
+            port: 7897,
+            bypass: String::new(),
+        };
+        let mut calls = Vec::new();
+
+        let outcome = apply_proxy_or_direct_with(Some(&config), |config| {
+            calls.push(config.clone());
+            Err(anyhow::Error::new(sysproxy::Error::NoActiveNetworkService))
+        })
+        .unwrap();
+
+        assert!(matches!(outcome, ProxyApplyOutcome::DirectFallback { .. }));
+        assert_eq!(calls, [config, MacosProxyConfig::Disabled]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_partial_write_still_requires_compensation() {
+        let config = MacosProxyConfig::Global {
+            host: "127.0.0.1".to_owned(),
+            port: 7897,
+            bypass: String::new(),
+        };
+        let mut calls = 0;
+
+        let error = apply_proxy_or_direct_with(Some(&config), |_| {
+            calls += 1;
+            if calls == 1 {
+                Err(anyhow::anyhow!("networksetup refused midway"))
+            } else {
+                Err(anyhow::Error::new(sysproxy::Error::NoActiveNetworkService))
+            }
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("failed to compensate proxy apply failure"));
     }
 }
