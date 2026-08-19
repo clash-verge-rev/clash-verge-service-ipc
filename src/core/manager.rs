@@ -290,17 +290,9 @@ impl CoreManager {
         }
     }
 
-    /// The pid and configuration of the core currently running, if one is.
-    ///
-    /// Staging is defined relative to a live core: it writes into the generation that core was
-    /// started in and reasons about the binary it was started from. Both facts live only here,
-    /// which is why the decision to stage or to restart cannot be made by the client.
-    ///
-    /// The pid is read *after* the configuration guard is held, and it is returned alongside the
-    /// configuration rather than merely checked. The watchdog clears it from a task that holds no
-    /// lock, so reading it first would let this hand back the configuration of a core that had
-    /// already died; and the caller needs the value itself in order to notice a core replaced
-    /// underneath it later on.
+    /// Returns the live core's PID and configuration from one consistent read.
+    /// The configuration guard must be acquired before reading the PID because the watchdog can
+    /// clear it without holding that guard.
     pub(super) async fn running_core_config(&self) -> Option<(u32, ClashConfig)> {
         let config = self.running_config.lock().await;
         let pid = self.running_pid.load(Ordering::Acquire);

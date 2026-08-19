@@ -1,24 +1,6 @@
-//! Making a runtime generation match a bundle without restarting the core that runs in it.
-//!
-//! A generation is normally written once, by `start_clash`, into a directory nothing else has
-//! touched. Staging writes into a directory a core is *currently running in*, which changes what
-//! is safe: files may be held open, and the core reads whatever it finds when it is told to
-//! reload. Three rules follow, and the plan below exists to make them explicit rather than
-//! implicit in the order of some I/O.
-//!
-//! **The service only deletes what it can prove it put there.** Every deletion candidate comes
-//! from the previous manifest, never from listing the directory. The core creates files of its
-//! own in the generation — `cache.db` at least — and a sweep driven by "whatever the bundle did
-//! not declare" would delete a database the running core has open.
-//!
-//! **A remote provider's cache is stale exactly when its url changed.** The core will not
-//! re-fetch a provider whose file already exists, so a cache left over from a different source
-//! keeps being served until that provider's own interval elapses. Deleting it is therefore not
-//! housekeeping: it has to happen before the core reloads, or the reload is silently wrong.
-//!
-//! **A copied asset is worth re-copying only when its source changed.** Comparing content would
-//! mean hashing tens of megabytes of geo data on every profile switch, which is most of what
-//! staging was supposed to save. The manifest records what each copy was made from instead.
+//! Updates the runtime generation while its core is still running.
+//! Only manifest-owned files are deleted, provider caches are invalidated when their URL changes,
+//! and asset metadata avoids hashing large unchanged files. Configuration is committed last.
 
 use super::assets::{
     destination_key, invalid_asset, resolve_in_generation, runtime_cleanup_retry_delay,
@@ -32,19 +14,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The name staging keeps its own bookkeeping under, inside the generation.
 pub(super) const MANIFEST_FILE_NAME: &str = ".runtime-manifest.json";
 
-/// Identity of a copy's source at the moment the copy was made.
-///
-/// Length and modification time rather than a digest: the point of skipping an unchanged asset
-/// is to not read it. A source rewritten in place, to the same length, with its modification
-/// time deliberately restored would be missed; nothing in this system produces that, and the
-/// alternative is hashing tens of megabytes of geo data on every profile switch.
-///
-/// `mtime_ns` is optional because a filesystem that cannot report a modification time leaves
-/// nothing to compare. Collapsing that case into a number would make every same-length change
-/// look unchanged, silently and forever — so an unknown time simply never matches.
+/// Source metadata recorded after a copy, avoiding content hashing on later staging.
+/// An unknown modification time never matches because length alone is not a safe identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct SourceIdentity {
     pub source: String,
@@ -54,17 +27,13 @@ pub(super) struct SourceIdentity {
 }
 
 impl SourceIdentity {
-    /// Whether a copy made under `self` can be trusted to still match a source seen as `current`.
     fn still_matches(&self, current: &Self) -> bool {
         self.mtime_ns.is_some() && self == current
     }
 }
 
-/// What the previous staging (or start) left in a generation.
-///
-/// Absent for a generation written by a service that predates staging. Absence is not an error:
-/// it means nothing can be proven, so nothing is skipped, nothing is swept, and every declared
-/// remote cache is discarded rather than trusted.
+/// Service-managed files recorded after a successful start or staging.
+/// A missing manifest means no file ownership or cache provenance can be trusted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct RuntimeManifest {
     #[serde(default)]
@@ -73,7 +42,6 @@ pub(super) struct RuntimeManifest {
     pub remote_providers: BTreeMap<String, String>,
 }
 
-/// A copy staging intends to make, with the identity to record once it succeeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PlannedCopy {
     pub source: String,
@@ -81,23 +49,19 @@ pub(super) struct PlannedCopy {
     pub identity: SourceIdentity,
 }
 
-/// The full set of changes that turn a generation into the bundle, ordered by when they matter.
+/// Planned changes, grouped by their required execution order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct StagePlan {
-    /// Stale remote caches. Must be gone before the core reloads.
+    /// Stale provider caches removed before reload.
     pub required_deletes: Vec<String>,
-    /// Assets whose source changed since the copy on disk was made.
     pub copies: Vec<PlannedCopy>,
-    /// Assets already made from the source they still name. Recorded for logging only.
+    /// Unchanged assets, retained for logging.
     pub skipped: Vec<String>,
-    /// Paths a previous staging wrote that this bundle no longer declares. Pure housekeeping:
-    /// failing to remove them changes nothing the core observes.
+    /// Obsolete service-managed files removed after commit.
     pub hygiene_deletes: Vec<String>,
-    /// What to persist once the copies and required deletes have gone through.
     pub manifest: RuntimeManifest,
 }
 
-/// Freshly stat'd metadata for one declared asset's source, gathered by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AssetSource {
     pub asset: RuntimeAsset,
@@ -105,7 +69,7 @@ pub(super) struct AssetSource {
     pub mtime_ns: Option<u128>,
 }
 
-/// Decide what staging must do. Pure: every fact it needs has already been read.
+/// Builds a pure staging plan from pre-read metadata.
 pub(super) fn plan_stage(
     previous: &RuntimeManifest,
     sources: &[AssetSource],
@@ -137,8 +101,7 @@ pub(super) fn plan_stage(
     }
 
     for provider in remote {
-        // No record means no proof the cache came from this url, so it cannot be reused. That is
-        // the same branch a changed url takes, and it is why an absent manifest is merely slow.
+        // Missing provenance is treated like a changed URL and cannot reuse the cache.
         if previous.remote_providers.get(&provider.destination) != Some(&provider.url) {
             plan.required_deletes.push(provider.destination.clone());
         }
@@ -158,22 +121,14 @@ pub(super) fn plan_stage(
             plan.hygiene_deletes.push(recorded.clone());
         }
     }
-    // A destination recorded as both an asset and a remote provider appears twice; the two chained
-    // maps are each sorted but their concatenation is not, so `dedup` alone would not notice.
-    // Sorting first is what makes it a deduplication rather than a no-op.
+    // The two input maps are sorted individually, not after concatenation.
     plan.hygiene_deletes.sort();
     plan.hygiene_deletes.dedup();
 
     plan
 }
 
-/// The remote providers a bundle declares, keyed by destination.
-///
-/// A destination declared twice with different urls, or declared as both a copied asset and a
-/// remote provider, is refused rather than reconciled. The two declarations disagree about who
-/// owns the file, and staging has no way to settle it: it cannot know which url produced the cache
-/// on disk, and copying an asset over what the core fetched would pin the wrong content — silently
-/// and permanently, because the next staging would find both records matching and skip both.
+/// Validates provider destinations and rejects conflicting URLs or asset ownership.
 pub(super) fn declared_remote_providers(
     declared: &[RemoteProvider],
     asset_destinations: &BTreeSet<String>,
@@ -205,16 +160,9 @@ pub(super) fn declared_remote_providers(
         .collect())
 }
 
-/// Make the generation the core is running in match `bundle`, or decline and change nothing.
-///
-/// The order below is the whole safety argument, so it is worth stating plainly. Stale caches go
-/// first because the core must not be able to read one. Copies go next because adding or
-/// replacing a declared file cannot mislead a core still running the previous configuration.
-/// `config.yaml` is replaced last and atomically, so every way of failing before that point
-/// leaves the configuration on disk agreeing with the core that is running — which is what makes
-/// the caller's fallback to stop + start safe. Housekeeping happens after the commit and its
-/// failures are logged, never returned: by then the generation already matches the bundle in
-/// every way the core can observe.
+/// Stages a live generation or returns a restart fallback.
+/// Required deletes and copies precede the atomic configuration commit; obsolete-file cleanup is
+/// best-effort afterward.
 pub(crate) async fn stage_runtime(
     owner: &AuthenticatedOwner,
     bundle: &RuntimeBundle,
@@ -269,10 +217,7 @@ pub(crate) async fn stage_runtime(
                 },
             });
         }
-        // The identity was read before the copy, so a source rewritten in between would be
-        // recorded as the content that is no longer there — and then skipped forever, because the
-        // record matches the source it now names. Re-reading is one stat against a file already in
-        // cache; being wrong here pins the wrong bytes for the life of the generation.
+        // Re-stat after copying to avoid recording stale source metadata.
         if source_identity_changed(&copy.source, &copy.identity).await {
             return Ok(StageRuntimeOutcome::RestartRequired {
                 reason: StageRejection::RuntimeUnwritable {
@@ -285,13 +230,8 @@ pub(crate) async fn stage_runtime(
         }
     }
 
-    // The watchdog restarts a dead core without taking the lifecycle lock, and it restarts it in
-    // this same generation from whatever `config.yaml` is on disk. Had that happened while the
-    // assets above were being replaced, the core now running would not be the one this plan was
-    // built against: it may have re-fetched a cache the plan just deleted, and committing would
-    // record a provenance that never happened — which no later staging could ever detect, because
-    // the record would look correct. Declining sends the caller down the path that rebuilds the
-    // generation from nothing.
+    // The watchdog can replace the core without the lifecycle lock. Never commit provenance built
+    // for an earlier process; force a clean restart instead.
     if CORE_MANAGER
         .lock()
         .await
@@ -309,10 +249,7 @@ pub(crate) async fn stage_runtime(
     if let Err(error) =
         commit_staged_config(&generation, &config_path, &bundle.yaml, &plan.manifest).await
     {
-        // The manifest may already be in place while `config.yaml` is not, which would leave it
-        // claiming a remote cache belongs to a url the running core is not using. Discarding it
-        // costs the next staging its skips and its cache reuse; keeping it risks a cache that no
-        // staging will ever discard again.
+        // A failed config commit leaves the newly written manifest untrusted; discard it.
         if let Err(discard) = remove_staged_file(&generation.join(MANIFEST_FILE_NAME)).await {
             tracing::warn!(
                 error = %discard,
@@ -364,10 +301,7 @@ pub(super) fn modified_nanos(metadata: &std::fs::Metadata) -> Option<u128> {
         .map(|elapsed| elapsed.as_nanos())
 }
 
-/// Whether `source` still looks like what `recorded` says was copied from it.
-///
-/// Reads metadata only. An unreadable source counts as changed, since a copy that cannot be
-/// re-checked is a copy whose record cannot be trusted.
+/// Returns true when source metadata changed or can no longer be read.
 pub(super) async fn source_identity_changed(source: &str, recorded: &SourceIdentity) -> bool {
     match tokio::fs::metadata(source).await {
         Ok(metadata) => {
@@ -377,11 +311,7 @@ pub(super) async fn source_identity_changed(source: &str, recorded: &SourceIdent
     }
 }
 
-/// Read the previous manifest, distinguishing "no record" from "a record that cannot be read".
-///
-/// Absence is ordinary and merely costs the skips. A manifest that is present but unparseable is
-/// different: it means files were written here whose names can no longer be recovered, so they can
-/// never be swept. Reporting it lets the caller rebuild the generation from nothing instead.
+/// Reads the manifest; absence is empty state, while malformed contents require a clean restart.
 pub(super) async fn read_manifest(generation: &Path) -> Result<RuntimeManifest, String> {
     let path = generation.join(MANIFEST_FILE_NAME);
     match tokio::fs::read(&path).await {
@@ -394,12 +324,7 @@ pub(super) async fn read_manifest(generation: &Path) -> Result<RuntimeManifest, 
     }
 }
 
-/// Retry the failures a handle held by the running core produces on Windows.
-///
-/// Both removing and replacing need this, and for the same reason: a deletion the core's handles
-/// leave pending makes the name unusable for a while, so the next operation on it fails with a
-/// code that says "not yet" rather than "never". A handle that is never released stops being
-/// transient, and the caller turns that into a restart instead of a half-corrected directory.
+/// Retries transient Windows failures while the running core releases file handles.
 async fn while_the_core_lets_go<Operation, Attempt>(mut operation: Operation) -> std::io::Result<()>
 where
     Operation: FnMut() -> Attempt,
@@ -430,11 +355,7 @@ pub(super) async fn remove_staged_file(path: &Path) -> std::io::Result<()> {
     .await
 }
 
-/// Put `staged` in place of `destination`, cleaning up the temporary on any failure.
-///
-/// Replace rather than overwrite: a rename detaches the handles the running core holds on the
-/// previous file instead of writing underneath them, so a core mid-read sees one file or the
-/// other and never a half-written one.
+/// Atomically replaces a destination and removes the temporary on failure.
 async fn replace_staged_file(staged: &Path, destination: &Path) -> std::io::Result<()> {
     let result =
         while_the_core_lets_go(|| crate::core::atomic_file::replace(staged, destination)).await;
@@ -462,8 +383,7 @@ pub(super) async fn commit_staged_config(
     yaml: &str,
     manifest: &RuntimeManifest,
 ) -> std::io::Result<()> {
-    // The manifest describes the copies and deletions that already happened, so it is written
-    // first: a manifest ahead of the configuration would claim work that a later failure undid.
+    // Record completed file changes first; the caller removes it if config commit fails.
     let manifest_path = generation.join(MANIFEST_FILE_NAME);
     let encoded = serde_json::to_vec(manifest)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -481,9 +401,7 @@ pub(super) async fn write_atomically(destination: &Path, contents: &[u8]) -> std
     }
 
     let staged = staging_temp_path(destination);
-    // A failure between creating the temporary and replacing with it would otherwise leave the
-    // temporary behind forever: housekeeping only visits names a manifest recorded, and this name
-    // is deliberately one no manifest can hold.
+    // Temporaries are never manifest-owned, so clean them up immediately on write failure.
     if let Err(error) = write_temp(&staged, contents).await {
         let _ = tokio::fs::remove_file(&staged).await;
         return Err(error);
@@ -491,11 +409,7 @@ pub(super) async fn write_atomically(destination: &Path, contents: &[u8]) -> std
     replace_staged_file(&staged, destination).await
 }
 
-/// Where a replacement is written before it takes the destination's place.
-///
-/// The name carries [`STAGING_TEMP_INFIX`], which no declared destination is allowed to contain —
-/// so a bundle cannot arrange for its own file to be the one a concurrent write is about to
-/// clobber.
+/// Creates a collision-resistant name that bundle destinations are forbidden to claim.
 fn staging_temp_path(destination: &Path) -> PathBuf {
     let sequence = STAGING_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let name = destination.file_name().map_or_else(
@@ -601,8 +515,7 @@ mod tests {
 
     #[test]
     fn an_asset_copied_from_a_different_source_path_is_copied_again() {
-        // Same length and modification time, different origin: the file on disk is not a copy of
-        // what the bundle now names, whatever its metadata says.
+        // Equal metadata cannot make a copy from another source valid.
         let previous = manifest(
             &[("providers/p.yaml", identity("/app/one.yaml", 128, 7))],
             &[],
@@ -686,8 +599,7 @@ mod tests {
 
     #[test]
     fn a_file_the_service_never_wrote_is_never_a_deletion_candidate() {
-        // `cache.db` is created and held open by the running core. It appears in no manifest, so
-        // no plan may name it — this is what keeps a sweep from deleting the core's database.
+        // Core-owned files such as `cache.db` never appear in the manifest.
         let previous = manifest(
             &[("geoip.metadb", identity("/app/geoip.metadb", 1, 1))],
             &[],
@@ -755,9 +667,7 @@ mod tests {
 
     #[test]
     fn a_destination_claimed_by_both_an_asset_and_a_provider_is_refused() {
-        // The two declarations disagree about who owns the file: staging would delete the cache and
-        // then copy over the same name, pinning the app's content where the core expected its own —
-        // and every later staging would find both records matching and skip both.
+        // Conflicting declarations make file ownership ambiguous.
         let declared = [remote("providers/p.yaml", "https://one.example/p.yaml")];
         let assets = BTreeSet::from(["providers/p.yaml".to_owned()]);
 
@@ -769,8 +679,7 @@ mod tests {
 
     #[test]
     fn an_asset_whose_modification_time_is_unknown_is_never_skipped() {
-        // Collapsing an unreadable timestamp into a number would make every same-length change
-        // look unchanged, and the copy on disk would stay wrong for the life of the generation.
+        // Length alone must not validate an asset with unknown modification time.
         let unknown = SourceIdentity {
             source: "/app/geo.dat".to_owned(),
             len: 10,
@@ -820,8 +729,7 @@ mod tests {
         use super::destination_key;
         use std::path::Path;
 
-        // Most Windows filesystems are case-insensitive, so `Config.yaml` would be a second
-        // manifest key for the one live configuration — and the sweep runs after the commit.
+        // Service-owned names are case-insensitive for Windows compatibility.
         for reserved in [
             "config.yaml",
             "Config.yaml",
@@ -834,14 +742,13 @@ mod tests {
                 "{reserved} names a file the generation owns"
             );
         }
-        // Only at the top level: nothing owns a file of that name inside a subdirectory.
+        // Reserved names apply only at the generation root.
         assert!(destination_key(Path::new("providers/config.yaml")).is_ok());
     }
 
     #[test]
     fn a_destination_recorded_as_both_kinds_is_swept_once() {
-        // The two maps are each sorted but their concatenation is not, so a key present in both
-        // survives a bare `dedup` whenever another key sorts between them.
+        // Individually sorted maps still require sorting after concatenation.
         let previous = manifest(
             &[
                 ("a.yaml", identity("/app/a.yaml", 1, 1)),

@@ -182,8 +182,7 @@ pub async fn restore_desired_state() -> Result<()> {
         .start_core(config, active_owner.identity.clone())
         .await
     {
-        // core 路径不存在通常表示 desired-state 已过期；清掉运行意图，避免重启时反复重试。
-        // 其它失败保留意图并交给上层记录。
+        // A missing core path makes the desired state stale; retain intent for other errors.
         if is_not_found_error(&error) {
             warn!(
                 "Core binary not found while restoring desired state (stale/translocated path?); \
@@ -205,7 +204,7 @@ pub async fn restore_desired_state() -> Result<()> {
     Ok(())
 }
 
-/// 判断错误链中是否包含 NotFound I/O 错误，用于识别失效的 core 路径。
+/// Returns whether the error chain contains an I/O `NotFound`.
 fn is_not_found_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause

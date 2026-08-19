@@ -2,9 +2,7 @@ use anyhow::{Context as _, Result, bail};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 
-/// Unix has no separate installer directory rule: the service's own privacy — root-owned, mode
-/// 0700 — is already what an installer needs. Named to match the Windows adapter so callers can
-/// ask for it without knowing which platform answers.
+/// Uses the service-directory privacy rule, which also satisfies Unix installer requirements.
 pub(crate) fn ensure_private_installer_directory(path: &Path) -> Result<()> {
     ensure_private_service_directory(path)
 }

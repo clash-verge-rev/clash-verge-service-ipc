@@ -120,9 +120,7 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
             .as_ref()
             .context("prepared runtime is unavailable")?;
         let clash_config = prepared.clash_config().clone();
-        // Only now, with the previous core stopped, is the generation safe to rewrite: it is the
-        // same directory that core was running in. Planning happened before anything was stopped,
-        // so a bundle the service refuses still costs no outage.
+        // Planning is read-only; materialize only after the previous core has stopped.
         prepared
             .materialize()
             .await
@@ -139,9 +137,7 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
                 ));
             }
             let _ = persist_owner_core_stopped(self.owner).await;
-            // The generation stays. It is the owner's one runtime directory, holding the core's
-            // own state, and what it describes now is a configuration this service accepted — the
-            // same one a retry would write again.
+            // Keep the owner's durable generation and core-managed state for a retry.
             return Err(error);
         }
         Ok(())
@@ -180,18 +176,13 @@ impl StartOwnerTransition<'_> {
                 "{error:#}; failed to roll back uncommitted owner core: {rollback_error:#}"
             ));
         }
-        // The prepared runtime is dropped rather than discarded: the generation is the owner's
-        // durable directory, so rolling back the *owner* leaves nothing on disk to undo.
+        // The generation is durable, so rolling back ownership has no disk changes to undo.
         self.prepared_runtime.take();
         Err(error)
     }
 }
 
-/// Whether this build drives the machine's proxy settings.
-///
-/// Only macOS has a backend behind `proxy`, and a `test` build must not reach the developer's
-/// real settings — so everywhere else the verbs below stay callable and do nothing, rather than
-/// each caller having to know which platform it is on.
+/// Whether proxy routes affect real system settings in this build.
 const SERVICE_PROXY_IS_LIVE: bool = cfg!(all(target_os = "macos", not(feature = "test")));
 
 async fn clear_service_proxy() -> AnyResult<()> {
@@ -266,24 +257,17 @@ async fn rollback_started_owner(owner: &AuthenticatedOwner) -> AnyResult<()> {
     }
 }
 
-// 防止旧 listener 的清理删除 supervisor 刚创建的新 socket。
+// Serializes listener replacement so old cleanup cannot remove the new socket.
 static IPC_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-/// The listener and the two ends of its shutdown handshake.
-///
-/// One supervisor owns all three at a time — `IPC_LIFECYCLE_LOCK` is what makes that true — but
-/// each is taken and replaced independently as a listener is torn down and rebuilt, so they are
-/// three cells rather than one.
+/// Listener state, replaced independently while `IPC_LIFECYCLE_LOCK` serializes supervisors.
 static IPC_SERVER: Lazy<Mutex<Option<IpcHttpServer>>> = Lazy::new(|| Mutex::new(None));
 static IPC_SHUTDOWN_SENDER: Lazy<Mutex<Option<oneshot::Sender<()>>>> =
     Lazy::new(|| Mutex::new(None));
 static IPC_SHUTDOWN_DONE: Lazy<Mutex<Option<oneshot::Receiver<()>>>> =
     Lazy::new(|| Mutex::new(None));
 
-/// Tell the listener to stop, then forget it.
-///
-/// The order matters and is the only reason this is a function: dropping the handle without
-/// calling `shutdown` leaves the listener running with nobody holding it.
+/// Shuts down the listener before dropping its handle.
 async fn shutdown_ipc_server() {
     let mut guard = IPC_SERVER.lock().await;
     if let Some(server) = guard.as_mut() {
@@ -433,7 +417,6 @@ fn ipc_backoff_delay(attempt: u32) -> Duration {
     Duration::from_millis(100u64 << (attempt - 1).min(3)).min(IPC_MAX_BACKOFF)
 }
 
-/// Creates the root-owned machine-wide control runtime directory.
 async fn make_ipc_dir() -> Result<()> {
     #[cfg(unix)]
     {
@@ -443,10 +426,6 @@ async fn make_ipc_dir() -> Result<()> {
         };
 
         ensure_control_runtime_dir(dir_path)?;
-    }
-    #[cfg(windows)]
-    {
-        // No directory creation needed for Windows named pipes
     }
     Ok(())
 }
@@ -466,11 +445,6 @@ async fn cleanup_ipc_path() -> Result<()> {
         if paths.ipc_path().exists() {
             fs::remove_file(paths.ipc_path()).await?;
         }
-    }
-    #[cfg(windows)]
-    {
-        // Named pipes on Windows are automatically cleaned up when the last handle is closed
-        // No manual cleanup needed
     }
     Ok(())
 }
@@ -538,10 +512,7 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
 
     #[cfg(windows)]
     {
-        // The production service runs as SYSTEM, whose ACE may create subsequent
-        // named-pipe instances. Integration tests run as the invoking user, so
-        // they need a test-only server ACE with the same create-instance right.
-        // Production clients still receive only read/write access.
+        // Tests need create-instance access normally held by the production SYSTEM account.
         #[cfg(feature = "test")]
         let descriptor = WINDOWS_TEST_CONTROL_PIPE_SDDL;
         #[cfg(not(feature = "test"))]
@@ -567,10 +538,7 @@ fn require_protocol_version(
         .ok_or_else(ServiceError::protocol_mismatch)
 }
 
-/// The two request envelopes a protected route can arrive in.
-///
-/// Both carry credentials in the same place, so a route's parse-and-authenticate step does not
-/// need to know which shape it just read.
+/// Common credential access for owner-only and session-authenticated envelopes.
 trait OwnerRequestEnvelope {
     fn credentials(&self) -> &crate::OwnerCredentials;
 }
@@ -587,14 +555,8 @@ impl<T> OwnerRequestEnvelope for AuthenticatedSessionRequest<T> {
     }
 }
 
-/// Protocol version, then deserialization, then owner authentication.
-///
-/// The order is load-bearing: a client speaking the wrong revision must be told so before its
-/// body is interpreted, and nothing may be authenticated against credentials that have not been
-/// parsed. Failures come back already encoded so a handler stays one `match`.
-///
-/// This deliberately stops short of the lifecycle lock. `StartClash` validates its payload in
-/// between, and must keep doing so before it waits on a contended lock.
+/// Validates protocol, parses the envelope, then authenticates its owner.
+/// Lifecycle locking remains separate so `StartClash` can validate before waiting on the lock.
 fn authenticate_request<E>(
     ctx: &kode_bridge::RequestContext,
 ) -> ControlFlow<Result<HttpResponse>, (E, AuthenticatedOwner)>
@@ -615,24 +577,17 @@ where
     ControlFlow::Continue((request, owner))
 }
 
-/// What a route requires of the owner once the lifecycle lock is held.
+/// Authentication state required after acquiring the owner lifecycle lock.
 enum OwnerLifecycleGate<'a> {
-    /// `Status` reports inactivity as data rather than as an error, and `StartClash` is the
-    /// request that makes an owner active in the first place. Neither can demand one.
+    /// No active owner is required.
     Unchecked,
-    /// Proof of being the active owner, which is all the read-only log routes need.
+    /// The authenticated owner must be active.
     ActiveOwner,
-    /// Proof of the current session, not merely of the owner: a second instance of the same
-    /// user, or one whose core was replaced, must not reach the running core.
+    /// The request must prove the current active session.
     ActiveSession(&'a OwnerSessionProof),
 }
 
-/// Takes `OWNER_LIFECYCLE_LOCK` and then applies the route's gate, in that order — the gate
-/// reads the very state the lock protects.
-///
-/// The guard is returned rather than dropped here, so it lives for the whole of the caller's
-/// operation. On a rejected gate the response is built while the guard is still held, which is
-/// where it is built today.
+/// Acquires `OWNER_LIFECYCLE_LOCK`, applies the gate, and returns the guard to the caller.
 async fn enter_owner_lifecycle(
     owner: &AuthenticatedOwner,
     gate: OwnerLifecycleGate<'_>,
@@ -812,10 +767,8 @@ fn create_ipc_router() -> Result<Router> {
                     ControlFlow::Continue(authenticated) => authenticated,
                     ControlFlow::Break(response) => return response,
                 };
-            // The guard is held for the whole operation, and for the same reason `StartClash`
-            // holds it: a core must not be stopped, started, or handed to another owner while its
-            // generation is being rewritten underneath it. Staging writes into the directory the
-            // *running* core reads from, which is why the gate is the session and not the owner.
+            // Staging rewrites the live generation, so hold the lifecycle lock and require its
+            // current session for the whole operation.
             let _lifecycle_guard = match enter_owner_lifecycle(
                 &owner,
                 OwnerLifecycleGate::ActiveSession(&request.session),
@@ -847,8 +800,7 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Continue(guard) => guard,
                 ControlFlow::Break(response) => return response,
             };
-            // The client does not get to choose where the service writes: whatever it sent is
-            // replaced with the owner's own log directory.
+            // Never let the client choose a service-owned log destination.
             writer_config.directory = service_paths()
                 .for_owner(&owner.identity)
                 .logs_dir()
@@ -872,9 +824,7 @@ fn create_ipc_router() -> Result<Router> {
                     ControlFlow::Continue(authenticated) => authenticated,
                     ControlFlow::Break(response) => return response,
                 };
-            // The proxy config is still validated here, after the gate, and not alongside
-            // `StartClash`'s pre-lock validation: a stale session must keep winning over an
-            // invalid payload.
+            // Reject a stale session before reporting payload validation errors.
             let _lifecycle_guard = match enter_owner_lifecycle(
                 &owner,
                 OwnerLifecycleGate::ActiveSession(&request.session),
@@ -898,8 +848,7 @@ fn create_ipc_router() -> Result<Router> {
 async fn read_log_snapshot(path: &std::path::Path) -> std::io::Result<String> {
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
-    // The kode-bridge in-memory response limit is 10 MiB. Hex keeps the JSON payload
-    // bounded and avoids content-dependent escaping expansion.
+    // Stay below kode-bridge's 10 MiB in-memory response limit after hex encoding.
     const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
     let mut file = tokio::fs::File::open(path).await?;
     let length = file.metadata().await?.len();

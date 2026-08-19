@@ -1,7 +1,4 @@
-//! Clash Verge Service - Cross-platform IPC service daemon
-//!
-//! This service can run as a standalone process or as a Windows service.
-//! It listens for shutdown signals (Ctrl+C, SIGTERM, or service stop) to gracefully terminate.
+//! Cross-platform IPC daemon, run standalone or as a Windows service.
 
 use anyhow::Result;
 use clash_verge_service_ipc::{
@@ -26,9 +23,6 @@ use {
     std::time::Duration,
 };
 
-// --- Main Entry Points ---
-
-/// Main entry point for non-Windows platforms (Linux, macOS).
 #[cfg(not(windows))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -44,8 +38,7 @@ fn set_secure_process_umask() {
     }
 }
 
-/// Main entry point for Windows.
-/// Tries to run as a service, falls back to standalone mode if that fails.
+/// Runs as a Windows service when possible, otherwise standalone.
 #[cfg(windows)]
 fn main() -> Result<()> {
     init_logger();
@@ -62,12 +55,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-// --- Windows Service Implementation ---
-
 #[cfg(windows)]
 define_windows_service!(ffi_service_main, my_service_main);
 
-/// The entry point for the Windows service.
 #[cfg(windows)]
 fn my_service_main(_args: Vec<OsString>) {
     if let Err(e) = run_service() {
@@ -75,7 +65,6 @@ fn my_service_main(_args: Vec<OsString>) {
     }
 }
 
-/// Contains the core logic for running as a Windows service.
 #[cfg(windows)]
 fn run_service() -> platform_lib::Result<()> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -166,9 +155,6 @@ fn run_service() -> platform_lib::Result<()> {
     Ok(())
 }
 
-// --- Common Logic ---
-
-/// Initializes the global logger.
 fn init_logger() {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
@@ -187,8 +173,7 @@ async fn run_standalone() -> Result<()> {
         return Ok(());
     };
 
-    // 启动恢复只做 best-effort；即使失败也要启动 IPC，让 GUI 重连后重推配置自愈。
-    // 否则失效的 desired-state 路径会导致进程退出并被 launchd 反复拉起。
+    // Startup recovery is best-effort so stale desired state cannot prevent IPC self-healing.
     match reconcile_service_startup().await {
         Ok(()) => {
             if let Err(error) = restore_desired_state().await {
@@ -209,7 +194,6 @@ async fn run_standalone() -> Result<()> {
     Ok(())
 }
 
-/// Waits for a shutdown signal appropriate for the current platform.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {

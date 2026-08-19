@@ -59,10 +59,7 @@ mod windows_legacy_cleanup;
 #[cfg(all(feature = "standalone", windows))]
 mod windows_security;
 
-/// The platform's answer to "make this private to the service".
-///
-/// Two adapters, one name: every caller below asks `platform_security` and none of them repeats
-/// the `unix`/`windows` pair that used to sit at each call site.
+/// Platform-specific service directory hardening.
 #[cfg(all(feature = "standalone", unix))]
 pub(in crate::core) use unix_security as platform_security;
 #[cfg(all(feature = "standalone", windows))]

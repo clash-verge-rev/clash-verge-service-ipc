@@ -83,8 +83,5 @@ pub const PROTOCOL_REVISION: u16 = 2;
 pub const MIN_SUPPORTED_CLIENT_REVISION: u16 = 1;
 pub const MIN_REQUIRED_SERVICE_REVISION: u16 = 1;
 /// Revision that introduced `/clash/stage-runtime`.
-///
-/// Kept apart from `MIN_REQUIRED_SERVICE_REVISION`, which must stay at the oldest revision a
-/// client can still talk to: an installed service without staging is fully usable and must not
-/// be pushed into a reinstall just because it cannot take the fast path.
+/// This is a capability gate, not the minimum compatible service revision.
 pub const MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING: u16 = 2;

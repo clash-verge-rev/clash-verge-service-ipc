@@ -6,11 +6,7 @@ use crate::{
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-/// The one directory an owner's core is ever started against.
-///
-/// A fixed name, not a per-start one: the core keeps its own state here and that state is the
-/// point. `snapshot_stale_runtime_directories` already treats this name as service-owned, so an
-/// installation still holding per-start directories retires them on its next start.
+/// Stable per-owner directory that preserves core-managed state across restarts.
 const RUNTIME_GENERATION_DIRECTORY_NAME: &str = "runtime";
 
 #[cfg(windows)]
@@ -23,16 +19,8 @@ const WINDOWS_RUNTIME_RETRY_DELAYS: [Duration; 6] = [
     Duration::from_millis(800),
 ];
 
-/// The owner's generation, refreshed and ready for a core to be started against it.
-///
-/// There is nothing here to undo. The generation is durable — one per owner, reused for the
-/// life of the installation — so a start that fails leaves it exactly as this left it, which is
-/// a configuration a core can be started against. It used to be a directory minted per start,
-/// and then every way of failing had to remember to delete it before it leaked; the state
-/// machine that tracked whether deleting was still safe went with it.
-///
-/// What survives is the sweep of the *old* per-start directories, which is how an installation
-/// that predates this migrates: they are collected once the start commits, and removed then.
+/// A planned refresh of the owner's durable runtime generation.
+/// Old per-start directories are retired only after the new core starts successfully.
 #[derive(Debug)]
 pub(crate) struct PreparedRuntime {
     clash_config: ClashConfig,
@@ -47,19 +35,13 @@ impl PreparedRuntime {
         &self.clash_config
     }
 
-    /// Write the planned changes into the generation.
-    ///
-    /// Separate from planning them because the generation is now the *same* directory the
-    /// outgoing core is running in, and this rewrites it. Planning happens before anything is
-    /// stopped, so a bundle the service will not accept still costs no outage; writing happens
-    /// after, so nothing is replaced under a core that still has it open. On Windows that is the
-    /// difference between a restart and a failed one — a geo database the running core has
-    /// memory-mapped cannot be replaced at all while it lives.
+    /// Writes the plan after the outgoing core has stopped.
+    /// Keeping this separate from planning avoids touching files still held open by that core.
     pub(crate) async fn materialize(&self) -> Result<(), ServiceError> {
         materialize_plan(&self.runtime, &self.plan, &self.yaml).await
     }
 
-    /// The core started against this generation: retire whatever the old layout left behind.
+    /// Retires directories left by the old per-start layout after a successful start.
     pub(crate) fn commit(mut self) {
         let stale_paths = std::mem::take(&mut self.stale_runtime_paths);
         if stale_paths.is_empty() {
@@ -173,20 +155,8 @@ async fn remove_runtime_directory(path: &Path, operation: &str) -> std::io::Resu
     }
 }
 
-/// Whether a Windows failure is one that another attempt could get past.
-///
-/// The first four are what a handle held on a file or directory produces while it is being removed.
-/// The `MoveFileEx` codes were added when this started being used for *replacing* a file and not
-/// only for removing a directory: a replacement whose target is in the delete-pending state a held
-/// handle leaves behind fails with one of them rather than with a sharing violation.
-///
-/// `ERROR_USER_MAPPED_FILE` is the one a memory-mapped file gives, and retrying it will not help
-/// while the mapping lives — it is here so the wait is bounded and the caller reaches its "give up
-/// and restart the core" path rather than treating it as a hard failure.
-///
-/// Which of these actually occur cannot be established on a machine that cannot build for Windows;
-/// the set errs towards retrying, and the cost of a wrong guess is a bounded delay before the
-/// caller falls back.
+/// Returns a bounded retry delay for Windows errors caused by live file handles.
+/// Mapped files are included so callers eventually fall back to restarting the core.
 #[cfg(windows)]
 pub(super) fn runtime_cleanup_retry_delay(
     error: &std::io::Error,
@@ -222,19 +192,8 @@ pub(super) fn runtime_cleanup_retry_delay(
     None
 }
 
-/// Make sure the owner's generation directory exists and is private to the service.
-///
-/// The owner has one generation and keeps it. It used to get a fresh
-/// `runtime.generation-{pid}-{nanos}-{seq}` on every start, which is why a restart lost the
-/// node the user had picked: the core keeps its own state in the directory it is started
-/// against — `cache.db`, holding the `store-selected` choices and the fake-ip leases — and a
-/// directory nothing had ever run in has none of it. Every `select` group then fell back to
-/// the first entry in its `proxies:` list.
-///
-/// Reusing it is also what the service already did from the other direction: restoring an
-/// owner's core from its desired state starts it against the recorded `config_dir`, which is
-/// this same directory. Only an app-driven start minted a new one, so the two paths disagreed
-/// about whether a generation outlives the core that ran in it.
+/// Ensures the private, durable generation used by both normal starts and desired-state restore.
+/// Reuse preserves core-owned state such as `cache.db` selections and fake-IP leases.
 async fn ensure_runtime_generation(owner_root: &Path) -> Result<PathBuf, ServiceError> {
     let runtime = owner_root.join(RUNTIME_GENERATION_DIRECTORY_NAME);
     tokio::fs::create_dir_all(&runtime).await.map_err(|error| {
@@ -292,16 +251,8 @@ pub(crate) async fn prepare_runtime(
     Ok(prepared)
 }
 
-/// Work out what would make the owner's generation match `bundle`. Writes nothing.
-///
-/// The same plan `stage_runtime` uses, for the same reasons: an asset is re-copied only when its
-/// source changed, a remote provider's download cache is discarded exactly when its url changed,
-/// and nothing is deleted that the previous manifest did not record. That last rule is what
-/// carries the core's own files — `cache.db` above all — across a restart, and it is the point of
-/// running the plan here rather than copying blindly into an empty directory.
-///
-/// A first start finds no manifest, which the plan reads as "nothing can be proven": it copies
-/// every asset and skips nothing, which is what building an empty generation always did.
+/// Plans a runtime refresh without writing; only manifest-recorded files may be deleted.
+/// A missing manifest copies all declared assets and preserves unknown core-owned files.
 async fn plan_runtime_refresh(
     owner: &AuthenticatedOwner,
     bundle: &RuntimeBundle,
@@ -309,12 +260,8 @@ async fn plan_runtime_refresh(
     runtime: &Path,
 ) -> Result<super::staging::StagePlan, ServiceError> {
     let gathered = gather_bundle(owner, bundle, core_path).await?;
-    // A manifest that cannot be read is not a reason to refuse to start a core. It is the same
-    // state as no manifest at all — nothing can be proven — and the plan already answers that by
-    // copying everything and sweeping nothing. Staging can afford to decline and let the caller
-    // restart; a start has nowhere to fall back to, and the caller's fallback for a declined
-    // staging *is* a start. Refusing here turns a corrupt bookkeeping file into no core at all,
-    // with every retry hitting the same file.
+    // A corrupt manifest must not prevent the restart that staging uses as its fallback.
+    // Treat it as untrusted: copy everything and sweep nothing.
     let previous = super::staging::read_manifest(runtime)
         .await
         .unwrap_or_else(|detail| {
@@ -331,20 +278,13 @@ async fn plan_runtime_refresh(
     ))
 }
 
-/// Apply a plan to the generation.
-///
-/// The order is the plan's own, and the same one staging applies: stale caches before the copies,
-/// `config.yaml` committed last and atomically. Here it is not about what a live core might see —
-/// the caller has already stopped it — but about what is on disk if this fails part way. A failure
-/// before the commit leaves the generation still describing the configuration the previous core
-/// ran, which is what the desired-state restore would start again.
+/// Applies a plan, committing `config.yaml` last so partial failure leaves the old configuration.
 async fn materialize_plan(
     runtime: &Path,
     plan: &super::staging::StagePlan,
     yaml: &str,
 ) -> Result<(), ServiceError> {
-    // The plan is shared, so what gets recorded is corrected here: a copy whose source moved
-    // under it loses its entry rather than the whole start losing.
+    // Do not record a source that changed while it was copied.
     let mut manifest = plan.manifest.clone();
     for destination in &plan.required_deletes {
         let target = resolve_in_generation(runtime, destination)?;
@@ -367,15 +307,8 @@ async fn materialize_plan(
                     copy.destination
                 ))
             })?;
-        // Re-stat for the reason staging does: an identity read before the copy would name
-        // content that is no longer there, and every later staging would then skip it because
-        // the record still matches the source. One stat against a warm file beats pinning the
-        // wrong bytes for the life of the generation.
-        //
-        // Staging turns this into a restart; a start cannot, and does not need to. Dropping the
-        // entry says the same thing the manifest says about any destination it omits — nothing is
-        // proven about it — so the next staging copies it again. A geo database being rewritten
-        // while the core starts must not be a start failure.
+        // Re-stat after copying. If the source moved, omit its proof so the next staging retries;
+        // a concurrent geo-data update should not fail the current start.
         if super::staging::source_identity_changed(&copy.source, &copy.identity).await {
             tracing::warn!(
                 destination = %copy.destination,
@@ -389,12 +322,8 @@ async fn materialize_plan(
     if let Err(error) =
         super::staging::commit_staged_config(runtime, &config_path, yaml, &manifest).await
     {
-        // The manifest goes in before the configuration, so it can be in place while the
-        // configuration is not — claiming a remote cache belongs to a url nothing is serving. Left
-        // there, the next plan believes the claim and never discards that cache, so the core keeps
-        // being handed provider data fetched from the previous url, with nothing to notice it.
-        // Discarding it costs the next start its skips and its cache reuse; keeping it costs
-        // correctness for as long as the generation lives. Staging makes the same trade.
+        // A manifest written before a failed config commit may claim cache provenance for a URL
+        // the core never loaded; discard it rather than trust stale provider data next time.
         if let Err(discard) =
             super::staging::remove_staged_file(&runtime.join(super::staging::MANIFEST_FILE_NAME))
                 .await
@@ -409,9 +338,7 @@ async fn materialize_plan(
         )));
     }
 
-    // Housekeeping: files a previous bundle declared and this one does not. Failing to remove one
-    // changes nothing the core observes, so it is logged rather than returned — the configuration
-    // is already committed and the core is about to be started against it.
+    // Post-commit cleanup is best-effort because it cannot affect what the core observes.
     for destination in &plan.hygiene_deletes {
         match resolve_in_generation(runtime, destination) {
             Ok(target) => {
@@ -440,11 +367,7 @@ async fn materialize_plan(
     Ok(())
 }
 
-/// Everything a bundle declares, validated and stat'd, ready for the plan.
-///
-/// Both verbs need exactly this and used to compute it separately. The duplication was the kind
-/// that drifts silently: only one of the two rejected a destination declared twice, and only one
-/// of them re-checked a source that changed under the copy.
+/// Validated, stat'd bundle data shared by start and staging plans.
 pub(super) struct GatheredBundle {
     pub sources: Vec<super::staging::AssetSource>,
     pub remote: Vec<crate::RemoteProvider>,
@@ -515,15 +438,7 @@ pub(super) fn validate_core_path(
     Ok(canonical)
 }
 
-/// Where a macOS core binary is allowed to live.
-///
-/// This is the whole security value of the macOS arm of [`validate_core_path`]: a core outside an
-/// Applications directory is one the owner could have written wherever it liked, without the
-/// protections macOS gives an installed application.
-///
-/// It takes plain paths rather than an owner so the rule can be checked without a filesystem, a
-/// running service, or a particular build. The `test` escape hatch stays at the call site — this
-/// function always answers the production question.
+/// Checks the production macOS rule that cores live in a protected Applications directory.
 #[cfg(target_os = "macos")]
 fn is_permitted_macos_core_location(canonical: &Path, home_applications: Option<&Path>) -> bool {
     canonical.starts_with("/Applications")
@@ -580,23 +495,12 @@ pub(super) fn validate_destination(destination: &str) -> Result<PathBuf, Service
     Ok(path.to_path_buf())
 }
 
-/// The file a runtime generation's configuration always lives in.
 pub(super) const RUNTIME_CONFIG_FILE_NAME: &str = "config.yaml";
-/// The infix every file staging writes as a temporary carries.
 pub(super) const STAGING_TEMP_INFIX: &str = ".staging-";
 
-/// Reduce a validated destination to the single string form used as its key everywhere.
-///
-/// Built by reassembling the validated components, never by rewriting separators in the client's
-/// own string. That distinction is the whole point: `validate_destination` accepts a destination
-/// because every component is `Normal`, and on Unix a backslash is an ordinary character *inside*
-/// a component — so rewriting `\` to `/` afterwards turns a filename the validator accepted back
-/// into a path, and `..\..\etc\thing` becomes a traversal the validator already approved.
-///
-/// Also refuses the names the generation directory owns. A bundle that could claim `config.yaml`
-/// could have its configuration deleted by the next staging's housekeeping sweep; one that could
-/// claim the manifest could rewrite the record staging trusts; one that could claim a staging
-/// temporary could be clobbered mid-write.
+/// Canonicalizes a validated destination and rejects service-owned generation names.
+/// Rebuild from path components rather than rewriting separators, which could turn a valid Unix
+/// filename containing backslashes into an unvalidated traversal.
 pub(super) fn destination_key(destination: &Path) -> Result<String, ServiceError> {
     let mut parts = Vec::new();
     for component in destination.components() {
@@ -615,9 +519,7 @@ pub(super) fn destination_key(destination: &Path) -> Result<String, ServiceError
     }
     match parts.as_slice() {
         [] => Err(invalid_asset("runtime asset destination is empty")),
-        // Compared without regard to case, because most Windows filesystems are: `Config.yaml`
-        // would be a different manifest key naming the same file, and the housekeeping sweep — which
-        // runs after the configuration is committed — would then delete the live configuration.
+        // Treat service-owned names case-insensitively for Windows filesystems.
         [only]
             if only.eq_ignore_ascii_case(RUNTIME_CONFIG_FILE_NAME)
                 || only.eq_ignore_ascii_case(super::staging::MANIFEST_FILE_NAME) =>
@@ -630,11 +532,7 @@ pub(super) fn destination_key(destination: &Path) -> Result<String, ServiceError
     }
 }
 
-/// Whether a name is shaped like one of staging's own temporaries, `.{name}.staging-{pid}-{seq}`.
-///
-/// Matched on the shape rather than on the infix alone: a provider legitimately called
-/// `company.staging-prod.yaml` is not a temporary, and refusing it would keep a configuration the
-/// core is willing to load from ever being materialised.
+/// Matches staging's temporary-file shape without rejecting ordinary names containing the infix.
 fn is_staging_temporary(name: &str) -> bool {
     let Some(tail) = name
         .strip_prefix('.')
@@ -650,10 +548,7 @@ fn is_staging_temporary(name: &str) -> bool {
             && sequence.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-/// Resolve a recorded destination inside `generation`, refusing anything that would leave it.
-///
-/// Applied to keys read back from the manifest as well as to keys from the bundle: the manifest is
-/// a file, and a file is a thing that can be wrong.
+/// Resolves an untrusted bundle or manifest destination inside `generation`.
 pub(super) fn resolve_in_generation(
     generation: &Path,
     destination: &str,
@@ -780,14 +675,7 @@ async fn prepare_owner_ipc_directory(owner: &AuthenticatedOwner) -> Result<(), S
     Ok(())
 }
 
-/// Whether an already-open directory is one the service may use as an owner's IPC directory.
-///
-/// Root owns it when the installer made it; the owner owns it after a handover. Anything else is
-/// a directory somebody else can write to, and the core's socket must not be created inside one.
-///
-/// The facts arrive as plain values so the rule can be checked without an `fstat`, a real
-/// directory, or root. `process_owned` is the caller's `test`-build concession — no test runs as
-/// root — and this function stays honest about the rest regardless of build.
+/// Allows only root-, owner-, or test-process-owned IPC directories with private group/other mode.
 #[cfg(unix)]
 fn owner_ipc_directory_is_usable(
     inspected: bool,
@@ -941,10 +829,7 @@ mod tests {
     use serial_test::serial;
     use std::path::PathBuf;
 
-    /// Plan and then write, which is the pair the start path performs.
-    ///
-    /// They are separate in production because the write happens only once the previous core has
-    /// been stopped; a test with no core running can do both at once.
+    /// Runs the two production phases together when no core is active in tests.
     async fn prepare_and_materialize(
         owner: &AuthenticatedOwner,
         bundle: &RuntimeBundle,
@@ -955,11 +840,7 @@ mod tests {
     }
 
     fn test_owner(app_data_root: std::path::PathBuf) -> AuthenticatedOwner {
-        // `ensure_service_directory` creates one level and then hardens it, so it needs its parent
-        // to exist. In production the installer provides that; the integration tests get it as a
-        // side effect of starting the IPC server. These tests start nothing, so they provide it —
-        // relaxing the hardening helper into `create_dir_all` instead would create the
-        // intermediate directories of a privileged path unhardened.
+        // Unit tests do not run the installer or IPC server that normally creates this parent.
         if let Some(root) = std::path::Path::new(crate::IPC_PATH).parent() {
             std::fs::create_dir_all(root).expect("test IPC root must be creatable");
         }
@@ -1085,9 +966,7 @@ mod tests {
             .expect_err("traversal must fail");
 
         assert_eq!(error.code, ServiceErrorCode::InvalidRuntimeAsset);
-        // The generation is the owner's one durable directory, so "did not replace" is a
-        // statement about its contents rather than about how many directories exist: a rejected
-        // bundle must leave the configuration a core could still be started against.
+        // A rejected bundle must leave the durable generation startable.
         assert_eq!(
             std::fs::read_to_string(&prepared.clash_config.core_config.config_path)?,
             "mode: rule\n"
@@ -1096,7 +975,6 @@ mod tests {
         Ok(())
     }
 
-    /// What the core writes for itself, which the service must never take away from it.
     fn core_owned_state(prepared: &PreparedRuntime) -> PathBuf {
         PathBuf::from(&prepared.clash_config.core_config.config_dir).join("cache.db")
     }
@@ -1104,10 +982,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_restart_keeps_the_state_the_core_wrote_for_itself() -> anyhow::Result<()> {
-        // The regression this pins: mihomo stores the node the user picked in `cache.db`, in the
-        // directory it was started against. A start that minted a fresh directory handed the core
-        // an empty one, `store-selected` restored nothing, and every `select` group fell back to
-        // the first entry in its `proxies:` list.
+        // `cache.db` contains selections and must survive service-driven restarts.
         let app_root =
             std::env::temp_dir().join(format!("service-runtime-cachedb-{}", std::process::id()));
         std::fs::create_dir_all(&app_root)?;
@@ -1141,9 +1016,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_rejected_bundle_keeps_the_state_the_core_wrote_for_itself() -> anyhow::Result<()> {
-        // Rejecting used to mean deleting the whole directory, which was safe only because the
-        // directory was one this start had just created. Now it is the owner's, and deleting it
-        // would throw away the running core's database to punish a bad bundle.
+        // Rejecting a bundle must not delete core-owned state from the durable generation.
         let app_root = std::env::temp_dir().join(format!(
             "service-runtime-cachedb-reject-{}",
             std::process::id()
@@ -1189,11 +1062,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn planning_a_start_writes_nothing_into_the_generation() -> anyhow::Result<()> {
-        // The generation is the directory the *outgoing* core is still running in when a start is
-        // planned, so planning may not touch it. Only `materialize`, which the caller runs once
-        // that core has been stopped, is allowed to write. On Windows the difference is whether a
-        // restart works at all: a geo database the running core has memory-mapped cannot be
-        // replaced while it lives.
+        // Planning runs while the outgoing core may still hold generation files open.
         let app_root =
             std::env::temp_dir().join(format!("service-runtime-planonly-{}", std::process::id()));
         std::fs::create_dir_all(&app_root)?;
@@ -1250,10 +1119,7 @@ mod tests {
     #[serial]
     async fn planning_a_start_does_not_replace_an_asset_the_running_core_holds()
     -> anyhow::Result<()> {
-        // The sibling test covers *adding* a destination while planning. This covers replacing one
-        // that is already there, which is the case Windows cares about: a geo database the running
-        // core has memory-mapped cannot be replaced while it lives, so a plan that overwrote in
-        // place would turn every same-owner restart into a failure.
+        // Existing destinations may be memory-mapped by the outgoing core on Windows.
         let app_root =
             std::env::temp_dir().join(format!("service-runtime-planonly-{}", std::process::id()));
         std::fs::create_dir_all(&app_root)?;
@@ -1312,10 +1178,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn an_unreadable_manifest_rebuilds_rather_than_refusing_to_start() -> anyhow::Result<()> {
-        // The manifest is bookkeeping the user never sees. Staging can decline a corrupt one and
-        // let the caller restart — but the caller's fallback *is* a start, so if a start refused
-        // too, a truncated JSON file would leave the machine with no core and every retry would
-        // hit the same file.
+        // Restart is staging's fallback, so corrupt bookkeeping cannot also block start.
         let app_root =
             std::env::temp_dir().join(format!("service-runtime-manifest-{}", std::process::id()));
         std::fs::create_dir_all(&app_root)?;
@@ -1367,14 +1230,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_destination_the_manifest_omits_is_copied_again() -> anyhow::Result<()> {
-        // An asset rewritten while it was being copied is dropped from the manifest rather than
-        // failing the start — a geo database being updated must not leave the machine with no
-        // core. This tests what that costs, which is the whole claim: a destination nothing is
-        // proven about is copied again, so the omission is self-correcting.
-        //
-        // Driven by editing the manifest rather than by racing the copy, because the branch that
-        // omits the entry only fires on a rewrite between two stats microseconds apart. The
-        // omission is what it produces, and the omission is what has to be safe.
+        // Simulate the manifest omission produced when a source changes during its copy.
         let app_root =
             std::env::temp_dir().join(format!("service-runtime-omitted-{}", std::process::id()));
         std::fs::create_dir_all(&app_root)?;
@@ -1404,7 +1260,7 @@ mod tests {
             "a copy that went through cleanly is recorded"
         );
 
-        // What the tolerant branch leaves behind: the copy, without a record of what it was from.
+        // The copy exists but has no trusted source record.
         std::fs::write(&manifest_path, br#"{"assets":{},"remote_providers":{}}"#)?;
         std::fs::remove_file(generation.join("geo.dat"))?;
 
@@ -1422,9 +1278,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_bundle_this_service_will_not_accept_changes_nothing() -> anyhow::Result<()> {
-        // Everything is validated and stat'd before a byte moves, so a bundle that is rejected
-        // half way through its asset list cannot leave the generation describing neither the old
-        // configuration nor the new one.
+        // Validation must finish before any generation file changes.
         let app_root =
             std::env::temp_dir().join(format!("service-runtime-atomic-{}", std::process::id()));
         std::fs::create_dir_all(&app_root)?;

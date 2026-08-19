@@ -1,7 +1,6 @@
 use clash_verge_service_ipc::{OwnerCredentials, test_owner_credentials};
 
-// Each test binary compiles this module separately and uses a different part of it; a helper one
-// binary does not need is not an unused helper.
+// Each integration-test binary uses a different subset of these helpers.
 #[allow(dead_code)]
 pub fn owner_credentials() -> OwnerCredentials {
     let app_data_dir =
@@ -10,9 +9,7 @@ pub fn owner_credentials() -> OwnerCredentials {
         .expect("test owner credentials should be secured for the current user")
 }
 
-/// Where `cargo` put a helper binary this test needs to spawn.
-///
-/// The mock core, crashing core, and owner-lock probe are built beside the tests.
+/// Returns the path to a helper binary built beside the integration tests.
 #[allow(dead_code)]
 pub fn test_bin_path(name: &str) -> std::path::PathBuf {
     let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -22,9 +19,7 @@ pub fn test_bin_path(name: &str) -> std::path::PathBuf {
     path
 }
 
-/// Wait until the service is answering on its socket.
-///
-/// `run_ipc_server` returns before the listener has necessarily bound its socket.
+/// Waits for the asynchronously started IPC listener to become ready.
 #[allow(dead_code)]
 pub async fn wait_for_ipc() -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

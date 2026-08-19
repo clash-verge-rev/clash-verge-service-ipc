@@ -7,10 +7,6 @@ pub enum IpcCommand {
     GetVersion,
     #[strum(serialize = "/status")]
     Status,
-    // #[strum(serialize = "/clash")]
-    // GetClash,
-
-    // 用于日志界面加载上一次日志内容
     #[strum(serialize = "/clash/logs")]
     GetClashLogs,
 

@@ -1,10 +1,4 @@
-//! What the installer and the uninstaller both have to do.
-//!
-//! These two binaries are one job seen from either end: they take the same repair gate, run the
-//! same maintenance flag, shell out the same way, and both have to clear the helper that shipped
-//! before the service had a channel. Neither can import the other, and none of this belongs in the
-//! library — it is how a privileged command-line tool behaves, not part of the IPC contract — so
-//! it lives here and both declare it.
+//! Privileged maintenance shared by the installer and uninstaller binaries.
 
 use anyhow::Error;
 
@@ -34,7 +28,6 @@ pub fn uninstall_old_service() -> Result<(), Error> {
     let target_binary_path = "/Library/PrivilegedHelperTools/io.github.clashverge.helper";
     let plist_file = "/Library/LaunchDaemons/io.github.clashverge.helper.plist";
 
-    // Stop and unload service
     run_command("launchctl", &["stop", "io.github.clashverge.helper"], false)?;
     run_command("launchctl", &["bootout", "system", plist_file], false)?;
     run_command(
@@ -43,7 +36,6 @@ pub fn uninstall_old_service() -> Result<(), Error> {
         false,
     )?;
 
-    // Remove files
     if Path::new(plist_file).exists() {
         std::fs::remove_file(plist_file)
             .map_err(|e| anyhow::anyhow!("Failed to remove plist file: {}", e))?;
