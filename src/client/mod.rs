@@ -14,8 +14,9 @@ mod windows_identity;
 
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
-    MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof, ProtocolInfo,
-    ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, ServiceStatusSnapshot,
+    MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, MobileHotspotCompatibilityOutcome,
+    MobileHotspotCompatibilityRequest, OwnerCredentials, OwnerSessionProof, ProtocolInfo, ProtocolVersion,
+    ProxyApplyOutcome, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, ServiceStatusSnapshot,
     StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
@@ -26,6 +27,7 @@ static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
 // Large cache chunks need a longer timeout than control messages.
 const RUNTIME_FILE_TIMEOUT: Duration = Duration::from_secs(15);
+const MOBILE_HOTSPOT_COMPATIBILITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn protected<'a>(request: kode_bridge::HttpRequestBuilder<'a>) -> kode_bridge::HttpRequestBuilder<'a> {
     request.header(
@@ -276,6 +278,22 @@ pub async fn set_system_proxy(
         Some(session),
         body.clone(),
         None,
+    )
+    .await
+}
+
+pub async fn set_mobile_hotspot_compatibility(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    body: &MobileHotspotCompatibilityRequest,
+) -> Result<Response<MobileHotspotCompatibilityOutcome>> {
+    protected_call(
+        Verb::Put,
+        IpcCommand::SetMobileHotspotCompatibility,
+        credentials,
+        Some(session),
+        body.clone(),
+        Some(MOBILE_HOTSPOT_COMPATIBILITY_TIMEOUT),
     )
     .await
 }

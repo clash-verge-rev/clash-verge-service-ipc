@@ -61,6 +61,10 @@ impl ServiceError {
     pub(crate) fn proxy_apply_failed(message: impl Into<String>) -> Self {
         Self::new(ServiceErrorCode::ProxyApplyFailed, message)
     }
+
+    pub(crate) fn mobile_hotspot_compatibility_failed(message: impl Into<String>) -> Self {
+        Self::new(ServiceErrorCode::MobileHotspotCompatibilityFailed, message)
+    }
 }
 
 impl fmt::Display for ServiceError {
