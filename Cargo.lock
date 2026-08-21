@@ -137,6 +137,7 @@ dependencies = [
  "tracing-estuary",
  "tracing-subscriber",
  "url",
+ "windows",
  "windows-service",
  "windows-sys 0.61.2",
 ]
