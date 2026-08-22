@@ -2,6 +2,9 @@
 
 use anyhow::Error;
 
+#[cfg(target_os = "macos")]
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub(crate) fn enter_repair_gate() -> Result<clash_verge_service_ipc::ServiceRepairGate, Error> {
     match clash_verge_service_ipc::acquire_service_repair_gate()? {
         Some(gate) => Ok(gate),
@@ -49,16 +52,43 @@ pub fn uninstall_old_service() -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub fn run_command(cmd: &str, args: &[&str], debug: bool) -> Result<(), Error> {
+#[cfg(target_os = "macos")]
+pub fn run_command_output(
+    cmd: &str,
+    args: &[&str],
+    debug: bool,
+) -> Result<std::process::Output, Error> {
+    run_command_output_with_timeout(cmd, args, debug, COMMAND_TIMEOUT)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn run_command_output_with_timeout(
+    cmd: &str,
+    args: &[&str],
+    debug: bool,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, Error> {
     if debug {
         println!("Executing: {} {}", cmd, args.join(" "));
     }
 
-    let output = std::process::Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|e| anyhow::anyhow!("Failed to execute '{}': {}", cmd, e))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("Failed to create command runtime: {error}"))?;
+    runtime.block_on(async {
+        let mut command = tokio::process::Command::new(cmd);
+        command.args(args).kill_on_drop(true);
+        tokio::time::timeout(timeout, command.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("Command '{}' exceeded its {:?} timeout", cmd, timeout))?
+            .map_err(|error| anyhow::anyhow!("Failed to execute '{}': {}", cmd, error))
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub fn run_command(cmd: &str, args: &[&str], debug: bool) -> Result<(), Error> {
+    let output = run_command_output(cmd, args, debug)?;
 
     if output.status.success() {
         return Ok(());
@@ -81,4 +111,147 @@ pub fn run_command(cmd: &str, args: &[&str], debug: bool) -> Result<(), Error> {
         stdout,
         stderr
     ))
+}
+
+#[cfg(target_os = "linux")]
+pub struct SystemdManager {
+    runtime: tokio::runtime::Runtime,
+    connection: zbus::Connection,
+    transport: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+// This module is compiled separately into the installer and uninstaller, so each
+// binary intentionally leaves some operations unused.
+#[allow(dead_code)]
+impl SystemdManager {
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    const METHOD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+    const STATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    pub fn connect() -> Result<Self, Error> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (connection, transport) = runtime.block_on(async {
+            let private = tokio::time::timeout(Self::CONNECT_TIMEOUT, async {
+                zbus::connection::Builder::address("unix:path=/run/systemd/private")?
+                    .p2p()
+                    .method_timeout(Self::METHOD_TIMEOUT)
+                    .build()
+                    .await
+            })
+            .await;
+            if let Ok(Ok(connection)) = private {
+                return Ok((connection, "private socket"));
+            }
+            let private_error = match private {
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => format!("timed out after {:?}", Self::CONNECT_TIMEOUT),
+                Ok(Ok(_)) => unreachable!(),
+            };
+
+            let system_bus = tokio::time::timeout(Self::CONNECT_TIMEOUT, async {
+                zbus::connection::Builder::system()?
+                    .method_timeout(Self::METHOD_TIMEOUT)
+                    .build()
+                    .await
+            })
+            .await;
+            match system_bus {
+                Ok(Ok(connection)) => Ok((connection, "system bus")),
+                Ok(Err(error)) => Err(anyhow::anyhow!(
+                    "failed to connect to systemd (private: {private_error}; system bus: {error})"
+                )),
+                Err(_) => Err(anyhow::anyhow!(
+                    "failed to connect to systemd (private: {private_error}; system bus timed out after {:?})",
+                    Self::CONNECT_TIMEOUT
+                )),
+            }
+        })?;
+        Ok(Self {
+            runtime,
+            connection,
+            transport,
+        })
+    }
+
+    pub fn transport(&self) -> &'static str {
+        self.transport
+    }
+
+    async fn proxy(&self) -> Result<systemd_zbus::ManagerProxy<'_>, Error> {
+        Ok(systemd_zbus::ManagerProxy::new(&self.connection).await?)
+    }
+
+    pub fn stop(&self, unit: &str) -> Result<(), Error> {
+        self.runtime.block_on(async {
+            use systemd_zbus::{ActiveState, Mode, UnitProxy};
+
+            let manager = self.proxy().await?;
+            let _ = manager.stop_unit(unit, Mode::Replace).await?;
+            let unit_path = manager.get_unit(unit).await?;
+            let unit = UnitProxy::builder(&self.connection)
+                .path(unit_path)?
+                .build()
+                .await?;
+            let deadline = std::time::Instant::now() + Self::STATE_TIMEOUT;
+            loop {
+                if matches!(
+                    unit.active_state().await?,
+                    ActiveState::Inactive | ActiveState::Failed
+                ) {
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "systemd unit did not stop within {:?}",
+                        Self::STATE_TIMEOUT
+                    ));
+                }
+                tokio::time::sleep(Self::STATE_INTERVAL).await;
+            }
+        })
+    }
+
+    pub fn reload(&self) -> Result<(), Error> {
+        self.runtime.block_on(async {
+            self.proxy().await?.reload().await?;
+            Ok(())
+        })
+    }
+
+    pub fn enable(&self, unit_path: &str) -> Result<(), Error> {
+        self.runtime.block_on(async {
+            let _ = self
+                .proxy()
+                .await?
+                .enable_unit_files(&[unit_path], false, false)
+                .await?;
+            Ok(())
+        })
+    }
+
+    pub fn disable(&self, unit: &str) -> Result<(), Error> {
+        self.runtime.block_on(async {
+            let _ = self
+                .proxy()
+                .await?
+                .disable_unit_files(&[unit], false)
+                .await?;
+            Ok(())
+        })
+    }
+
+    pub fn start(&self, unit: &str) -> Result<(), Error> {
+        self.runtime.block_on(async {
+            let _ = self
+                .proxy()
+                .await?
+                .start_unit(unit, systemd_zbus::Mode::Replace)
+                .await?;
+            Ok(())
+        })
+    }
 }
