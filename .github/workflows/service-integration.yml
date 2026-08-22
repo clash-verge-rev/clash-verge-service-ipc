@@ -155,8 +155,22 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Build binaries
-        run: cargo build --release --features "standalone client test"
+      - name: Build production service binaries
+        if: runner.os != 'Windows'
+        run: >-
+          cargo build --release --features "standalone client integration-driver"
+          --bin clash-verge-service
+          --bin clash-verge-service-install
+          --bin clash-verge-service-uninstall
+          --bin service-integration-driver
+
+      - name: Build Windows integration binaries
+        if: runner.os == 'Windows'
+        run: cargo build --release --features "standalone client test integration-driver"
+
+      - name: Build integration fixture
+        if: runner.os != 'Windows'
+        run: cargo build --release --features "test" --bin mock_binary
 
       - name: Install service (Linux)
         if: runner.os == 'Linux'
@@ -213,9 +227,17 @@ jobs:
         if: runner.os == 'macOS'
         run: sudo launchctl list | grep io.github.clash-verge-rev.clash-verge-rev.service
 
+      - name: Install integration fixture in an allowed macOS location
+        if: runner.os == 'macOS'
+        run: |
+          sudo install -d /Applications/ClashVergeServiceIntegration.app/Contents/MacOS
+          sudo install -m 755 target/release/mock_binary /Applications/ClashVergeServiceIntegration.app/Contents/MacOS/mock_binary
+
       - name: Start mock_binary (macOS)
         id: start_macos
         if: runner.os == 'macOS'
+        env:
+          CLASH_VERGE_TEST_CORE_PATH: /Applications/ClashVergeServiceIntegration.app/Contents/MacOS/mock_binary
         run: |
           generation="$(target/release/service-integration-driver start)"
           if [[ ! "$generation" =~ ^[0-9]+$ ]]; then
@@ -242,6 +264,10 @@ jobs:
           if [ -x target/release/clash-verge-service-uninstall ]; then
             sudo target/release/clash-verge-service-uninstall --debug
           fi
+          sudo rm -f /Applications/ClashVergeServiceIntegration.app/Contents/MacOS/mock_binary
+          sudo rmdir /Applications/ClashVergeServiceIntegration.app/Contents/MacOS || true
+          sudo rmdir /Applications/ClashVergeServiceIntegration.app/Contents || true
+          sudo rmdir /Applications/ClashVergeServiceIntegration.app || true
 
       - name: Install service (Windows)
         if: runner.os == 'Windows'

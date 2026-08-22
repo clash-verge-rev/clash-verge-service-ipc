@@ -42,10 +42,11 @@ required-features = ["standalone", "test"]
 [[bin]]
 name = "service-integration-driver"
 path = "src/bin/service_integration_driver.rs"
-required-features = ["client"]
+required-features = ["client", "integration-driver"]
 
 [features]
 development-channel = []
+integration-driver = []
 standalone = [
     "kode-bridge",
     "kode-bridge/client",
@@ -115,7 +116,7 @@ compact_str = { version = "0.10", features = ["serde"], optional = true }
 url = "2.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-sysproxy = { git = "https://github.com/clash-verge-rev/sysproxy-rs", branch = "main" }
+system-configuration = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 platform_lib = { package = "libc", version = "0.2", optional = true }
