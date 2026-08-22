@@ -184,7 +184,7 @@ dependencies = [
  "sha2",
  "strum",
  "strum_macros",
- "system-configuration",
+ "sysproxy",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1279,6 +1279,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "sysproxy"
+version = "0.7.0"
+source = "git+https://github.com/clash-verge-rev/sysproxy-rs.git?rev=6ed8b4b0378b151d4820dd564d0d225552799222#6ed8b4b0378b151d4820dd564d0d225552799222"
+dependencies = [
+ "log",
+ "system-configuration",
+ "thiserror",
 ]
 
 [[package]]
