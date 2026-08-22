@@ -122,7 +122,7 @@ platform_lib = { package = "libc", version = "0.2", optional = true }
 nix = { version = "0.31", features = ["user"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "5.19.0", default-features = false, features = ["p2p", "tokio"], optional = true }
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 platform_lib = { package = "windows-service", version = "0.8", optional = true }
