@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn production_process_control_does_not_spawn_system_cli() {
         let production = include_str!("process.rs")
-            .split("\n#[cfg(test)]\nmod tests")
+            .split("#[cfg(test)]")
             .next()
             .unwrap();
         for command in ["tasklist", "taskkill", "Command::new(\"ps\""] {

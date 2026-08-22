@@ -118,6 +118,7 @@ pub struct SystemdManager {
     runtime: tokio::runtime::Runtime,
     connection: zbus::Connection,
     transport: &'static str,
+    destination: Option<&'static str>,
 }
 
 #[cfg(target_os = "linux")]
@@ -125,6 +126,11 @@ pub struct SystemdManager {
 // binary intentionally leaves some operations unused.
 #[allow(dead_code)]
 impl SystemdManager {
+    const MANAGER_PATH: &'static str = "/org/freedesktop/systemd1";
+    const MANAGER_INTERFACE: &'static str = "org.freedesktop.systemd1.Manager";
+    const UNIT_INTERFACE: &'static str = "org.freedesktop.systemd1.Unit";
+    const PROPERTIES_INTERFACE: &'static str = "org.freedesktop.DBus.Properties";
+    const SYSTEMD_DESTINATION: &'static str = "org.freedesktop.systemd1";
     const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     const METHOD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -134,7 +140,7 @@ impl SystemdManager {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let (connection, transport) = runtime.block_on(async {
+        let (connection, transport, destination) = runtime.block_on(async {
             let private = tokio::time::timeout(Self::CONNECT_TIMEOUT, async {
                 zbus::connection::Builder::address("unix:path=/run/systemd/private")?
                     .p2p()
@@ -144,7 +150,7 @@ impl SystemdManager {
             })
             .await;
             if let Ok(Ok(connection)) = private {
-                return Ok((connection, "private socket"));
+                return Ok((connection, "private socket", None));
             }
             let private_error = match private {
                 Ok(Err(error)) => error.to_string(),
@@ -160,7 +166,9 @@ impl SystemdManager {
             })
             .await;
             match system_bus {
-                Ok(Ok(connection)) => Ok((connection, "system bus")),
+                Ok(Ok(connection)) => {
+                    Ok((connection, "system bus", Some(Self::SYSTEMD_DESTINATION)))
+                }
                 Ok(Err(error)) => Err(anyhow::anyhow!(
                     "failed to connect to systemd (private: {private_error}; system bus: {error})"
                 )),
@@ -174,6 +182,7 @@ impl SystemdManager {
             runtime,
             connection,
             transport,
+            destination,
         })
     }
 
@@ -181,27 +190,43 @@ impl SystemdManager {
         self.transport
     }
 
-    async fn proxy(&self) -> Result<systemd_zbus::ManagerProxy<'_>, Error> {
-        Ok(systemd_zbus::ManagerProxy::new(&self.connection).await?)
-    }
-
     pub fn stop(&self, unit: &str) -> Result<(), Error> {
         self.runtime.block_on(async {
-            use systemd_zbus::{ActiveState, Mode, UnitProxy};
-
-            let manager = self.proxy().await?;
-            let _ = manager.stop_unit(unit, Mode::Replace).await?;
-            let unit_path = manager.get_unit(unit).await?;
-            let unit = UnitProxy::builder(&self.connection)
-                .path(unit_path)?
-                .build()
+            self.connection
+                .call_method(
+                    self.destination,
+                    Self::MANAGER_PATH,
+                    Some(Self::MANAGER_INTERFACE),
+                    "StopUnit",
+                    &(unit, "replace"),
+                )
                 .await?;
+            let reply = self
+                .connection
+                .call_method(
+                    self.destination,
+                    Self::MANAGER_PATH,
+                    Some(Self::MANAGER_INTERFACE),
+                    "GetUnit",
+                    &(unit,),
+                )
+                .await?;
+            let unit_path: zbus::zvariant::OwnedObjectPath = reply.body().deserialize()?;
             let deadline = std::time::Instant::now() + Self::STATE_TIMEOUT;
             loop {
-                if matches!(
-                    unit.active_state().await?,
-                    ActiveState::Inactive | ActiveState::Failed
-                ) {
+                let reply = self
+                    .connection
+                    .call_method(
+                        self.destination,
+                        unit_path.as_str(),
+                        Some(Self::PROPERTIES_INTERFACE),
+                        "Get",
+                        &(Self::UNIT_INTERFACE, "ActiveState"),
+                    )
+                    .await?;
+                let state: zbus::zvariant::OwnedValue = reply.body().deserialize()?;
+                let state = String::try_from(state)?;
+                if matches!(state.as_str(), "inactive" | "failed") {
                     return Ok(());
                 }
                 if std::time::Instant::now() >= deadline {
@@ -217,17 +242,29 @@ impl SystemdManager {
 
     pub fn reload(&self) -> Result<(), Error> {
         self.runtime.block_on(async {
-            self.proxy().await?.reload().await?;
+            self.connection
+                .call_method(
+                    self.destination,
+                    Self::MANAGER_PATH,
+                    Some(Self::MANAGER_INTERFACE),
+                    "Reload",
+                    &(),
+                )
+                .await?;
             Ok(())
         })
     }
 
     pub fn enable(&self, unit_path: &str) -> Result<(), Error> {
         self.runtime.block_on(async {
-            let _ = self
-                .proxy()
-                .await?
-                .enable_unit_files(&[unit_path], false, false)
+            self.connection
+                .call_method(
+                    self.destination,
+                    Self::MANAGER_PATH,
+                    Some(Self::MANAGER_INTERFACE),
+                    "EnableUnitFiles",
+                    &(&[unit_path], false, false),
+                )
                 .await?;
             Ok(())
         })
@@ -235,10 +272,14 @@ impl SystemdManager {
 
     pub fn disable(&self, unit: &str) -> Result<(), Error> {
         self.runtime.block_on(async {
-            let _ = self
-                .proxy()
-                .await?
-                .disable_unit_files(&[unit], false)
+            self.connection
+                .call_method(
+                    self.destination,
+                    Self::MANAGER_PATH,
+                    Some(Self::MANAGER_INTERFACE),
+                    "DisableUnitFiles",
+                    &(&[unit], false),
+                )
                 .await?;
             Ok(())
         })
@@ -246,10 +287,14 @@ impl SystemdManager {
 
     pub fn start(&self, unit: &str) -> Result<(), Error> {
         self.runtime.block_on(async {
-            let _ = self
-                .proxy()
-                .await?
-                .start_unit(unit, systemd_zbus::Mode::Replace)
+            self.connection
+                .call_method(
+                    self.destination,
+                    Self::MANAGER_PATH,
+                    Some(Self::MANAGER_INTERFACE),
+                    "StartUnit",
+                    &(unit, "replace"),
+                )
                 .await?;
             Ok(())
         })

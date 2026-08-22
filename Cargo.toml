@@ -62,7 +62,6 @@ standalone = [
     "response",
     "dep:platform_lib",
     "dep:nix",
-    "dep:systemd-zbus",
     "dep:zbus",
     "dep:windows-sys",
     "compact_str",
@@ -123,7 +122,6 @@ platform_lib = { package = "libc", version = "0.2", optional = true }
 nix = { version = "0.31", features = ["user"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-systemd-zbus = { version = "5.3.2", default-features = false, optional = true }
 zbus = { version = "5.19.0", default-features = false, features = ["p2p", "tokio"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
