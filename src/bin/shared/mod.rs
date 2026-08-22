@@ -234,13 +234,14 @@ impl SystemdManager {
 
     pub fn enable(&self, unit_path: &str) -> Result<(), Error> {
         self.runtime.block_on(async {
+            let unit_paths: &[&str] = &[unit_path];
             self.connection
                 .call_method(
                     Some(Self::SYSTEMD_DESTINATION),
                     Self::MANAGER_PATH,
                     Some(Self::MANAGER_INTERFACE),
                     "EnableUnitFiles",
-                    &(&[unit_path], false, false),
+                    &(unit_paths, false, false),
                 )
                 .await?;
             Ok(())
@@ -249,13 +250,14 @@ impl SystemdManager {
 
     pub fn disable(&self, unit: &str) -> Result<(), Error> {
         self.runtime.block_on(async {
+            let units: &[&str] = &[unit];
             self.connection
                 .call_method(
                     Some(Self::SYSTEMD_DESTINATION),
                     Self::MANAGER_PATH,
                     Some(Self::MANAGER_INTERFACE),
                     "DisableUnitFiles",
-                    &(&[unit], false),
+                    &(units, false),
                 )
                 .await?;
             Ok(())
