@@ -104,104 +104,31 @@ fn explicit_port(authority: &str) -> anyhow::Result<u16> {
     port.parse::<u16>().context("PAC URL port must be a u16")
 }
 
-#[cfg(any(target_os = "macos", test))]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct SystemProxy {
-    host: String,
-    port: u16,
-    bypass: String,
-    enable: bool,
-}
-
-#[cfg(any(target_os = "macos", test))]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct AutoProxy {
-    url: String,
-    enable: bool,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ProxyCall {
-    System(SystemProxy),
-    Auto(AutoProxy),
-}
-
-#[cfg(any(target_os = "macos", test))]
-trait ProxyBackend {
-    fn set_system_proxy(&mut self, proxy: SystemProxy) -> anyhow::Result<()>;
-    fn set_auto_proxy(&mut self, proxy: AutoProxy) -> anyhow::Result<()>;
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn apply_with_backend(
-    backend: &mut impl ProxyBackend,
-    config: &MacosProxyConfig,
-) -> anyhow::Result<()> {
-    match config {
-        MacosProxyConfig::Disabled => {
-            backend.set_system_proxy(SystemProxy::default())?;
-            backend.set_auto_proxy(AutoProxy::default())?;
-        }
-        MacosProxyConfig::Global { host, port, bypass } => {
-            backend.set_auto_proxy(AutoProxy::default())?;
-            backend.set_system_proxy(SystemProxy {
+#[cfg(target_os = "macos")]
+fn apply_real(config: &MacosProxyConfig) -> anyhow::Result<()> {
+    let (system, auto) = match config {
+        MacosProxyConfig::Disabled => (
+            sysproxy::Sysproxy::default(),
+            sysproxy::Autoproxy::default(),
+        ),
+        MacosProxyConfig::Global { host, port, bypass } => (
+            sysproxy::Sysproxy {
                 host: host.clone(),
                 port: *port,
                 bypass: bypass.clone(),
                 enable: true,
-            })?;
-        }
-        MacosProxyConfig::Pac { url } => {
-            backend.set_system_proxy(SystemProxy::default())?;
-            backend.set_auto_proxy(AutoProxy {
+            },
+            sysproxy::Autoproxy::default(),
+        ),
+        MacosProxyConfig::Pac { url } => (
+            sysproxy::Sysproxy::default(),
+            sysproxy::Autoproxy {
                 url: url.clone(),
                 enable: true,
-            })?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct RealBackend;
-
-#[cfg(target_os = "macos")]
-fn system_proxy_to_sysproxy(proxy: SystemProxy) -> sysproxy::Sysproxy {
-    sysproxy::Sysproxy {
-        host: proxy.host,
-        port: proxy.port,
-        bypass: if proxy.bypass.is_empty() {
-            "Empty".to_owned()
-        } else {
-            proxy.bypass
-        },
-        enable: proxy.enable,
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl ProxyBackend for RealBackend {
-    fn set_system_proxy(&mut self, proxy: SystemProxy) -> anyhow::Result<()> {
-        system_proxy_to_sysproxy(proxy)
-            .set_system_proxy()
-            .map_err(Into::into)
-    }
-
-    fn set_auto_proxy(&mut self, proxy: AutoProxy) -> anyhow::Result<()> {
-        sysproxy::Autoproxy {
-            url: proxy.url,
-            enable: proxy.enable,
-        }
-        .set_auto_proxy()
-        .map_err(Into::into)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn apply_real(config: &MacosProxyConfig) -> anyhow::Result<()> {
-    apply_with_backend(&mut RealBackend, config)
+            },
+        ),
+    };
+    sysproxy::apply_privileged_native(&system, &auto).map_err(Into::into)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -301,43 +228,8 @@ pub async fn apply_proxy_or_direct(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
-    use super::system_proxy_to_sysproxy;
-    use super::{
-        AutoProxy, ProxyBackend, ProxyCall, SystemProxy, apply_proxy_or_direct_with,
-        apply_with_backend, validate_proxy_config,
-    };
+    use super::{apply_proxy_or_direct_with, validate_proxy_config};
     use crate::{MacosProxyConfig, ProxyApplyOutcome};
-
-    #[derive(Default)]
-    struct RecordingBackend {
-        calls: Vec<ProxyCall>,
-    }
-
-    impl ProxyBackend for RecordingBackend {
-        fn set_system_proxy(&mut self, proxy: SystemProxy) -> anyhow::Result<()> {
-            self.calls.push(ProxyCall::System(proxy));
-            Ok(())
-        }
-
-        fn set_auto_proxy(&mut self, proxy: AutoProxy) -> anyhow::Result<()> {
-            self.calls.push(ProxyCall::Auto(proxy));
-            Ok(())
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn sysproxy_conversion_uses_empty_sentinel_only_for_empty_bypass() {
-        let empty = system_proxy_to_sysproxy(SystemProxy::default());
-        assert_eq!(empty.bypass, "Empty");
-
-        let nonempty = system_proxy_to_sysproxy(SystemProxy {
-            bypass: "localhost,127.0.0.1".to_owned(),
-            ..SystemProxy::default()
-        });
-        assert_eq!(nonempty.bypass, "localhost,127.0.0.1");
-    }
 
     #[test]
     fn proxy_contract_accepts_only_loopback_targets() {
@@ -455,61 +347,6 @@ mod tests {
     }
 
     #[test]
-    fn proxy_apply_order_disables_the_conflicting_mode_first() {
-        let mut backend = RecordingBackend::default();
-        apply_with_backend(
-            &mut backend,
-            &MacosProxyConfig::Global {
-                host: "127.0.0.1".to_owned(),
-                port: 7897,
-                bypass: "localhost".to_owned(),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            backend.calls,
-            [
-                ProxyCall::Auto(AutoProxy::default()),
-                ProxyCall::System(SystemProxy {
-                    host: "127.0.0.1".to_owned(),
-                    port: 7897,
-                    bypass: "localhost".to_owned(),
-                    enable: true,
-                }),
-            ]
-        );
-
-        backend.calls.clear();
-        apply_with_backend(
-            &mut backend,
-            &MacosProxyConfig::Pac {
-                url: "http://[::1]:33221/commands/pac".to_owned(),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            backend.calls,
-            [
-                ProxyCall::System(SystemProxy::default()),
-                ProxyCall::Auto(AutoProxy {
-                    url: "http://[::1]:33221/commands/pac".to_owned(),
-                    enable: true,
-                }),
-            ]
-        );
-
-        backend.calls.clear();
-        apply_with_backend(&mut backend, &MacosProxyConfig::Disabled).unwrap();
-        assert_eq!(
-            backend.calls,
-            [
-                ProxyCall::System(SystemProxy::default()),
-                ProxyCall::Auto(AutoProxy::default()),
-            ]
-        );
-    }
-
-    #[test]
     fn proxy_apply_failure_compensates_once_with_disabled() {
         let config = MacosProxyConfig::Global {
             host: "127.0.0.1".to_owned(),
@@ -569,7 +406,7 @@ mod tests {
         let error = apply_proxy_or_direct_with(Some(&config), |_| {
             calls += 1;
             if calls == 1 {
-                Err(anyhow::anyhow!("networksetup refused midway"))
+                Err(anyhow::anyhow!("native proxy transaction failed"))
             } else {
                 Err(anyhow::Error::new(sysproxy::Error::NoActiveNetworkService))
             }
