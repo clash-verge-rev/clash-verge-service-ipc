@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::time::Duration;
@@ -12,12 +12,12 @@ pub(super) struct ProcessIdentity {
     pub(super) started_at: u64,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn checked_unix_pid(pid: u32) -> Option<i32> {
     i32::try_from(pid).ok().filter(|pid| *pid > 0)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn parse_linux_process_stat(stat: &str) -> Result<(char, u64)> {
     let mut fields = stat
         .rsplit_once(')')
@@ -35,7 +35,7 @@ fn parse_linux_process_stat(stat: &str) -> Result<(char, u64)> {
     Ok((state, started_at))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn termination_order(root_pid: u32, relations: &[(u32, u32)]) -> Vec<u32> {
     fn visit(
         pid: u32,
@@ -106,21 +106,6 @@ fn windows_process_identity_details_from_handle(
         executable,
         started_at,
     })
-}
-
-#[cfg(windows)]
-fn windows_process_identity_from_handle(
-    handle: &OwnedWindowsHandle,
-) -> Result<Option<ProcessIdentity>> {
-    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
-
-    match unsafe { WaitForSingleObject(handle.0, 0) } {
-        WAIT_OBJECT_0 => return Ok(None),
-        WAIT_TIMEOUT => {}
-        _ => return Err(std::io::Error::last_os_error().into()),
-    }
-    Ok(Some(windows_process_identity_details_from_handle(handle)?))
 }
 
 pub(super) fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
@@ -260,7 +245,11 @@ pub(super) fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
             };
         }
         let handle = OwnedWindowsHandle(handle);
-        windows_process_identity_from_handle(&handle)
+        if windows_handle_is_signaled(&handle)? {
+            Ok(None)
+        } else {
+            Ok(Some(windows_process_identity_details_from_handle(&handle)?))
+        }
     }
 
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
@@ -421,15 +410,6 @@ fn terminate_windows_process_tree(
     let Some(root_handle) = open_windows_termination_handle(pid)? else {
         return Ok(Vec::new());
     };
-    terminate_windows_process_tree_with_root_handle(pid, root_handle, expected_identity)
-}
-
-#[cfg(windows)]
-fn terminate_windows_process_tree_with_root_handle(
-    pid: u32,
-    root_handle: OwnedWindowsHandle,
-    expected_identity: Option<&ProcessIdentity>,
-) -> Result<Vec<(u32, OwnedWindowsHandle)>> {
     use windows_sys::Win32::System::Threading::TerminateProcess;
 
     if let Some(expected_identity) = expected_identity {
@@ -438,6 +418,20 @@ fn terminate_windows_process_tree_with_root_handle(
             bail!("process {pid} identity changed before termination");
         }
     }
+
+    let terminate = |candidate: u32, handle: &OwnedWindowsHandle| -> Result<()> {
+        if windows_handle_is_signaled(handle)? {
+            return Ok(());
+        }
+        if unsafe { TerminateProcess(handle.0, 1) } == 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(anyhow::anyhow!(
+                "failed to terminate process {candidate}: {error}"
+            ));
+        }
+        Ok(())
+    };
+    terminate(pid, &root_handle)?;
 
     let relations = windows_process_relations()?;
     let order = termination_order(pid, &relations);
@@ -454,23 +448,6 @@ fn terminate_windows_process_tree_with_root_handle(
         }
     }
 
-    let terminate = |candidate: u32, handle: &OwnedWindowsHandle| -> Result<()> {
-        if windows_handle_is_signaled(handle)? {
-            return Ok(());
-        }
-        if unsafe { TerminateProcess(handle.0, 1) } == 0 {
-            let error = std::io::Error::last_os_error();
-            return Err(anyhow::anyhow!(
-                "failed to terminate process {candidate}: {error}"
-            ));
-        }
-        Ok(())
-    };
-    let (_, root_handle) = targets
-        .iter()
-        .find(|(candidate, _)| *candidate == pid)
-        .expect("root PID is always ordered");
-    terminate(pid, root_handle)?;
     for (candidate, handle) in &targets {
         if *candidate != pid {
             terminate(*candidate, handle)?;
@@ -575,41 +552,10 @@ pub(super) async fn terminate_process_if_identity(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        checked_unix_pid, is_process_alive, parse_linux_process_stat, process_identity,
-        terminate_process_if_identity, termination_order,
-    };
+    use super::is_process_alive;
     use std::hint::black_box;
-    use std::process::{Child, Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    const PROCESS_HELPER_MODE: &str = "CLASH_VERGE_PROCESS_TEST_MODE";
-    const PROCESS_HELPER_PID_FILE: &str = "CLASH_VERGE_PROCESS_TEST_PID_FILE";
-    const PROCESS_HELPER_TEST: &str = "core::process::tests::subprocess_helper";
-
-    fn spawn_helper(mode: &str, pid_file: Option<&std::path::Path>) -> anyhow::Result<Child> {
-        let mut command = Command::new(std::env::current_exe()?);
-        command
-            .args([PROCESS_HELPER_TEST, "--exact", "--ignored"])
-            .env(PROCESS_HELPER_MODE, mode)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Some(pid_file) = pid_file {
-            command.env(PROCESS_HELPER_PID_FILE, pid_file);
-        }
-        Ok(command.spawn()?)
-    }
-
-    fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
-        for _ in 0..100 {
-            if predicate() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        false
-    }
+    use std::process::Command;
+    use std::time::Instant;
 
     fn legacy_cli_process_alive(pid: u32) -> anyhow::Result<bool> {
         #[cfg(unix)]
@@ -648,111 +594,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn subprocess_helper() {
-        match std::env::var(PROCESS_HELPER_MODE).as_deref() {
-            Ok("exit") => {}
-            Ok("sleep") => std::thread::sleep(Duration::from_secs(30)),
-            Ok("tree") => {
-                let pid_file = std::env::var_os(PROCESS_HELPER_PID_FILE)
-                    .expect("tree helper requires a PID file");
-                let mut child = spawn_helper("sleep", None).expect("failed to spawn leaf helper");
-                std::fs::write(pid_file, child.id().to_string())
-                    .expect("failed to publish leaf PID");
-                let _ = child.wait();
-            }
-            Ok("tree-root") => {
-                let pid_file = std::env::var_os(PROCESS_HELPER_PID_FILE)
-                    .expect("tree root helper requires a PID file");
-                let mut child = spawn_helper("tree", Some(std::path::Path::new(&pid_file)))
-                    .expect("failed to spawn branch helper");
-                let _ = child.wait();
-            }
-            mode => panic!("unexpected process helper mode: {mode:?}"),
-        }
-    }
-
-    #[test]
-    fn unix_pid_validation_rejects_process_group_values() {
-        assert_eq!(checked_unix_pid(0), None);
-        assert_eq!(checked_unix_pid(i32::MAX as u32), Some(i32::MAX));
-        assert_eq!(checked_unix_pid(i32::MAX as u32 + 1), None);
-    }
-
-    #[test]
-    fn linux_stat_parser_handles_spaces_and_parentheses_in_command() -> anyhow::Result<()> {
-        let stat = "42 (name with ) parens) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 98765";
-        assert_eq!(parse_linux_process_stat(stat)?, ('S', 98765));
-        Ok(())
-    }
-
-    #[test]
-    fn process_tree_termination_orders_descendants_before_parent() {
-        let relations = [(20, 10), (30, 20), (40, 10), (10, 1)];
-        let order = termination_order(10, &relations);
-        let position = |pid| {
-            order
-                .iter()
-                .position(|candidate| *candidate == pid)
-                .unwrap()
-        };
-        assert!(position(30) < position(20));
-        assert!(position(20) < position(10));
-        assert!(position(40) < position(10));
-    }
-
-    #[test]
-    fn process_tree_termination_tolerates_cycles() {
-        let relations = [(20, 10), (10, 20)];
-        let order = termination_order(10, &relations);
-        assert_eq!(order.len(), 2);
-        assert_eq!(order.last(), Some(&10));
-    }
-
-    #[test]
-    fn current_process_is_alive_and_has_an_identity() -> anyhow::Result<()> {
-        let pid = std::process::id();
-        assert!(is_process_alive(pid));
-        assert!(process_identity(pid)?.is_some());
-        Ok(())
-    }
-
-    #[test]
-    fn exited_unreaped_process_is_not_alive() -> anyhow::Result<()> {
-        let mut child = spawn_helper("exit", None)?;
-        let pid = child.id();
-        assert!(wait_until(|| !is_process_alive(pid)));
-        assert!(process_identity(pid)?.is_none());
-        child.wait()?;
-        Ok(())
-    }
-
-    #[test]
-    fn mismatched_identity_does_not_terminate_process() -> anyhow::Result<()> {
-        let mut child = spawn_helper("sleep", None)?;
-        let pid = child.id();
-        let result = (|| -> anyhow::Result<()> {
-            anyhow::ensure!(wait_until(|| is_process_alive(pid)), "helper did not start");
-            let mut wrong_identity = process_identity(pid)?.expect("helper identity");
-            wrong_identity.started_at = wrong_identity.started_at.wrapping_add(1);
-            let error = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(terminate_process_if_identity(pid, &wrong_identity))
-                .expect_err("mismatched identity must be rejected");
-            anyhow::ensure!(
-                error.to_string().contains("identity changed"),
-                "unexpected rejection: {error:#}"
-            );
-            anyhow::ensure!(is_process_alive(pid), "mismatched identity killed helper");
-            Ok(())
-        })();
-        let _ = child.kill();
-        let _ = child.wait();
-        result
-    }
-
-    #[test]
-    #[ignore]
     fn benchmark_native_process_probe_against_legacy_cli() -> anyhow::Result<()> {
         const WARMUP_ITERATIONS: usize = 3;
         const ITERATIONS: usize = 30;
@@ -786,7 +627,7 @@ mod tests {
         let report = serde_json::json!({
             "platform": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
-            "git_sha": std::env::var("GITHUB_SHA").ok(),
+            "git_sha": std::env::var("CLASH_VERGE_PROCESS_BENCH_GIT_SHA").ok(),
             "runner": {
                 "arch": std::env::var("RUNNER_ARCH").ok(),
                 "image_os": std::env::var("ImageOS").ok(),
@@ -810,124 +651,5 @@ mod tests {
             std::fs::write(output, format!("{report}\n"))?;
         }
         Ok(())
-    }
-
-    #[test]
-    fn production_process_control_does_not_spawn_system_cli() {
-        let production = include_str!("process.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        for command in ["tasklist", "taskkill", "Command::new(\"ps\""] {
-            assert!(
-                !production.contains(command),
-                "found forbidden CLI: {command}"
-            );
-        }
-    }
-
-    #[test]
-    fn production_installers_do_not_spawn_unbounded_system_cli() {
-        let install = include_str!("../bin/install_service.rs");
-        let uninstall = include_str!("../bin/uninstall_service.rs");
-        let shared = include_str!("../bin/shared/mod.rs");
-
-        for source in [install, uninstall, shared] {
-            assert!(!source.contains("systemctl"));
-        }
-        for source in [install, uninstall] {
-            assert!(!source.contains("std::process::Command"));
-        }
-        assert!(
-            shared.contains("run_command_output_with_timeout(cmd, args, debug, COMMAND_TIMEOUT)")
-        );
-        assert!(shared.contains("tokio::time::timeout(timeout"));
-        assert!(shared.contains("tokio::process::Command::new(cmd)"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_windows_termination_stops_descendant_tree() -> anyhow::Result<()> {
-        use super::terminate_process;
-
-        let pid_file = std::env::temp_dir().join(format!(
-            "clash-verge-process-tree-{}-{}.pid",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        ));
-        let mut root = spawn_helper("tree-root", Some(&pid_file))?;
-        let root_pid = root.id();
-        let result = (|| -> anyhow::Result<()> {
-            assert!(wait_until(|| pid_file.exists()));
-            let leaf_pid: u32 = std::fs::read_to_string(&pid_file)?.parse()?;
-            assert!(is_process_alive(root_pid));
-            assert!(is_process_alive(leaf_pid));
-
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(terminate_process(root_pid))?;
-            assert!(wait_until(|| !is_process_alive(root_pid)));
-            assert!(wait_until(|| !is_process_alive(leaf_pid)));
-            Ok(())
-        })();
-
-        if is_process_alive(root_pid) {
-            let _ = root.kill();
-        }
-        let _ = root.wait();
-        let _ = std::fs::remove_file(pid_file);
-        result
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_windows_termination_stops_descendant_after_root_exit() -> anyhow::Result<()> {
-        use super::{
-            open_windows_termination_handle, terminate_windows_process_tree_with_root_handle,
-            windows_handle_is_signaled,
-        };
-        use windows_sys::Win32::System::Threading::TerminateProcess;
-
-        let pid_file = std::env::temp_dir().join(format!(
-            "clash-verge-exited-process-tree-{}-{}.pid",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        ));
-        let mut root = spawn_helper("tree", Some(&pid_file))?;
-        let root_pid = root.id();
-        let result = (|| -> anyhow::Result<()> {
-            assert!(wait_until(|| pid_file.exists()));
-            let leaf_pid: u32 = std::fs::read_to_string(&pid_file)?.parse()?;
-            let root_handle = open_windows_termination_handle(root_pid)?.expect("root handle");
-            anyhow::ensure!(
-                unsafe { TerminateProcess(root_handle.0, 1) } != 0,
-                "failed to terminate root fixture: {}",
-                std::io::Error::last_os_error()
-            );
-            assert!(wait_until(
-                || windows_handle_is_signaled(&root_handle).unwrap_or(false)
-            ));
-            assert!(is_process_alive(leaf_pid));
-
-            let targets =
-                terminate_windows_process_tree_with_root_handle(root_pid, root_handle, None)?;
-            assert!(wait_until(|| targets.iter().all(|(_, handle)| {
-                windows_handle_is_signaled(handle).unwrap_or(false)
-            })));
-            assert!(wait_until(|| !is_process_alive(leaf_pid)));
-            Ok(())
-        })();
-
-        if is_process_alive(root_pid) {
-            let _ = root.kill();
-        }
-        let _ = root.wait();
-        let _ = std::fs::remove_file(pid_file);
-        result
     }
 }

@@ -2,9 +2,6 @@
 
 use anyhow::Error;
 
-#[cfg(target_os = "macos")]
-const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
 pub(crate) fn enter_repair_gate() -> Result<clash_verge_service_ipc::ServiceRepairGate, Error> {
     match clash_verge_service_ipc::acquire_service_repair_gate()? {
         Some(gate) => Ok(gate),
@@ -53,42 +50,15 @@ pub fn uninstall_old_service() -> Result<(), Error> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn run_command_output(
-    cmd: &str,
-    args: &[&str],
-    debug: bool,
-) -> Result<std::process::Output, Error> {
-    run_command_output_with_timeout(cmd, args, debug, COMMAND_TIMEOUT)
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn run_command_output_with_timeout(
-    cmd: &str,
-    args: &[&str],
-    debug: bool,
-    timeout: std::time::Duration,
-) -> Result<std::process::Output, Error> {
+pub fn run_command(cmd: &str, args: &[&str], debug: bool) -> Result<(), Error> {
     if debug {
         println!("Executing: {} {}", cmd, args.join(" "));
     }
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| anyhow::anyhow!("Failed to create command runtime: {error}"))?;
-    runtime.block_on(async {
-        let mut command = tokio::process::Command::new(cmd);
-        command.args(args).kill_on_drop(true);
-        tokio::time::timeout(timeout, command.output())
-            .await
-            .map_err(|_| anyhow::anyhow!("Command '{}' exceeded its {:?} timeout", cmd, timeout))?
-            .map_err(|error| anyhow::anyhow!("Failed to execute '{}': {}", cmd, error))
-    })
-}
-
-#[cfg(target_os = "macos")]
-pub fn run_command(cmd: &str, args: &[&str], debug: bool) -> Result<(), Error> {
-    let output = run_command_output(cmd, args, debug)?;
+    let output = std::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to execute '{}': {}", cmd, e))?;
 
     if output.status.success() {
         return Ok(());
@@ -134,28 +104,39 @@ impl SystemdManager {
     const STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
     const STATE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+    fn is_missing_unit(error: &zbus::Error) -> bool {
+        matches!(
+            error,
+            zbus::Error::MethodError(name, _, _)
+                if matches!(
+                    name.as_str(),
+                    "org.freedesktop.systemd1.NoSuchUnit"
+                        | "org.freedesktop.systemd1.LoadFailed"
+                )
+        )
+    }
+
     pub fn connect() -> Result<Self, Error> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let connection = runtime.block_on(async {
-            let result = tokio::time::timeout(Self::CONNECT_TIMEOUT, async {
+            tokio::time::timeout(Self::CONNECT_TIMEOUT, async {
                 zbus::connection::Builder::system()?
                     .method_timeout(Self::METHOD_TIMEOUT)
                     .build()
                     .await
             })
-            .await;
-            match result {
-                Ok(Ok(connection)) => Ok(connection),
-                Ok(Err(error)) => Err(anyhow::anyhow!(
-                    "failed to connect to systemd via system bus: {error}"
-                )),
-                Err(_) => Err(anyhow::anyhow!(
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
                     "system bus connection timed out after {:?}",
                     Self::CONNECT_TIMEOUT
-                )),
-            }
+                )
+            })?
+            .map_err(|error| {
+                anyhow::anyhow!("failed to connect to systemd via system bus: {error}")
+            })
         })?;
         Ok(Self {
             runtime,
@@ -163,13 +144,10 @@ impl SystemdManager {
         })
     }
 
-    pub fn transport(&self) -> &'static str {
-        "system bus"
-    }
-
     pub fn stop(&self, unit: &str) -> Result<(), Error> {
         self.runtime.block_on(async {
-            self.connection
+            if let Err(error) = self
+                .connection
                 .call_method(
                     Some(Self::SYSTEMD_DESTINATION),
                     Self::MANAGER_PATH,
@@ -177,8 +155,15 @@ impl SystemdManager {
                     "StopUnit",
                     &(unit, "replace"),
                 )
-                .await?;
-            let reply = self
+                .await
+            {
+                return if Self::is_missing_unit(&error) {
+                    Ok(())
+                } else {
+                    Err(error.into())
+                };
+            }
+            let reply = match self
                 .connection
                 .call_method(
                     Some(Self::SYSTEMD_DESTINATION),
@@ -187,7 +172,12 @@ impl SystemdManager {
                     "GetUnit",
                     &(unit,),
                 )
-                .await?;
+                .await
+            {
+                Ok(reply) => reply,
+                Err(error) if Self::is_missing_unit(&error) => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
             let unit_path: zbus::zvariant::OwnedObjectPath = reply.body().deserialize()?;
             let deadline = std::time::Instant::now() + Self::STATE_TIMEOUT;
             loop {

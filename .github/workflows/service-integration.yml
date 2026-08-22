@@ -34,7 +34,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -58,11 +57,14 @@ jobs:
         run: cargo test --all-features
 
       - name: Benchmark native process probe against legacy CLI
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
         env:
           CLASH_VERGE_PROCESS_BENCH_OUTPUT: process-probe-benchmark.json
+          CLASH_VERGE_PROCESS_BENCH_GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: cargo test --release --all-features --lib core::process::tests::benchmark_native_process_probe_against_legacy_cli -- --exact --ignored --nocapture
 
       - name: Upload process probe benchmark
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v7
         with:
           name: process-probe-benchmark-${{ runner.os }}
@@ -71,6 +73,7 @@ jobs:
 
   benchmark-summary:
     name: Native Process Benchmark Summary
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     needs: cargo-tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -142,7 +145,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
     env:
       CLASH_VERGE_TEST_SESSION_TOKEN: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     steps:
@@ -155,22 +157,8 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Build production service binaries
-        if: runner.os != 'Windows'
-        run: >-
-          cargo build --release --features "standalone client integration-driver"
-          --bin clash-verge-service
-          --bin clash-verge-service-install
-          --bin clash-verge-service-uninstall
-          --bin service-integration-driver
-
-      - name: Build Windows integration binaries
-        if: runner.os == 'Windows'
-        run: cargo build --release --features "standalone client test integration-driver"
-
-      - name: Build integration fixture
-        if: runner.os != 'Windows'
-        run: cargo build --release --features "test" --bin mock_binary
+      - name: Build binaries
+        run: cargo build --release --features "standalone client test"
 
       - name: Install service (Linux)
         if: runner.os == 'Linux'
@@ -227,17 +215,9 @@ jobs:
         if: runner.os == 'macOS'
         run: sudo launchctl list | grep io.github.clash-verge-rev.clash-verge-rev.service
 
-      - name: Install integration fixture in an allowed macOS location
-        if: runner.os == 'macOS'
-        run: |
-          sudo install -d /Applications/ClashVergeServiceIntegration.app/Contents/MacOS
-          sudo install -m 755 target/release/mock_binary /Applications/ClashVergeServiceIntegration.app/Contents/MacOS/mock_binary
-
       - name: Start mock_binary (macOS)
         id: start_macos
         if: runner.os == 'macOS'
-        env:
-          CLASH_VERGE_TEST_CORE_PATH: /Applications/ClashVergeServiceIntegration.app/Contents/MacOS/mock_binary
         run: |
           generation="$(target/release/service-integration-driver start)"
           if [[ ! "$generation" =~ ^[0-9]+$ ]]; then
@@ -264,10 +244,6 @@ jobs:
           if [ -x target/release/clash-verge-service-uninstall ]; then
             sudo target/release/clash-verge-service-uninstall --debug
           fi
-          sudo rm -f /Applications/ClashVergeServiceIntegration.app/Contents/MacOS/mock_binary
-          sudo rmdir /Applications/ClashVergeServiceIntegration.app/Contents/MacOS || true
-          sudo rmdir /Applications/ClashVergeServiceIntegration.app/Contents || true
-          sudo rmdir /Applications/ClashVergeServiceIntegration.app || true
 
       - name: Install service (Windows)
         if: runner.os == 'Windows'

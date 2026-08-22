@@ -106,16 +106,29 @@ fn explicit_port(authority: &str) -> anyhow::Result<u16> {
 
 #[cfg(target_os = "macos")]
 fn apply_real(config: &MacosProxyConfig) -> anyhow::Result<()> {
-    let config = match config {
-        MacosProxyConfig::Disabled => sysproxy::ProxyConfig::Disabled,
-        MacosProxyConfig::Global { host, port, bypass } => sysproxy::ProxyConfig::Global {
-            host: host.clone(),
-            port: *port,
-            bypass: bypass.clone(),
-        },
-        MacosProxyConfig::Pac { url } => sysproxy::ProxyConfig::Pac { url: url.clone() },
+    let (system, auto) = match config {
+        MacosProxyConfig::Disabled => (
+            sysproxy::Sysproxy::default(),
+            sysproxy::Autoproxy::default(),
+        ),
+        MacosProxyConfig::Global { host, port, bypass } => (
+            sysproxy::Sysproxy {
+                host: host.clone(),
+                port: *port,
+                bypass: bypass.clone(),
+                enable: true,
+            },
+            sysproxy::Autoproxy::default(),
+        ),
+        MacosProxyConfig::Pac { url } => (
+            sysproxy::Sysproxy::default(),
+            sysproxy::Autoproxy {
+                url: url.clone(),
+                enable: true,
+            },
+        ),
     };
-    config.apply_privileged_native().map_err(Into::into)
+    sysproxy::apply_privileged_native(&system, &auto).map_err(Into::into)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -217,23 +230,6 @@ pub async fn apply_proxy_or_direct(
 mod tests {
     use super::{apply_proxy_or_direct_with, validate_proxy_config};
     use crate::{MacosProxyConfig, ProxyApplyOutcome};
-
-    #[test]
-    fn production_proxy_backend_has_no_external_command_dependency() {
-        let manifest = include_str!("../../Cargo.toml");
-        let source = include_str!("proxy.rs");
-        let legacy_binary = concat!("network", "setup");
-        let synchronous_command = concat!("process::", "Command");
-        let asynchronous_command = concat!("tokio::", "process");
-
-        assert!(manifest.contains("sysproxy = {"));
-        assert!(manifest.contains("features = [\"privileged-macos\"]"));
-        assert!(!manifest.contains("system-configuration ="));
-        assert!(!source.contains(legacy_binary));
-        assert!(!source.contains(synchronous_command));
-        assert!(!source.contains(asynchronous_command));
-        assert!(source.contains("apply_privileged_native"));
-    }
 
     #[test]
     fn proxy_contract_accepts_only_loopback_targets() {

@@ -9,6 +9,7 @@ use clash_verge_service_ipc::{
 };
 #[cfg(not(feature = "test"))]
 use clash_verge_service_ipc::{OwnerCredentials, OwnerIdentity};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -207,14 +208,6 @@ fn owner_credentials() -> anyhow::Result<OwnerCredentials> {
 }
 
 fn mock_binary_path() -> anyhow::Result<String> {
-    if let Some(path) = std::env::var_os("CLASH_VERGE_TEST_CORE_PATH") {
-        let path = std::path::PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path.to_string_lossy().into_owned());
-        }
-        anyhow::bail!("CLASH_VERGE_TEST_CORE_PATH does not name a file");
-    }
-
     let current_exe = std::env::current_exe()?;
     let mut path = current_exe;
     path.pop();
@@ -225,5 +218,17 @@ fn mock_binary_path() -> anyhow::Result<String> {
     if path.exists() {
         return Ok(path.to_string_lossy().to_string());
     }
-    anyhow::bail!("mock_binary fixture is missing beside service-integration-driver");
+
+    let status = Command::new("cargo")
+        .args(["build", "--features", "test"])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build mock_binary");
+    }
+    if path.exists() {
+        return Ok(path.to_string_lossy().to_string());
+    }
+    anyhow::bail!("mock_binary not found after build");
 }

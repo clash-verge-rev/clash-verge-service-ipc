@@ -87,26 +87,14 @@ fn main() -> Result<(), Error> {
     let debug = env::args().any(|arg| arg == "--debug");
     let service_name = clash_verge_service_ipc::SERVICE_SLUG;
     let unit_name = format!("{}.service", service_name);
-    let systemd = match SystemdManager::connect() {
-        Ok(systemd) => Some(systemd),
-        Err(error) => {
-            if debug {
-                eprintln!("Unable to connect to systemd; continuing file cleanup: {error:#}");
-            }
-            None
-        }
-    };
+    let systemd = SystemdManager::connect()?;
 
     if debug {
-        if let Some(systemd) = &systemd {
-            println!("Connected to systemd via {}", systemd.transport());
-        }
+        println!("Connected to systemd via system bus");
         println!("Stopping and disabling systemd unit {unit_name}");
     }
-    if let Some(systemd) = &systemd {
-        let _ = systemd.stop(&unit_name);
-        let _ = systemd.disable(&unit_name);
-    }
+    systemd.stop(&unit_name)?;
+    systemd.disable(&unit_name)?;
 
     let unit_file = format!("/etc/systemd/system/{}.service", service_name);
     if std::path::Path::new(&unit_file).exists() {
@@ -114,9 +102,7 @@ fn main() -> Result<(), Error> {
             .map_err(|e| anyhow::anyhow!("Failed to remove service file: {}", e))?;
     }
 
-    if let Some(systemd) = &systemd {
-        let _ = systemd.reload();
-    }
+    systemd.reload()?;
     let target =
         clash_verge_service_ipc::prepare_service_install_directory()?.join("clash-verge-service");
     if target.exists() {
