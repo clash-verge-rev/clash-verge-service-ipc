@@ -117,8 +117,6 @@ pub fn run_command(cmd: &str, args: &[&str], debug: bool) -> Result<(), Error> {
 pub struct SystemdManager {
     runtime: tokio::runtime::Runtime,
     connection: zbus::Connection,
-    transport: &'static str,
-    destination: Option<&'static str>,
 }
 
 #[cfg(target_os = "linux")]
@@ -140,40 +138,21 @@ impl SystemdManager {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let (connection, transport, destination) = runtime.block_on(async {
-            let private = tokio::time::timeout(Self::CONNECT_TIMEOUT, async {
-                zbus::connection::Builder::address("unix:path=/run/systemd/private")?
-                    .p2p()
-                    .method_timeout(Self::METHOD_TIMEOUT)
-                    .build()
-                    .await
-            })
-            .await;
-            if let Ok(Ok(connection)) = private {
-                return Ok((connection, "private socket", None));
-            }
-            let private_error = match private {
-                Ok(Err(error)) => error.to_string(),
-                Err(_) => format!("timed out after {:?}", Self::CONNECT_TIMEOUT),
-                Ok(Ok(_)) => unreachable!(),
-            };
-
-            let system_bus = tokio::time::timeout(Self::CONNECT_TIMEOUT, async {
+        let connection = runtime.block_on(async {
+            let result = tokio::time::timeout(Self::CONNECT_TIMEOUT, async {
                 zbus::connection::Builder::system()?
                     .method_timeout(Self::METHOD_TIMEOUT)
                     .build()
                     .await
             })
             .await;
-            match system_bus {
-                Ok(Ok(connection)) => {
-                    Ok((connection, "system bus", Some(Self::SYSTEMD_DESTINATION)))
-                }
+            match result {
+                Ok(Ok(connection)) => Ok(connection),
                 Ok(Err(error)) => Err(anyhow::anyhow!(
-                    "failed to connect to systemd (private: {private_error}; system bus: {error})"
+                    "failed to connect to systemd via system bus: {error}"
                 )),
                 Err(_) => Err(anyhow::anyhow!(
-                    "failed to connect to systemd (private: {private_error}; system bus timed out after {:?})",
+                    "system bus connection timed out after {:?}",
                     Self::CONNECT_TIMEOUT
                 )),
             }
@@ -181,20 +160,18 @@ impl SystemdManager {
         Ok(Self {
             runtime,
             connection,
-            transport,
-            destination,
         })
     }
 
     pub fn transport(&self) -> &'static str {
-        self.transport
+        "system bus"
     }
 
     pub fn stop(&self, unit: &str) -> Result<(), Error> {
         self.runtime.block_on(async {
             self.connection
                 .call_method(
-                    self.destination,
+                    Some(Self::SYSTEMD_DESTINATION),
                     Self::MANAGER_PATH,
                     Some(Self::MANAGER_INTERFACE),
                     "StopUnit",
@@ -204,7 +181,7 @@ impl SystemdManager {
             let reply = self
                 .connection
                 .call_method(
-                    self.destination,
+                    Some(Self::SYSTEMD_DESTINATION),
                     Self::MANAGER_PATH,
                     Some(Self::MANAGER_INTERFACE),
                     "GetUnit",
@@ -217,7 +194,7 @@ impl SystemdManager {
                 let reply = self
                     .connection
                     .call_method(
-                        self.destination,
+                        Some(Self::SYSTEMD_DESTINATION),
                         unit_path.as_str(),
                         Some(Self::PROPERTIES_INTERFACE),
                         "Get",
@@ -244,7 +221,7 @@ impl SystemdManager {
         self.runtime.block_on(async {
             self.connection
                 .call_method(
-                    self.destination,
+                    Some(Self::SYSTEMD_DESTINATION),
                     Self::MANAGER_PATH,
                     Some(Self::MANAGER_INTERFACE),
                     "Reload",
@@ -259,7 +236,7 @@ impl SystemdManager {
         self.runtime.block_on(async {
             self.connection
                 .call_method(
-                    self.destination,
+                    Some(Self::SYSTEMD_DESTINATION),
                     Self::MANAGER_PATH,
                     Some(Self::MANAGER_INTERFACE),
                     "EnableUnitFiles",
@@ -274,7 +251,7 @@ impl SystemdManager {
         self.runtime.block_on(async {
             self.connection
                 .call_method(
-                    self.destination,
+                    Some(Self::SYSTEMD_DESTINATION),
                     Self::MANAGER_PATH,
                     Some(Self::MANAGER_INTERFACE),
                     "DisableUnitFiles",
@@ -289,7 +266,7 @@ impl SystemdManager {
         self.runtime.block_on(async {
             self.connection
                 .call_method(
-                    self.destination,
+                    Some(Self::SYSTEMD_DESTINATION),
                     Self::MANAGER_PATH,
                     Some(Self::MANAGER_INTERFACE),
                     "StartUnit",
