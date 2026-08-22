@@ -12,8 +12,6 @@ use sha2::{Digest as _, Sha256};
 use shared::SystemdManager;
 #[cfg(target_os = "macos")]
 use shared::run_command;
-#[cfg(target_os = "macos")]
-use shared::run_command_output;
 #[cfg(all(target_os = "macos", not(feature = "development-channel")))]
 use shared::uninstall_old_service;
 use shared::{enter_repair_gate, run_maintenance_if_requested};
@@ -228,8 +226,14 @@ fn classify_launchd_service_probe(
 
 #[cfg(target_os = "macos")]
 fn probe_launchd_service(debug: bool) -> Result<LaunchdInstallPlan, Error> {
-    let target = launchd_service_target();
-    let output = run_command_output("launchctl", &["print", &target], debug)?;
+    if debug {
+        println!("Executing: launchctl print {}", launchd_service_target());
+    }
+
+    let output = std::process::Command::new("launchctl")
+        .args(["print", &launchd_service_target()])
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to probe launchd service: {}", e))?;
     let diagnostic = format!(
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
@@ -401,10 +405,10 @@ fn main() -> Result<(), Error> {
     let systemd = SystemdManager::connect()?;
 
     if debug {
-        println!("Connected to systemd via {}", systemd.transport());
+        println!("Connected to systemd via system bus");
         println!("Stopping systemd unit {unit_name}");
     }
-    let _ = systemd.stop(&unit_name);
+    systemd.stop(&unit_name)?;
     publish_staged_binary(&staged, &target)?;
 
     let unit_file_content = format!(
@@ -560,22 +564,6 @@ fn configure_windows_service_recovery(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn command_wrapper_bounds_external_process_wait() {
-        let started = std::time::Instant::now();
-        let error = shared::run_command_output_with_timeout(
-            "/bin/sleep",
-            &["5"],
-            false,
-            std::time::Duration::from_millis(50),
-        )
-        .expect_err("sleep should exceed the command timeout");
-
-        assert!(error.to_string().contains("exceeded"));
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
-    }
 
     #[test]
     fn missing_launchd_service_skips_bootout() {

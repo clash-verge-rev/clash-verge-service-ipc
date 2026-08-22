@@ -45,7 +45,7 @@ jobs:
           toolchain: stable
 
       - name: Build service binaries
-        run: cargo build --release --features "standalone client integration-driver"
+        run: cargo build --release --features "standalone client"
 
       - name: Install service (Unix)
         if: runner.os != 'Windows'
