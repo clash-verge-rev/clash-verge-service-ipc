@@ -34,6 +34,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -56,6 +57,84 @@ jobs:
       - name: Run cargo test
         run: cargo test --all-features
 
+      - name: Benchmark native process probe against legacy CLI
+        env:
+          CLASH_VERGE_PROCESS_BENCH_OUTPUT: process-probe-benchmark.json
+        run: cargo test --release --all-features --lib core::process::tests::benchmark_native_process_probe_against_legacy_cli -- --exact --ignored --nocapture
+
+      - name: Upload process probe benchmark
+        uses: actions/upload-artifact@v7
+        with:
+          name: process-probe-benchmark-${{ runner.os }}
+          path: process-probe-benchmark.json
+          if-no-files-found: error
+
+  benchmark-summary:
+    name: Native Process Benchmark Summary
+    needs: cargo-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download process probe benchmarks
+        uses: actions/download-artifact@v7
+        with:
+          pattern: process-probe-benchmark-*
+          path: process-probe-benchmarks
+
+      - name: Publish cross-platform benchmark diff
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+            const root = "process-probe-benchmarks";
+            const reports = fs.readdirSync(root, { withFileTypes: true })
+              .filter((entry) => entry.isDirectory())
+              .map((entry) => JSON.parse(fs.readFileSync(
+                path.join(root, entry.name, "process-probe-benchmark.json"),
+                "utf8",
+              )))
+              .sort((left, right) => left.platform.localeCompare(right.platform));
+            if (reports.length !== 3) {
+              throw new Error(`expected 3 platform reports, found ${reports.length}`);
+            }
+            const milliseconds = (nanoseconds) => (nanoseconds / 1_000_000).toFixed(3);
+            await core.summary
+              .addHeading("Native process probe vs legacy CLI")
+              .addRaw("Each row is a same-runner comparison; absolute timings are not compared across runner types.\n\n")
+              .addTable([
+                [
+                  { data: "Platform", header: true },
+                  { data: "Architecture", header: true },
+                  { data: "Native median", header: true },
+                  { data: "Legacy median", header: true },
+                  { data: "Native p95", header: true },
+                  { data: "Legacy p95", header: true },
+                  { data: "Median speedup", header: true },
+                ],
+                ...reports.map((report) => [
+                  report.platform,
+                  report.arch,
+                  `${milliseconds(report.native.median_ns)} ms`,
+                  `${milliseconds(report.legacy_cli.median_ns)} ms`,
+                  `${milliseconds(report.native.p95_ns)} ms`,
+                  `${milliseconds(report.legacy_cli.p95_ns)} ms`,
+                  `${report.median_speedup.toFixed(2)}x`,
+                ]),
+              ])
+              .write();
+            fs.writeFileSync(
+              "process-probe-benchmark-summary.json",
+              `${JSON.stringify(reports, null, 2)}\n`,
+            );
+
+      - name: Upload cross-platform benchmark diff
+        uses: actions/upload-artifact@v7
+        with:
+          name: process-probe-benchmark-summary
+          path: process-probe-benchmark-summary.json
+          if-no-files-found: error
+
   service-flow:
     name: Service Integration (${{ matrix.os }})
     strategy:
@@ -63,6 +142,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     env:
       CLASH_VERGE_TEST_SESSION_TOKEN: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     steps:
@@ -80,7 +160,17 @@ jobs:
 
       - name: Install service (Linux)
         if: runner.os == 'Linux'
-        run: sudo target/release/clash-verge-service-install --debug
+        run: |
+          if ! install_output="$(sudo target/release/clash-verge-service-install --debug 2>&1)"; then
+            echo "$install_output" >&2
+            exit 1
+          fi
+          echo "$install_output"
+          if [[ "$install_output" != *"Connected to systemd via private socket"* && \
+                "$install_output" != *"Connected to systemd via system bus"* ]]; then
+            echo "installer did not report a native systemd transport" >&2
+            exit 1
+          fi
 
       - name: Verify service (Linux)
         if: runner.os == 'Linux'

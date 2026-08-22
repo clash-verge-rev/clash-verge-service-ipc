@@ -8,8 +8,12 @@ mod shared;
 use anyhow::Error;
 use anyhow::{Context as _, bail};
 use sha2::{Digest as _, Sha256};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
+use shared::SystemdManager;
+#[cfg(target_os = "macos")]
 use shared::run_command;
+#[cfg(target_os = "macos")]
+use shared::run_command_output;
 #[cfg(all(target_os = "macos", not(feature = "development-channel")))]
 use shared::uninstall_old_service;
 use shared::{enter_repair_gate, run_maintenance_if_requested};
@@ -224,14 +228,8 @@ fn classify_launchd_service_probe(
 
 #[cfg(target_os = "macos")]
 fn probe_launchd_service(debug: bool) -> Result<LaunchdInstallPlan, Error> {
-    if debug {
-        println!("Executing: launchctl print {}", launchd_service_target());
-    }
-
-    let output = std::process::Command::new("launchctl")
-        .args(["print", &launchd_service_target()])
-        .output()
-        .map_err(|e| anyhow::anyhow!("Failed to probe launchd service: {}", e))?;
+    let target = launchd_service_target();
+    let output = run_command_output("launchctl", &["print", &target], debug)?;
     let diagnostic = format!(
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
@@ -270,6 +268,39 @@ fn resolve_service_group_name() -> Result<String, Error> {
     }
 
     bail!("unable to resolve the invoking user's service group; use sudo or pkexec")
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_owner(path: &Path) -> Result<(), Error> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("path contains NUL: {path:?}"))?;
+    if unsafe { platform_lib::lchown(path_c.as_ptr(), 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to set root:wheel owner on {path:?}"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_owner_recursive(path: &Path) -> Result<(), Error> {
+    set_macos_owner(path)?;
+    if !std::fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path)? {
+        set_macos_owner_recursive(&entry?.path())?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_permissions(path: &Path, mode: u32) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("failed to set mode {mode:o} on {path:?}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -321,8 +352,6 @@ fn main() -> Result<(), Error> {
         service_id = clash_verge_service_ipc::MACOS_SERVICE_ID,
     );
     let plist_path = plist_file.to_string_lossy().into_owned();
-    let target_path = target_binary_path.to_string_lossy().into_owned();
-    let bundle_path_string = bundle_path.to_string_lossy().into_owned();
 
     if launchd_install_plan == LaunchdInstallPlan::Bootout {
         run_command("launchctl", &["bootout", "system", &plist_path], debug)?;
@@ -334,14 +363,12 @@ fn main() -> Result<(), Error> {
         .and_then(|mut file| file.write_all(launchd_plist_content.as_bytes()))
         .map_err(|e| anyhow::anyhow!("Failed to write plist file: {}", e))?;
 
-    run_command("chmod", &["644", &plist_path], debug)?;
-    run_command("chown", &["root:wheel", &plist_path], debug)?;
-
-    run_command("chmod", &["544", &target_path], debug)?;
-    run_command("chown", &["root:wheel", &target_path], debug)?;
-
-    run_command("chmod", &["755", &bundle_path_string], debug)?;
-    run_command("chown", &["-R", "root:wheel", &bundle_path_string], debug)?;
+    set_macos_permissions(&plist_file, 0o644)?;
+    set_macos_owner(&plist_file)?;
+    set_macos_permissions(&target_binary_path, 0o544)?;
+    set_macos_owner(&target_binary_path)?;
+    set_macos_permissions(&bundle_path, 0o755)?;
+    set_macos_owner_recursive(&bundle_path)?;
 
     let launchd_target = launchd_service_target();
     run_command("launchctl", &["enable", &launchd_target], debug)?;
@@ -371,8 +398,13 @@ fn main() -> Result<(), Error> {
     let staged = stage_service_binary(&source, &target)?;
     let unit_name = format!("{}.service", clash_verge_service_ipc::SERVICE_SLUG);
     let unit_path = PathBuf::from("/etc/systemd/system").join(&unit_name);
+    let systemd = SystemdManager::connect()?;
 
-    let _ = run_command("systemctl", &["stop", &unit_name], debug);
+    if debug {
+        println!("Connected to systemd via {}", systemd.transport());
+        println!("Stopping systemd unit {unit_name}");
+    }
+    let _ = systemd.stop(&unit_name);
     publish_staged_binary(&staged, &target)?;
 
     let unit_file_content = format!(
@@ -391,9 +423,10 @@ fn main() -> Result<(), Error> {
         .sync_all()
         .with_context(|| format!("failed to sync systemd unit {unit_path:?}"))?;
 
-    run_command("systemctl", &["daemon-reload"], debug)?;
-    run_command("systemctl", &["enable", &unit_name], debug)?;
-    run_command("systemctl", &["start", &unit_name], debug)?;
+    let unit_path = unit_path.to_string_lossy();
+    systemd.reload()?;
+    systemd.enable(&unit_path)?;
+    systemd.start(&unit_name)?;
     wait_for_service_ready()?;
 
     Ok(())
@@ -527,6 +560,22 @@ fn configure_windows_service_recovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn command_wrapper_bounds_external_process_wait() {
+        let started = std::time::Instant::now();
+        let error = shared::run_command_output_with_timeout(
+            "/bin/sleep",
+            &["5"],
+            false,
+            std::time::Duration::from_millis(50),
+        )
+        .expect_err("sleep should exceed the command timeout");
+
+        assert!(error.to_string().contains("exceeded"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
 
     #[test]
     fn missing_launchd_service_skips_bootout() {
