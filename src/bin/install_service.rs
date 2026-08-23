@@ -8,9 +8,7 @@ mod shared;
 use anyhow::Error;
 use anyhow::{Context as _, bail};
 use sha2::{Digest as _, Sha256};
-#[cfg(target_os = "linux")]
-use shared::SystemdManager;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use shared::run_command;
 #[cfg(all(target_os = "macos", not(feature = "development-channel")))]
 use shared::uninstall_old_service;
@@ -402,13 +400,8 @@ fn main() -> Result<(), Error> {
     let staged = stage_service_binary(&source, &target)?;
     let unit_name = format!("{}.service", clash_verge_service_ipc::SERVICE_SLUG);
     let unit_path = PathBuf::from("/etc/systemd/system").join(&unit_name);
-    let systemd = SystemdManager::connect()?;
 
-    if debug {
-        println!("Connected to systemd via system bus");
-        println!("Stopping systemd unit {unit_name}");
-    }
-    systemd.stop(&unit_name)?;
+    let _ = run_command("systemctl", &["stop", &unit_name], debug);
     publish_staged_binary(&staged, &target)?;
 
     let unit_file_content = format!(
@@ -427,10 +420,9 @@ fn main() -> Result<(), Error> {
         .sync_all()
         .with_context(|| format!("failed to sync systemd unit {unit_path:?}"))?;
 
-    let unit_path = unit_path.to_string_lossy();
-    systemd.reload()?;
-    systemd.enable(&unit_path)?;
-    systemd.start(&unit_name)?;
+    run_command("systemctl", &["daemon-reload"], debug)?;
+    run_command("systemctl", &["enable", &unit_name], debug)?;
+    run_command("systemctl", &["start", &unit_name], debug)?;
     wait_for_service_ready()?;
 
     Ok(())

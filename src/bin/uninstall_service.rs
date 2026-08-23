@@ -6,9 +6,7 @@ fn main() {
 mod shared;
 
 use anyhow::Error;
-#[cfg(target_os = "linux")]
-use shared::SystemdManager;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use shared::run_command;
 #[cfg(all(target_os = "macos", not(feature = "development-channel")))]
 use shared::uninstall_old_service;
@@ -86,15 +84,17 @@ fn main() -> Result<(), Error> {
     let _gate = enter_repair_gate()?;
     let debug = env::args().any(|arg| arg == "--debug");
     let service_name = clash_verge_service_ipc::SERVICE_SLUG;
-    let unit_name = format!("{}.service", service_name);
-    let systemd = SystemdManager::connect()?;
 
-    if debug {
-        println!("Connected to systemd via system bus");
-        println!("Stopping and disabling systemd unit {unit_name}");
-    }
-    systemd.stop(&unit_name)?;
-    systemd.disable(&unit_name)?;
+    let _ = run_command(
+        "systemctl",
+        &["stop", &format!("{}.service", service_name)],
+        debug,
+    );
+    let _ = run_command(
+        "systemctl",
+        &["disable", &format!("{}.service", service_name)],
+        debug,
+    );
 
     let unit_file = format!("/etc/systemd/system/{}.service", service_name);
     if std::path::Path::new(&unit_file).exists() {
@@ -102,7 +102,7 @@ fn main() -> Result<(), Error> {
             .map_err(|e| anyhow::anyhow!("Failed to remove service file: {}", e))?;
     }
 
-    systemd.reload()?;
+    let _ = run_command("systemctl", &["daemon-reload"], debug);
     let target =
         clash_verge_service_ipc::prepare_service_install_directory()?.join("clash-verge-service");
     if target.exists() {

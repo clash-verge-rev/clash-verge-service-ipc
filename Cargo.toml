@@ -62,7 +62,6 @@ standalone = [
     "response",
     "dep:platform_lib",
     "dep:nix",
-    "dep:zbus",
     "dep:windows-sys",
     "compact_str",
 ]
@@ -120,9 +119,6 @@ sysproxy = { git = "https://github.com/clash-verge-rev/sysproxy-rs.git", rev = "
 [target.'cfg(unix)'.dependencies]
 platform_lib = { package = "libc", version = "0.2", optional = true }
 nix = { version = "0.31", features = ["user"], optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "5.19.0", default-features = false, features = ["tokio"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 platform_lib = { package = "windows-service", version = "0.8", optional = true }

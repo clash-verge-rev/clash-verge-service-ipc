@@ -162,16 +162,7 @@ jobs:
 
       - name: Install service (Linux)
         if: runner.os == 'Linux'
-        run: |
-          if ! install_output="$(sudo target/release/clash-verge-service-install --debug 2>&1)"; then
-            echo "$install_output" >&2
-            exit 1
-          fi
-          echo "$install_output"
-          if [[ "$install_output" != *"Connected to systemd via system bus"* ]]; then
-            echo "installer did not report the native system bus transport" >&2
-            exit 1
-          fi
+        run: sudo target/release/clash-verge-service-install --debug
 
       - name: Verify service (Linux)
         if: runner.os == 'Linux'
