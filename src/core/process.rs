@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
-use std::collections::{HashMap, HashSet};
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 #[cfg(unix)]
 use std::time::Duration;
 use tracing::warn;
@@ -35,58 +35,36 @@ fn parse_linux_process_stat(stat: &str) -> Result<(char, u64)> {
     Ok((state, started_at))
 }
 
-#[cfg(windows)]
-fn termination_order(root_pid: u32, relations: &[(u32, u32)]) -> Vec<u32> {
-    fn visit(
-        pid: u32,
-        children: &HashMap<u32, Vec<u32>>,
-        visited: &mut HashSet<u32>,
-        order: &mut Vec<u32>,
-    ) {
-        if pid == 0 || !visited.insert(pid) {
-            return;
-        }
-        if let Some(child_pids) = children.get(&pid) {
-            for &child_pid in child_pids {
-                visit(child_pid, children, visited, order);
-            }
-        }
-        order.push(pid);
-    }
-
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    for &(child_pid, parent_pid) in relations {
-        children.entry(parent_pid).or_default().push(child_pid);
-    }
-    let mut order = Vec::new();
-    visit(root_pid, &children, &mut HashSet::new(), &mut order);
-    order
-}
-
-#[cfg(windows)]
-struct OwnedWindowsHandle(windows_sys::Win32::Foundation::HANDLE);
-
-// Windows kernel handles remain valid across threads until their final CloseHandle.
-#[cfg(windows)]
-unsafe impl Send for OwnedWindowsHandle {}
-
-#[cfg(windows)]
-impl Drop for OwnedWindowsHandle {
-    fn drop(&mut self) {
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+#[cfg(target_os = "macos")]
+fn macos_process_info(pid: i32) -> std::io::Result<platform_lib::proc_bsdinfo> {
+    let mut info = unsafe { std::mem::zeroed::<platform_lib::proc_bsdinfo>() };
+    let info_len = unsafe {
+        platform_lib::proc_pidinfo(
+            pid,
+            platform_lib::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut platform_lib::proc_bsdinfo).cast(),
+            std::mem::size_of::<platform_lib::proc_bsdinfo>() as i32,
+        )
+    };
+    if info_len == std::mem::size_of::<platform_lib::proc_bsdinfo>() as i32 {
+        Ok(info)
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
 #[cfg(windows)]
-fn windows_process_identity_details_from_handle(
-    handle: &OwnedWindowsHandle,
-) -> Result<ProcessIdentity> {
+fn windows_process_identity_details_from_handle(handle: &OwnedHandle) -> Result<ProcessIdentity> {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetProcessTimes, QueryFullProcessImageNameW};
 
     let mut path = vec![0u16; 32_768];
     let mut path_len = path.len() as u32;
-    if unsafe { QueryFullProcessImageNameW(handle.0, 0, path.as_mut_ptr(), &mut path_len) } == 0 {
+    if unsafe {
+        QueryFullProcessImageNameW(handle.as_raw_handle(), 0, path.as_mut_ptr(), &mut path_len)
+    } == 0
+    {
         return Err(std::io::Error::last_os_error().into());
     }
     path.truncate(path_len as usize);
@@ -98,7 +76,16 @@ fn windows_process_identity_details_from_handle(
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
-    if unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+    if unsafe {
+        GetProcessTimes(
+            handle.as_raw_handle(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
         return Err(std::io::Error::last_os_error().into());
     }
     let started_at = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
@@ -152,24 +139,16 @@ pub(super) fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
         use std::os::unix::ffi::OsStringExt as _;
 
         let unix_pid = checked_unix_pid(pid).expect("Unix PID was validated above");
-        let mut info = unsafe { std::mem::zeroed::<platform_lib::proc_bsdinfo>() };
-        let info_len = unsafe {
-            platform_lib::proc_pidinfo(
-                unix_pid,
-                platform_lib::PROC_PIDTBSDINFO,
-                0,
-                (&mut info as *mut platform_lib::proc_bsdinfo).cast(),
-                std::mem::size_of::<platform_lib::proc_bsdinfo>() as i32,
-            )
+        let info = match macos_process_info(unix_pid) {
+            Ok(info) => info,
+            Err(error) => {
+                return if is_process_alive(pid) {
+                    Err(error.into())
+                } else {
+                    Ok(None)
+                };
+            }
         };
-        if info_len != std::mem::size_of::<platform_lib::proc_bsdinfo>() as i32 {
-            let error = std::io::Error::last_os_error();
-            return if is_process_alive(pid) {
-                Err(error.into())
-            } else {
-                Ok(None)
-            };
-        }
         if info.pbi_status == platform_lib::SZOMB {
             return Ok(None);
         }
@@ -190,24 +169,16 @@ pub(super) fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
             .canonicalize()?
             .to_string_lossy()
             .into_owned();
-        let mut confirmed = unsafe { std::mem::zeroed::<platform_lib::proc_bsdinfo>() };
-        let confirmed_len = unsafe {
-            platform_lib::proc_pidinfo(
-                unix_pid,
-                platform_lib::PROC_PIDTBSDINFO,
-                0,
-                (&mut confirmed as *mut platform_lib::proc_bsdinfo).cast(),
-                std::mem::size_of::<platform_lib::proc_bsdinfo>() as i32,
-            )
+        let confirmed = match macos_process_info(unix_pid) {
+            Ok(info) => info,
+            Err(error) => {
+                return if is_process_alive(pid) {
+                    Err(error.into())
+                } else {
+                    Ok(None)
+                };
+            }
         };
-        if confirmed_len != std::mem::size_of::<platform_lib::proc_bsdinfo>() as i32 {
-            let error = std::io::Error::last_os_error();
-            return if is_process_alive(pid) {
-                Err(error.into())
-            } else {
-                Ok(None)
-            };
-        }
         if confirmed.pbi_status == platform_lib::SZOMB {
             return Ok(None);
         }
@@ -227,24 +198,9 @@ pub(super) fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
 
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
-        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        let Some(handle) = open_windows_process_handle(pid)? else {
+            return Ok(None);
         };
-
-        let handle =
-            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
-        if handle.is_null() {
-            let error = std::io::Error::last_os_error();
-            return if error.raw_os_error().map(|code| code as u32) == Some(ERROR_INVALID_PARAMETER)
-            {
-                Ok(None)
-            } else {
-                Err(error.into())
-            };
-        }
-        let handle = OwnedWindowsHandle(handle);
         if windows_handle_is_signaled(&handle)? {
             Ok(None)
         } else {
@@ -282,20 +238,10 @@ pub(super) fn is_process_alive(pid: u32) -> bool {
 
         #[cfg(target_os = "macos")]
         {
-            let mut info = unsafe { std::mem::zeroed::<platform_lib::proc_bsdinfo>() };
-            let info_len = unsafe {
-                platform_lib::proc_pidinfo(
-                    unix_pid,
-                    platform_lib::PROC_PIDTBSDINFO,
-                    0,
-                    (&mut info as *mut platform_lib::proc_bsdinfo).cast(),
-                    std::mem::size_of::<platform_lib::proc_bsdinfo>() as i32,
-                )
-            };
-            if info_len != std::mem::size_of::<platform_lib::proc_bsdinfo>() as i32 {
-                return std::io::Error::last_os_error().raw_os_error() != Some(platform_lib::ESRCH);
+            match macos_process_info(unix_pid) {
+                Ok(info) => info.pbi_status != platform_lib::SZOMB,
+                Err(error) => error.raw_os_error() != Some(platform_lib::ESRCH),
             }
-            info.pbi_status != platform_lib::SZOMB
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -304,9 +250,9 @@ pub(super) fn is_process_alive(pid: u32) -> bool {
 
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
         use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+        use windows_sys::Win32::System::Threading::OpenProcess;
 
         let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
         if handle.is_null() {
@@ -314,62 +260,17 @@ pub(super) fn is_process_alive(pid: u32) -> bool {
                 .raw_os_error()
                 .is_some_and(|code| code as u32 == ERROR_ACCESS_DENIED);
         }
-        let handle = OwnedWindowsHandle(handle);
-        match unsafe { WaitForSingleObject(handle.0, 0) } {
-            WAIT_OBJECT_0 => false,
-            WAIT_TIMEOUT => true,
-            _ => true,
-        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+        windows_handle_is_signaled(&handle).map_or(true, |signaled| !signaled)
     }
 }
 
 #[cfg(windows)]
-fn windows_process_relations() -> Result<Vec<(u32, u32)>> {
-    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-        TH32CS_SNAPPROCESS,
-    };
-
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let snapshot = OwnedWindowsHandle(snapshot);
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
-    if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
-        let error = std::io::Error::last_os_error();
-        return if error.raw_os_error().map(|code| code as u32) == Some(ERROR_NO_MORE_FILES) {
-            Ok(Vec::new())
-        } else {
-            Err(error.into())
-        };
-    }
-
-    let mut relations = Vec::new();
-    loop {
-        relations.push((entry.th32ProcessID, entry.th32ParentProcessID));
-        if unsafe { Process32NextW(snapshot.0, &mut entry) } != 0 {
-            continue;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error().map(|code| code as u32) == Some(ERROR_NO_MORE_FILES) {
-            break;
-        }
-        return Err(error.into());
-    }
-    Ok(relations)
-}
-
-#[cfg(windows)]
-fn windows_handle_is_signaled(handle: &OwnedWindowsHandle) -> Result<bool> {
+fn windows_handle_is_signaled(handle: &OwnedHandle) -> Result<bool> {
     use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-    match unsafe { WaitForSingleObject(handle.0, 0) } {
+    match unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } {
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),
         _ => Err(std::io::Error::last_os_error().into()),
@@ -377,22 +278,14 @@ fn windows_handle_is_signaled(handle: &OwnedWindowsHandle) -> Result<bool> {
 }
 
 #[cfg(windows)]
-fn open_windows_termination_handle(pid: u32) -> Result<Option<OwnedWindowsHandle>> {
+fn open_windows_process_handle(pid: u32) -> Result<Option<OwnedHandle>> {
     use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
     use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
-    let handle = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,
-            0,
-            pid,
-        )
-    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
     if !handle.is_null() {
-        return Ok(Some(OwnedWindowsHandle(handle)));
+        return Ok(Some(unsafe { OwnedHandle::from_raw_handle(handle) }));
     }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error().map(|value| value as u32) == Some(ERROR_INVALID_PARAMETER) {
@@ -400,60 +293,6 @@ fn open_windows_termination_handle(pid: u32) -> Result<Option<OwnedWindowsHandle
     } else {
         Err(error.into())
     }
-}
-
-#[cfg(windows)]
-fn terminate_windows_process_tree(
-    pid: u32,
-    expected_identity: Option<&ProcessIdentity>,
-) -> Result<Vec<(u32, OwnedWindowsHandle)>> {
-    let Some(root_handle) = open_windows_termination_handle(pid)? else {
-        return Ok(Vec::new());
-    };
-    use windows_sys::Win32::System::Threading::TerminateProcess;
-
-    if let Some(expected_identity) = expected_identity {
-        let current_identity = windows_process_identity_details_from_handle(&root_handle)?;
-        if &current_identity != expected_identity {
-            bail!("process {pid} identity changed before termination");
-        }
-    }
-
-    let terminate = |candidate: u32, handle: &OwnedWindowsHandle| -> Result<()> {
-        if windows_handle_is_signaled(handle)? {
-            return Ok(());
-        }
-        if unsafe { TerminateProcess(handle.0, 1) } == 0 {
-            let error = std::io::Error::last_os_error();
-            return Err(anyhow::anyhow!(
-                "failed to terminate process {candidate}: {error}"
-            ));
-        }
-        Ok(())
-    };
-    terminate(pid, &root_handle)?;
-
-    let relations = windows_process_relations()?;
-    let order = termination_order(pid, &relations);
-    let mut targets = Vec::with_capacity(order.len());
-    let mut root_handle = Some(root_handle);
-    for candidate in order {
-        if candidate == pid {
-            targets.push((
-                candidate,
-                root_handle.take().expect("root PID is ordered once"),
-            ));
-        } else if let Some(handle) = open_windows_termination_handle(candidate)? {
-            targets.push((candidate, handle));
-        }
-    }
-
-    for (candidate, handle) in &targets {
-        if *candidate != pid {
-            terminate(*candidate, handle)?;
-        }
-    }
-    Ok(targets)
 }
 
 async fn terminate_process_inner(
@@ -518,24 +357,28 @@ async fn terminate_process_inner(
         if pid == 0 {
             bail!("invalid Windows process ID 0");
         }
-        let targets = terminate_windows_process_tree(pid, expected_identity)?;
-        for _ in 0..20 {
-            let mut all_signaled = true;
-            for (_, handle) in &targets {
-                all_signaled &= windows_handle_is_signaled(handle)?;
+        let Some(handle) = open_windows_process_handle(pid)? else {
+            return Ok(());
+        };
+        if let Some(expected_identity) = expected_identity {
+            let current_identity = windows_process_identity_details_from_handle(&handle)?;
+            if &current_identity != expected_identity {
+                bail!("process {pid} identity changed before termination");
             }
-            if all_signaled {
+        }
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()?;
+        if !status.success() && !windows_handle_is_signaled(&handle)? {
+            bail!("taskkill failed for process {pid} with status {status}");
+        }
+        for _ in 0..20 {
+            if windows_handle_is_signaled(&handle)? {
                 return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        let mut remaining = Vec::new();
-        for (pid, handle) in &targets {
-            if !windows_handle_is_signaled(handle)? {
-                remaining.push(*pid);
-            }
-        }
-        bail!("processes {remaining:?} are still alive after native termination");
+        bail!("process {pid} is still alive after taskkill");
     }
 }
 

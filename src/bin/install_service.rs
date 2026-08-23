@@ -274,15 +274,10 @@ fn resolve_service_group_name() -> Result<String, Error> {
 
 #[cfg(target_os = "macos")]
 fn set_macos_owner(path: &Path) -> Result<(), Error> {
-    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::lchown;
 
-    let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| anyhow::anyhow!("path contains NUL: {path:?}"))?;
-    if unsafe { platform_lib::lchown(path_c.as_ptr(), 0, 0) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to set root:wheel owner on {path:?}"));
-    }
-    Ok(())
+    lchown(path, Some(0), Some(0))
+        .with_context(|| format!("failed to set root:wheel owner on {path:?}"))
 }
 
 #[cfg(target_os = "macos")]
