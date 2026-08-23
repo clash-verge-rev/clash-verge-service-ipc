@@ -79,13 +79,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Download process probe benchmarks
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: process-probe-benchmark-*
           path: process-probe-benchmarks
 
       - name: Publish cross-platform benchmark diff
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require("fs");
