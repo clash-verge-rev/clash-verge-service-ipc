@@ -1,6 +1,6 @@
 [package]
 name = "clash_verge_service_ipc"
-version = "2.6.4"
+version = "2.6.5"
 edition = "2024"
 authors = ["Tunglies"]
 license = "GPL-3.0"
@@ -114,7 +114,7 @@ compact_str = { version = "0.10", features = ["serde"], optional = true }
 url = "2.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-sysproxy = { git = "https://github.com/clash-verge-rev/sysproxy-rs.git", rev = "efeba6e5c03ea10fe75fd525aa2b0c1b1aef801d", default-features = false }
+sysproxy = { git = "https://github.com/clash-verge-rev/sysproxy-rs.git", rev = "1677bcb8d3cd9436b71a2e61629f41be9f0e80ba", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 platform_lib = { package = "libc", version = "0.2", optional = true }
