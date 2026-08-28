@@ -114,7 +114,7 @@ compact_str = { version = "0.10", features = ["serde"], optional = true }
 url = "2.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-sysproxy = { git = "https://github.com/clash-verge-rev/sysproxy-rs.git", rev = "1677bcb8d3cd9436b71a2e61629f41be9f0e80ba", default-features = false }
+sysproxy = { git = "https://github.com/clash-verge-rev/sysproxy-rs.git", rev = "62c952b3a60c39a360f7e6cecde2bef5448659eb", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 platform_lib = { package = "libc", version = "0.2", optional = true }
