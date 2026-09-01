@@ -163,7 +163,7 @@ pub(crate) async fn stage_runtime(
         });
     };
 
-    let core_path = validate_core_path(owner, &bundle.core_path)?;
+    let core_path = validate_core_path(&bundle.core_path)?;
     if Path::new(&running.core_config.core_path) != core_path {
         return Ok(StageRuntimeOutcome::RestartRequired {
             reason: StageRejection::CorePathChanged,

@@ -1,5 +1,6 @@
 use crate::core::auth::{AuthenticatedOwner, ServiceError};
 use crate::core::paths::ensure_owner_state_directory;
+use crate::core::trusted_core_location::require_trusted_core_location;
 use crate::{ClashConfig, CoreConfig, RuntimeBundle, ServiceErrorCode, WriterConfig, mihomo_ipc_path};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -194,7 +195,7 @@ pub(crate) async fn prepare_runtime(
     owner: &AuthenticatedOwner,
     bundle: &RuntimeBundle,
 ) -> Result<PreparedRuntime, ServiceError> {
-    let core_path = validate_core_path(owner, &bundle.core_path)?;
+    let core_path = validate_core_path(&bundle.core_path)?;
     let owner_paths = ensure_owner_state_directory(&owner.identity)
         .map_err(|error| invalid_asset(format!("failed to secure owner state root: {error:#}")))?;
     let owner_root = owner_paths.root();
@@ -374,38 +375,14 @@ pub(super) async fn gather_bundle(
     Ok(GatheredBundle { sources, remote })
 }
 
-pub(super) fn validate_core_path(owner: &AuthenticatedOwner, core_path: &str) -> Result<PathBuf, ServiceError> {
+/// The service executes this path as root or LocalSystem, so the location has to be one the
+/// requesting owner could not have written. Owner identity says nothing here: any local account
+/// may become an owner.
+pub(super) fn validate_core_path(core_path: &str) -> Result<PathBuf, ServiceError> {
     let requested = Path::new(core_path);
     let canonical = canonical_regular_file(requested, "core")?;
-
-    #[cfg(target_os = "macos")]
-    {
-        let home_applications = owner.app_data_root.ancestors().find_map(|path| {
-            path.file_name()
-                .is_some_and(|name| name == "Library")
-                .then(|| path.parent().map(|home| home.join("Applications")))
-                .flatten()
-        });
-        let allowed =
-            cfg!(feature = "test") || is_permitted_macos_core_location(&canonical, home_applications.as_deref());
-        if !allowed {
-            return Err(ServiceError::new(
-                ServiceErrorCode::InvalidInstallLocation,
-                "macOS core path is outside an allowed Applications directory",
-            ));
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    let _ = owner;
-
+    require_trusted_core_location(&canonical)?;
     Ok(canonical)
-}
-
-/// Checks the production macOS rule that cores live in a protected Applications directory.
-#[cfg(target_os = "macos")]
-fn is_permitted_macos_core_location(canonical: &Path, home_applications: Option<&Path>) -> bool {
-    canonical.starts_with("/Applications") || home_applications.is_some_and(|root| canonical.starts_with(root))
 }
 
 pub(super) fn validate_source(
@@ -626,56 +603,6 @@ fn owner_ipc_directory_is_usable(
     inspected
         && mode & platform_lib::S_IFMT == platform_lib::S_IFDIR
         && (directory_uid == 0 || directory_uid == owner_uid || process_owned)
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod macos_core_location_tests {
-    use super::is_permitted_macos_core_location;
-    use std::path::Path;
-
-    #[test]
-    fn accepts_a_system_applications_core() {
-        assert!(is_permitted_macos_core_location(
-            Path::new("/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo"),
-            None,
-        ));
-    }
-
-    #[test]
-    fn accepts_a_core_under_the_owners_own_applications() {
-        assert!(is_permitted_macos_core_location(
-            Path::new("/Users/someone/Applications/Clash Verge.app/core"),
-            Some(Path::new("/Users/someone/Applications")),
-        ));
-    }
-
-    #[test]
-    fn rejects_a_core_the_owner_could_have_dropped_anywhere() {
-        assert!(!is_permitted_macos_core_location(
-            Path::new("/tmp/verge-mihomo"),
-            Some(Path::new("/Users/someone/Applications")),
-        ));
-        assert!(!is_permitted_macos_core_location(
-            Path::new("/Users/someone/Downloads/verge-mihomo"),
-            Some(Path::new("/Users/someone/Applications")),
-        ));
-    }
-
-    #[test]
-    fn rejects_another_users_applications_directory() {
-        assert!(!is_permitted_macos_core_location(
-            Path::new("/Users/someone-else/Applications/evil.app/core"),
-            Some(Path::new("/Users/someone/Applications")),
-        ));
-    }
-
-    #[test]
-    fn does_not_accept_a_prefix_that_merely_looks_alike() {
-        assert!(!is_permitted_macos_core_location(
-            Path::new("/Applications-elsewhere/verge-mihomo"),
-            None,
-        ));
-    }
 }
 
 #[cfg(all(test, unix))]

@@ -51,6 +51,8 @@ mod state;
 mod status;
 #[cfg(feature = "test")]
 mod test_credentials;
+#[cfg(feature = "standalone")]
+mod trusted_core_location;
 #[cfg(all(feature = "standalone", unix))]
 mod unix_security;
 #[cfg(all(feature = "standalone", windows))]
