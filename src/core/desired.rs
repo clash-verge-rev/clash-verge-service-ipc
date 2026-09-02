@@ -1,9 +1,9 @@
-use crate::core::auth::{AuthenticatedOwner, hash_session_token};
+use crate::core::auth::{AuthenticatedOwner, ServiceError, hash_session_token};
 use crate::core::logger::set_or_update_writer;
 use crate::core::manager::CORE_MANAGER;
 use crate::core::paths::service_paths;
 use crate::core::state::set_core_lifecycle_state;
-use crate::{ClashConfig, OwnerIdentity, ServiceLifecycleState, WriterConfig};
+use crate::{ClashConfig, OwnerIdentity, ServiceErrorCode, ServiceLifecycleState, WriterConfig};
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -172,10 +172,10 @@ pub async fn restore_desired_state() -> Result<()> {
         .await
     {
         // A missing core path makes the desired state stale; retain intent for other errors.
-        if is_not_found_error(&error) {
+        if core_path_is_unusable(&error) {
             warn!(
-                "Core binary not found while restoring desired state (stale/translocated path?); \
-                 clearing desired core-run state to stop retrying: {error:#}"
+                "Persisted core path cannot be launched (missing, moved, or no longer in a \
+                 location this build trusts); clearing desired core-run state to stop retrying: {error:#}"
             );
             if let Err(clear_error) = persist_owner_core_stopped_by_key(&active_owner.owner_key).await {
                 warn!("Failed to clear stale desired state after not-found core path: {clear_error:#}");
@@ -189,12 +189,24 @@ pub async fn restore_desired_state() -> Result<()> {
     Ok(())
 }
 
-/// Returns whether the error chain contains an I/O `NotFound`.
-fn is_not_found_error(error: &anyhow::Error) -> bool {
+/// Returns whether the persisted core path can never launch, so retrying it is pointless.
+///
+/// Only a verdict from core-path validation counts. A bare `NotFound` anywhere in the chain used
+/// to qualify, which also caught unrelated failures such as a volatile IPC directory missing after
+/// a reboot and then wiped a perfectly good desired state; validation now reports a vanished
+/// binary as `InvalidRuntimeAsset`, so that broad match no longer buys anything.
+///
+/// A transient inspection failure (an I/O error while reading a path's metadata or ACL) also
+/// arrives under these codes and will clear the state. The cost is one manual restart on a machine
+/// whose filesystem is already failing, which is not worth a wire-visible error code to separate.
+fn core_path_is_unusable(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+        cause.downcast_ref::<ServiceError>().is_some_and(|service_error| {
+            matches!(
+                service_error.code,
+                ServiceErrorCode::InvalidInstallLocation | ServiceErrorCode::InvalidRuntimeAsset
+            )
+        })
     })
 }
 
@@ -597,5 +609,48 @@ mod owner_tests {
         assert_eq!(std::fs::read(&backup)?, br#"{"core_should_be_running":true}"#);
         std::fs::remove_dir_all(root)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod core_path_recovery_tests {
+    use super::core_path_is_unusable;
+    use crate::ServiceErrorCode;
+    use crate::core::auth::ServiceError;
+
+    #[test]
+    fn a_rejected_core_location_clears_the_desired_state_instead_of_wedging_startup() {
+        let error = anyhow::Error::new(ServiceError::new(
+            ServiceErrorCode::InvalidInstallLocation,
+            "core path is outside /Applications",
+        ))
+        .context("failed to start core");
+
+        assert!(core_path_is_unusable(&error));
+    }
+
+    #[test]
+    fn a_vanished_core_binary_is_still_treated_as_unusable() {
+        let error = anyhow::Error::new(ServiceError::new(
+            ServiceErrorCode::InvalidRuntimeAsset,
+            "core is unavailable: No such file or directory (os error 2)",
+        ));
+
+        assert!(core_path_is_unusable(&error));
+    }
+
+    #[test]
+    fn a_missing_volatile_ipc_directory_no_longer_wipes_a_good_desired_state() {
+        let error = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("failed to open core IPC directory");
+
+        assert!(!core_path_is_unusable(&error));
+    }
+
+    #[test]
+    fn an_unrelated_start_failure_retains_the_desired_state() {
+        let error = anyhow::anyhow!("core IPC socket did not appear");
+
+        assert!(!core_path_is_unusable(&error));
     }
 }

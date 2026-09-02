@@ -378,7 +378,7 @@ pub(super) async fn gather_bundle(
 /// The service executes this path as root or LocalSystem, so the location has to be one the
 /// requesting owner could not have written. Owner identity says nothing here: any local account
 /// may become an owner.
-pub(super) fn validate_core_path(core_path: &str) -> Result<PathBuf, ServiceError> {
+pub(crate) fn validate_core_path(core_path: &str) -> Result<PathBuf, ServiceError> {
     let requested = Path::new(core_path);
     let canonical = canonical_regular_file(requested, "core")?;
     require_trusted_core_location(&canonical)?;
