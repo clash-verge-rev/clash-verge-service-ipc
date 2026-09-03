@@ -12,6 +12,24 @@ use shared::run_command;
 use shared::uninstall_old_service;
 use shared::{enter_repair_gate, run_maintenance_if_requested};
 
+/// Removes the cores the installer published, as far as the filesystem allows.
+///
+/// Best-effort by design: this runs after the service is already deleted, and a leftover core
+/// process or a scanner holding a file open must not turn a completed uninstall into a reported
+/// failure. What stays behind is admin-only and inert without the service.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn remove_installed_cores() {
+    let cores = clash_verge_service_ipc::service_paths().core_dir();
+    match std::fs::remove_dir_all(&cores) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "Could not remove core directory {cores:?}: {error}. \
+             A process may still hold a core open; this does not affect the uninstall."
+        ),
+    }
+}
+
 #[cfg(any(windows, test))]
 fn poll_until<T>(
     max_attempts: usize,
@@ -66,6 +84,8 @@ fn main() -> Result<(), Error> {
             .map_err(|e| anyhow::anyhow!("Failed to remove bundle directory: {}", e))?;
     }
 
+    remove_installed_cores();
+
     Ok(())
 }
 
@@ -94,6 +114,10 @@ fn main() -> Result<(), Error> {
         std::fs::remove_file(&target)
             .map_err(|error| anyhow::anyhow!("Failed to remove service binary {target:?}: {error}"))?;
     }
+    // A fallback publish may have displaced a locked service image aside; best-effort.
+    let _ = std::fs::remove_file(target.with_extension(clash_verge_service_ipc::CORE_DISPLACED_EXTENSION));
+
+    remove_installed_cores();
 
     Ok(())
 }
@@ -124,49 +148,58 @@ fn main() -> anyhow::Result<()> {
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
     let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
-    let service = service_manager.open_service(clash_verge_service_ipc::WINDOWS_SERVICE_NAME, service_access)?;
-
-    let service_status = service.query_status()?;
-    if service_status.current_state != ServiceState::Stopped {
-        if let Err(error) = service.stop()
-            && !has_raw_error(&error, ERROR_SERVICE_NOT_ACTIVE)
-        {
-            return Err(error.into());
-        }
-        poll_until(
-            POLL_ATTEMPTS,
-            || {
-                let status = service.query_status()?;
-                Ok((status.current_state == ServiceState::Stopped).then_some(()))
-            },
-            || thread::sleep(POLL_INTERVAL),
-            "timed out waiting for service to stop",
-        )?;
-    }
-
-    service.delete()?;
-    drop(service);
-    poll_until(
-        POLL_ATTEMPTS,
-        || match service_manager.open_service(
-            clash_verge_service_ipc::WINDOWS_SERVICE_NAME,
-            ServiceAccess::QUERY_STATUS,
-        ) {
-            Ok(service) => {
-                drop(service);
-                Ok(None)
+    match service_manager.open_service(clash_verge_service_ipc::WINDOWS_SERVICE_NAME, service_access) {
+        Ok(service) => {
+            let service_status = service.query_status()?;
+            if service_status.current_state != ServiceState::Stopped {
+                if let Err(error) = service.stop()
+                    && !has_raw_error(&error, ERROR_SERVICE_NOT_ACTIVE)
+                {
+                    return Err(error.into());
+                }
+                poll_until(
+                    POLL_ATTEMPTS,
+                    || {
+                        let status = service.query_status()?;
+                        Ok((status.current_state == ServiceState::Stopped).then_some(()))
+                    },
+                    || thread::sleep(POLL_INTERVAL),
+                    "timed out waiting for service to stop",
+                )?;
             }
-            Err(error) if has_raw_error(&error, ERROR_SERVICE_DOES_NOT_EXIST) => Ok(Some(())),
-            Err(error) => Err(error.into()),
-        },
-        || thread::sleep(POLL_INTERVAL),
-        "timed out waiting for service deletion",
-    )?;
+
+            service.delete()?;
+            drop(service);
+            poll_until(
+                POLL_ATTEMPTS,
+                || match service_manager.open_service(
+                    clash_verge_service_ipc::WINDOWS_SERVICE_NAME,
+                    ServiceAccess::QUERY_STATUS,
+                ) {
+                    Ok(service) => {
+                        drop(service);
+                        Ok(None)
+                    }
+                    Err(error) if has_raw_error(&error, ERROR_SERVICE_DOES_NOT_EXIST) => Ok(Some(())),
+                    Err(error) => Err(error.into()),
+                },
+                || thread::sleep(POLL_INTERVAL),
+                "timed out waiting for service deletion",
+            )?;
+        }
+        // A previous run may have deleted the service and then failed before the file cleanup
+        // below; a rerun must finish that cleanup rather than stop at the missing service.
+        Err(error) if has_raw_error(&error, ERROR_SERVICE_DOES_NOT_EXIST) => {}
+        Err(error) => return Err(error.into()),
+    }
     let target = clash_verge_service_ipc::prepare_service_install_directory()?.join("clash-verge-service.exe");
     if target.exists() {
         std::fs::remove_file(&target)
             .map_err(|error| anyhow::anyhow!("Failed to remove service binary {target:?}: {error}"))?;
     }
+    // A fallback publish may have displaced a locked service image aside; best-effort.
+    let _ = std::fs::remove_file(target.with_extension(clash_verge_service_ipc::CORE_DISPLACED_EXTENSION));
+    remove_installed_cores();
     println!("Service uninstalled successfully. Resource cleanup warnings can be ignored.");
     Ok(())
 }
