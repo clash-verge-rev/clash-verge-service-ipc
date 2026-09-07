@@ -149,7 +149,7 @@ pub async fn restore_desired_state() -> Result<()> {
     let state = load_owner_desired_state(&active_owner.owner_key).await?;
 
     if let Some(writer_config) = state.last_writer_config.as_ref()
-        && let Err(error) = set_or_update_writer(writer_config).await
+        && let Err(error) = set_or_update_writer(writer_config)
     {
         warn!("Failed to restore writer config: {}", error);
     }
