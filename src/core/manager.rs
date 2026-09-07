@@ -1,5 +1,5 @@
 use crate::core::ClashConfig;
-use crate::core::logger::{get_writer, set_or_update_writer};
+use crate::core::logger::{LOG_RING, set_or_update_writer, write_core_line};
 use crate::core::process::process_identity;
 use crate::core::reconcile::ensure_startup_reconciled;
 use crate::core::runtime::{CoreRuntimeRecord, remove_core_runtime_record, write_core_runtime_record};
@@ -7,10 +7,6 @@ use crate::core::state::set_core_lifecycle_state;
 use crate::core::structure::ServiceLifecycleState;
 use crate::{OwnerIdentity, WriterConfig};
 use anyhow::{Context as _, Result, anyhow};
-use clash_verge_logger::AsyncLogger;
-use compact_str::CompactString;
-use flexi_logger::writers::LogWriter;
-use flexi_logger::{DeferredNow, Record};
 use once_cell::sync::Lazy;
 use std::process::Stdio;
 #[cfg(feature = "test")]
@@ -360,7 +356,7 @@ impl CoreManager {
 
     pub async fn stop_core(&self) -> Result<()> {
         info!("Stopping core");
-        LOGGER_MANAGER.clear_logs().await;
+        LOG_RING.clear_logs();
 
         let watchdog_result = self.stop_watchdog().await;
         let mut recovered_failed_child = false;
@@ -638,7 +634,7 @@ impl CoreManager {
         {
             let _ = core_ipc_path;
         }
-        LOGGER_MANAGER.clear_logs().await;
+        LOG_RING.clear_logs();
     }
 }
 
@@ -648,7 +644,7 @@ pub async fn run_with_logging(
     writer_config: &WriterConfig,
     owner: &OwnerIdentity,
 ) -> Result<ChildGuard> {
-    set_or_update_writer(writer_config).await?;
+    set_or_update_writer(writer_config)?;
 
     #[cfg(windows)]
     let child = {
@@ -689,52 +685,23 @@ pub async fn run_with_logging(
         return Err(anyhow!("Failed to capture child output"));
     };
 
-    let stdout_handle = tokio::spawn(async move {
-        let mut stdout_reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = stdout_reader.next_line().await {
-            let message = CompactString::from(line.as_str());
-            {
-                if let Some(shared_writer) = get_writer() {
-                    let w = shared_writer.lock().await;
-                    let mut now = DeferredNow::default();
-                    let arg = format_args!("{}", line);
-                    let record = Record::builder()
-                        .args(arg)
-                        .level(log::Level::Info)
-                        .target("service")
-                        .build();
-                    let _ = w.write(&mut now, &record);
-                }
-            }
-            LOGGER_MANAGER.append_log(message).await;
-        }
-    });
-
-    let stderr_handle = tokio::spawn(async move {
-        let mut stderr_reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = stderr_reader.next_line().await {
-            let message = CompactString::from(line.as_str());
-            {
-                if let Some(shared_writer) = get_writer() {
-                    let w = shared_writer.lock().await;
-                    let mut now = DeferredNow::default();
-                    let arg = format_args!("{}", line);
-                    let record = Record::builder()
-                        .args(arg)
-                        .level(log::Level::Error)
-                        .target("service")
-                        .build();
-                    let _ = w.write(&mut now, &record);
-                }
-            }
-            LOGGER_MANAGER.append_log(message).await;
-        }
-    });
-
-    child_guard.readers.push(stdout_handle);
-    child_guard.readers.push(stderr_handle);
+    child_guard.readers.push(spawn_line_reader(stdout, log::Level::Info));
+    child_guard.readers.push(spawn_line_reader(stderr, log::Level::Error));
 
     Ok(child_guard)
+}
+
+fn spawn_line_reader<R>(reader: R, level: log::Level) -> JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            write_core_line(level, &line);
+            LOG_RING.append_log(line);
+        }
+    })
 }
 
 fn prepare_core_ipc_socket(core_ipc_path: &str, owner: &OwnerIdentity) -> Result<()> {
@@ -989,8 +956,6 @@ fn windows_owner_pipe_sddl(sid: &str) -> String {
 }
 
 pub static CORE_MANAGER: Lazy<Arc<Mutex<CoreManager>>> = Lazy::new(|| Arc::new(Mutex::new(CoreManager::new())));
-
-pub static LOGGER_MANAGER: Lazy<Arc<AsyncLogger>> = Lazy::new(|| Arc::new(AsyncLogger::new()));
 
 #[cfg(all(test, unix))]
 mod tests {

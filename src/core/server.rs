@@ -6,8 +6,8 @@ use crate::core::desired::{
     persist_owner_core_stopped, persist_owner_core_stopped_by_key, persist_owner_writer_config,
 };
 use crate::core::legacy_cleanup::cleanup_legacy_owner_files;
-use crate::core::logger::set_or_update_writer;
-use crate::core::manager::{CORE_MANAGER, LOGGER_MANAGER};
+use crate::core::logger::{LOG_RING, flush_writer, set_or_update_writer};
+use crate::core::manager::CORE_MANAGER;
 use crate::core::paths::service_paths;
 use crate::core::runtime_generation::{PreparedRuntime, prepare_runtime, stage_runtime};
 use crate::core::state::{set_core_lifecycle_state, set_service_lifecycle_state};
@@ -328,6 +328,13 @@ pub async fn stop_ipc_server() -> Result<()> {
 }
 
 pub async fn run_ipc_supervisor_until_shutdown(shutdown: impl Future<Output = ()>) -> AnyResult<()> {
+    let result = run_supervisor(shutdown).await;
+    // Do not rely on the periodic flusher at process exit.
+    flush_writer();
+    result
+}
+
+async fn run_supervisor(shutdown: impl Future<Output = ()>) -> AnyResult<()> {
     set_service_lifecycle_state(ServiceLifecycleState::Starting);
     info!("Starting IPC server...");
 
@@ -676,7 +683,7 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Continue(guard) => guard,
                 ControlFlow::Break(response) => return response,
             };
-            ok_json(LOGGER_MANAGER.get_logs().await)
+            ok_json(LOG_RING.get_logs())
         })
         .get(IpcCommand::GetClashLogSnapshot.as_ref(), |ctx| async move {
             trace!("Received GetClashLogSnapshot command");
@@ -763,7 +770,7 @@ fn create_ipc_router() -> Result<Router> {
                 .logs_dir()
                 .to_string_lossy()
                 .into_owned();
-            match set_or_update_writer(&writer_config).await {
+            match set_or_update_writer(&writer_config) {
                 Ok(_) => info!("Update writer successfully"),
                 Err(e) => {
                     return service_unavailable(format!("Failed to update writer: {}", e));

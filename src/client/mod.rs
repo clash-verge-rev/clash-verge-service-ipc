@@ -4,7 +4,6 @@ use std::{path::Path, sync::Arc, time::Duration};
 use anyhow::Result;
 #[cfg(unix)]
 use anyhow::{Result, anyhow};
-use compact_str::CompactString;
 use kode_bridge::{ClientConfig, IpcHttpClient};
 use log::{debug, warn};
 use once_cell::sync::Lazy;
@@ -191,7 +190,7 @@ pub async fn start_clash(
     .await
 }
 
-pub async fn get_clash_logs(credentials: &OwnerCredentials) -> Result<Response<Vec<CompactString>>> {
+pub async fn get_clash_logs(credentials: &OwnerCredentials) -> Result<Response<Vec<String>>> {
     protected_call(Verb::Get, IpcCommand::GetClashLogs, credentials, None, (), None).await
 }
 
