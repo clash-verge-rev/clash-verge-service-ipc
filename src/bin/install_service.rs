@@ -268,7 +268,7 @@ fn parse_sha256_hex(value: &str) -> Result<[u8; 32], Error> {
         bail!("--sha256 expects 64 hex characters, got {value:?}");
     }
     let mut digest = [0u8; 32];
-    for (index, chunk) in bytes.chunks_exact(2).enumerate() {
+    for (index, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
         digest[index] = u8::from_str_radix(std::str::from_utf8(chunk)?, 16)?;
     }
     Ok(digest)
