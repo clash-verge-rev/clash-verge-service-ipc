@@ -194,8 +194,11 @@ fn propagate_source_modified_time(staged: &Path, source_metadata: &std::fs::Meta
     let modified = source_metadata
         .modified()
         .with_context(|| format!("source of {staged:?} carries no modified time"))?;
+    // Unix staging files are already 0550; their owner can set times through a read-only
+    // descriptor. Windows needs write access for SetFileTime.
     let file = OpenOptions::new()
-        .write(true)
+        .read(!cfg!(windows))
+        .write(cfg!(windows))
         .open(staged)
         .with_context(|| format!("failed to reopen staged binary {staged:?}"))?;
     file.set_times(std::fs::FileTimes::new().set_modified(modified))
@@ -889,6 +892,10 @@ mod install_core_tests {
         let root = scratch("stamp")?;
         let source = root.join("verge-mihomo");
         std::fs::write(&source, b"core bytes")?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)?
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))?;
 
         let target = install_core(&source, &root.join("cores"), source.file_name().unwrap(), None)?;
 
@@ -898,6 +905,11 @@ mod install_core_tests {
             std::fs::metadata(&target)?.modified()?,
             "the copy must carry the source's modified time for drift detection"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&target)?.permissions().mode() & 0o777, 0o550);
+        }
         std::fs::remove_dir_all(&root)?;
         Ok(())
     }
@@ -933,10 +945,32 @@ mod install_core_tests {
         let cores = root.join("cores");
 
         let first = install_core(&source, &cores, source.file_name().unwrap(), None)?;
+        #[cfg(unix)]
+        let first_metadata = std::fs::metadata(&first)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)?
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))?;
         let second = install_core(&source, &cores, source.file_name().unwrap(), None)?;
 
         assert_eq!(first, second);
         assert_eq!(std::fs::read(&second)?, b"core bytes");
+        assert_eq!(
+            std::fs::metadata(&second)?.modified()?,
+            std::fs::metadata(&source)?.modified()?,
+            "an unchanged core must still refresh its modified time"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            let second_metadata = std::fs::metadata(&second)?;
+            assert_eq!(
+                first_metadata.ino(),
+                second_metadata.ino(),
+                "must not republish the core"
+            );
+            assert_eq!(second_metadata.permissions().mode() & 0o777, 0o550);
+        }
         std::fs::remove_dir_all(&root)?;
         Ok(())
     }
