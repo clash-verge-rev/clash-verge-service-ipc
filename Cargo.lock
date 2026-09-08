@@ -114,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "clash_verge_service_ipc"
-version = "2.6.7"
+version = "2.6.8"
 dependencies = [
  "anyhow",
  "flexi_logger",

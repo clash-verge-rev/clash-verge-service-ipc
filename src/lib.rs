@@ -15,15 +15,15 @@ pub use core::{
     SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot, StageRejection,
     StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig, mihomo_ipc_path, owner_key,
 };
-pub use core::{OwnerPaths, ServicePaths, service_paths};
+pub use core::{CORE_DISPLACED_EXTENSION, CORE_STAGING_EXTENSION, OwnerPaths, ServicePaths, service_paths};
 
 #[cfg(feature = "standalone")]
 pub use core::{
     ActiveOwnerState, DesiredState, REPAIR_IN_PROGRESS_EXIT_CODE, ServiceOwnerGuard, ServiceRepairGate,
     acquire_service_owner, acquire_service_repair_gate, cleanup_stale_owner_state, load_active_owner,
-    load_owner_desired_state, prepare_service_install_directory, reconcile_service_startup, restore_desired_state,
-    run_ipc_server, run_ipc_supervisor_until_shutdown, service_lifecycle_state, set_service_lifecycle_state,
-    stop_ipc_server,
+    load_owner_desired_state, prepare_core_install_directory, prepare_service_install_directory,
+    reconcile_service_startup, require_trusted_core_source, restore_desired_state, run_ipc_server,
+    run_ipc_supervisor_until_shutdown, service_lifecycle_state, set_service_lifecycle_state, stop_ipc_server,
 };
 
 #[cfg(feature = "test")]

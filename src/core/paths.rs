@@ -1,6 +1,20 @@
 use crate::core::structure::{OwnerIdentity, owner_key};
 use std::path::{Path, PathBuf};
 
+/// Extension the installer parks half-written copies under, beside their target.
+///
+/// The core resolution refuses names carrying it, so an installer that crashed mid-copy can never
+/// leave bytes in the core directory that the service would execute.
+pub const CORE_STAGING_EXTENSION: &str = "next";
+
+/// Extension a still-running core is moved aside under while its replacement is published.
+///
+/// Windows will rename a running executable but not overwrite it, so publishing over a live core
+/// displaces the old file here first. Refused by the core resolution and swept by the installer
+/// for the same reason as [`CORE_STAGING_EXTENSION`]: nothing an install left behind may ever be
+/// something the service will run.
+pub const CORE_DISPLACED_EXTENSION: &str = "old";
+
 #[derive(Debug, Clone)]
 pub struct ServicePaths {
     runtime_dir: PathBuf,
@@ -48,6 +62,19 @@ impl ServicePaths {
 
     pub fn install_dir(&self) -> PathBuf {
         self.persistent_state_dir.join("bin")
+    }
+
+    /// Holds the copies of the core binaries that the service is willing to execute.
+    ///
+    /// See [`CORE_STAGING_EXTENSION`] and [`CORE_DISPLACED_EXTENSION`] for the two name shapes
+    /// inside it that are never runnable.
+    ///
+    /// The client names a core by path, but the service never runs the client's copy: an install
+    /// directory the requesting account can write is an invitation to hand root different bytes.
+    /// Only a privileged installer can populate this directory, so what lands here is what an
+    /// administrator approved.
+    pub fn core_dir(&self) -> PathBuf {
+        self.persistent_state_dir.join("cores")
     }
 
     pub fn active_owner_path(&self) -> PathBuf {
@@ -128,6 +155,23 @@ pub fn prepare_service_install_directory() -> anyhow::Result<PathBuf> {
     platform_security::ensure_private_installer_directory(root)?;
     platform_security::ensure_private_installer_directory(&install)?;
     Ok(install)
+}
+
+/// Prepares the directory the privileged installer stages approved cores into.
+///
+/// Deliberately not part of `ensure_persistent_state_layout`: the service runs as root or
+/// LocalSystem and would claim ownership, while the installer runs as an elevated administrator.
+/// Letting both create it would flip the owner back and forth on every start.
+#[cfg(feature = "standalone")]
+pub fn prepare_core_install_directory() -> anyhow::Result<PathBuf> {
+    let paths = service_paths();
+    let root = paths.persistent_state_dir();
+    let cores = paths.core_dir();
+    use crate::core::platform_security;
+
+    platform_security::ensure_private_installer_directory(root)?;
+    platform_security::ensure_private_installer_directory(&cores)?;
+    Ok(cores)
 }
 
 #[cfg(feature = "standalone")]

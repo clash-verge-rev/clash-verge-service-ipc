@@ -647,8 +647,8 @@ pub async fn run_with_logging(
     // Every spawn is checked here rather than at the IPC boundary alone: desired-state
     // restoration and watchdog restarts reach this point without passing through
     // `prepare_runtime`, and state written by an older build can name a path this build refuses.
-    let bin_path = crate::core::runtime_generation::validate_core_path(bin_path)?;
-    let bin_path = bin_path.as_path();
+    let core = crate::core::runtime_generation::validate_core_path(bin_path)?;
+    let bin_path = core.executable();
     set_or_update_writer(writer_config)?;
 
     #[cfg(windows)]

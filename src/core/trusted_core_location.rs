@@ -1,13 +1,19 @@
-//! Decides whether a client-supplied core binary sits where only a privileged account can write.
+//! Decides whether a core binary sits where only a privileged account can write.
 //!
-//! The service runs as root or LocalSystem and executes the requested core verbatim, so an owner
-//! who can name any file also names what root runs. Owner authentication cannot carry that weight:
-//! every local account may legitimately become an owner, so the trust has to come from the
-//! location instead.
+//! The service runs as root or LocalSystem, so an owner who can name any file would otherwise also
+//! name what root runs. Owner authentication cannot carry that weight: every local account may
+//! legitimately become an owner, so the trust has to come from the location instead.
+//!
+//! This is applied to the copy the installer staged, not to the path the client named. Demanding
+//! that the client's own install directory be unwritable held for `%ProgramFiles%` but rejected
+//! every operator who installed anywhere else; see `runtime_generation::assets::validate_core_path`.
+//! What remains here is a check on the service's own directory, which passes by construction and is
+//! worth keeping for exactly that reason: a directory that fails it is one someone has been
+//! rearranging.
 
 use crate::ServiceErrorCode;
 use crate::core::auth::ServiceError;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Rejects a core the requesting account could have written.
 ///
@@ -20,16 +26,64 @@ pub(crate) fn require_trusted_core_location(canonical: &Path) -> Result<(), Serv
     check_platform_location(canonical)
 }
 
-fn untrusted(message: impl Into<String>) -> ServiceError {
+/// Builds the error every location-trust refusal carries; shared with the core resolution in
+/// `runtime_generation::assets`, which enforces the same property on the approved copy.
+pub(crate) fn untrusted(message: impl Into<String>) -> ServiceError {
     ServiceError::new(ServiceErrorCode::InvalidInstallLocation, message)
+}
+
+/// Decides whether a core SOURCE sits where only a privileged account can write, and returns the
+/// canonical path the verdict was rendered for.
+///
+/// The installer consults this before auto-staging a bundled core. A source that fails carries
+/// whatever bytes the directory's writers last put there, and an elevated copy would launder those
+/// bytes into the directory root executes from; such a source is staged only through an explicit
+/// `--install-core` carrying a `--sha256` attestation of the bytes the caller actually obtained.
+///
+/// Callers must copy FROM THE RETURNED PATH. The argument may travel through a link or junction a
+/// non-privileged account can retarget between this check and the copy; the canonical path has
+/// every link resolved, and the check just proved that only privileged accounts can rearrange any
+/// of its components.
+pub fn require_trusted_core_source(path: &Path) -> anyhow::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| anyhow::anyhow!("failed to canonicalize core source {path:?}: {error}"))?;
+    require_trusted_core_location(&canonical)?;
+    Ok(canonical)
 }
 
 #[cfg(target_os = "macos")]
 fn check_platform_location(canonical: &Path) -> Result<(), ServiceError> {
+    // The copy the service actually runs is staged under the installer-owned state root, which is
+    // created root-owned and 0700. The walk stops there rather than continuing to `/`: above it
+    // sits `/Library/Application Support`, which macOS ships writable by the `admin` group. That
+    // is the same exposure `/Applications` has always carried, and the reason ownership alone was
+    // never able to carry this check on macOS.
+    let paths = crate::core::paths::service_paths();
+    let state_root = paths.persistent_state_dir();
+    if canonical.starts_with(state_root) {
+        return require_root_owned_chain(canonical, Some(state_root));
+    }
     if !is_trusted_macos_location(canonical) {
         return Err(untrusted(format!(
-            "core path {canonical:?} is outside {MACOS_APPLICATIONS_ROOT}"
+            "core path {canonical:?} is under neither {state_root:?} nor {MACOS_APPLICATIONS_ROOT}"
         )));
+    }
+    // The prefix says which neighborhood the file lives in, not who could have rewritten it.
+    // Below `/Applications`, refuse anything group- or other-writable; the root itself stays
+    // exempt because macOS ships it admin-group-writable by design, which is the exposure this
+    // prefix rule accepted from the start. Drag-installed bundles arrive 0755 and pass.
+    use std::os::unix::fs::MetadataExt as _;
+    for component in canonical.ancestors() {
+        if component == Path::new(MACOS_APPLICATIONS_ROOT) {
+            break;
+        }
+        let metadata = std::fs::symlink_metadata(component)
+            .map_err(|error| untrusted(format!("failed to inspect core path {component:?}: {error}")))?;
+        if metadata.mode() & 0o022 != 0 {
+            return Err(untrusted(format!(
+                "core path {component:?} is writable by group or other"
+            )));
+        }
     }
     Ok(())
 }
@@ -50,6 +104,15 @@ fn is_trusted_macos_location(canonical: &Path) -> bool {
 /// Packaged installs land in root-owned prefixes, so this holds for DEB and RPM builds.
 #[cfg(target_os = "linux")]
 fn check_platform_location(canonical: &Path) -> Result<(), ServiceError> {
+    require_root_owned_chain(canonical, None)
+}
+
+/// Requires every component up the tree to be root-owned and unwritable by group or other.
+///
+/// `stop_after` bounds the walk at a directory whose own parents the operating system manages, for
+/// platforms where those parents are deliberately group-writable.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn require_root_owned_chain(canonical: &Path, stop_after: Option<&Path>) -> Result<(), ServiceError> {
     use std::os::unix::fs::MetadataExt as _;
 
     for component in canonical.ancestors() {
@@ -62,6 +125,9 @@ fn check_platform_location(canonical: &Path) -> Result<(), ServiceError> {
             return Err(untrusted(format!(
                 "core path {component:?} is writable by group or other"
             )));
+        }
+        if stop_after == Some(component) {
+            break;
         }
     }
     Ok(())
@@ -109,8 +175,9 @@ mod windows_location {
         | GENERIC_ALL;
 
     /// Rights that let a principal swap out a directory on the way to the core. Adding entries to
-    /// a directory is deliberately absent: the stock `C:\` DACL grants `BUILTIN\Users`
-    /// add-subdirectory, and that cannot replace a child that already exists.
+    /// a directory is deliberately absent: the stock `C:\` DACL grants `Authenticated Users`
+    /// add-subdirectory through `(A;;LC;;;AU)`, and that cannot replace a child that already
+    /// exists. `BUILTIN\Users` holds only read and execute there, so it is not the reason.
     const DIRECTORY_HIJACK_RIGHTS: u32 = DELETE | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
 
     pub(super) fn check(canonical: &Path) -> Result<(), ServiceError> {
@@ -351,9 +418,14 @@ mod production_gate_tests {
     #[test]
     fn the_production_gate_rejects_a_core_outside_applications() {
         assert!(require_trusted_core_location(Path::new("/tmp/verge-mihomo")).is_err());
+        // Ships with macOS as root-owned 0755, so it exercises the accept path with a real chain;
+        // a fictional bundle path would now fail the writability inspection on a missing file.
+        assert!(require_trusted_core_location(Path::new("/Applications/Utilities")).is_ok());
         assert!(
-            require_trusted_core_location(Path::new("/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo"))
-                .is_ok()
+            require_trusted_core_location(Path::new(
+                "/Applications/does-not-exist.app/Contents/MacOS/verge-mihomo"
+            ))
+            .is_err()
         );
     }
 }

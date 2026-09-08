@@ -11,9 +11,11 @@ pub use structure::{
 };
 
 pub mod paths;
+pub use paths::{
+    CORE_DISPLACED_EXTENSION, CORE_STAGING_EXTENSION, OwnerPaths, ServicePaths, mihomo_ipc_path, service_paths,
+};
 #[cfg(feature = "standalone")]
-pub use paths::prepare_service_install_directory;
-pub use paths::{OwnerPaths, ServicePaths, mihomo_ipc_path, service_paths};
+pub use paths::{prepare_core_install_directory, prepare_service_install_directory};
 
 #[cfg(feature = "standalone")]
 mod atomic_file;
@@ -88,3 +90,5 @@ pub use state::{service_lifecycle_state, set_service_lifecycle_state};
 pub use test_credentials::test_owner_credentials;
 #[cfg(all(feature = "test", unix))]
 pub use test_credentials::test_owner_credentials_for_uid;
+#[cfg(feature = "standalone")]
+pub use trusted_core_location::require_trusted_core_source;

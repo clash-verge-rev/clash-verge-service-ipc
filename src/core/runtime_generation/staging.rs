@@ -163,16 +163,15 @@ pub(crate) async fn stage_runtime(
         });
     };
 
-    let core_path = validate_core_path(&bundle.core_path)?;
-    if Path::new(&running.core_config.core_path) != core_path {
+    let core = validate_core_path(&bundle.core_path)?;
+    if Path::new(&running.core_config.core_path) != core.executable() {
         return Ok(StageRuntimeOutcome::RestartRequired {
             reason: StageRejection::CorePathChanged,
         });
     }
 
     let generation = PathBuf::from(&running.core_config.config_dir);
-    let super::assets::GatheredBundle { sources, remote } =
-        super::assets::gather_bundle(owner, bundle, &core_path).await?;
+    let super::assets::GatheredBundle { sources, remote } = super::assets::gather_bundle(owner, bundle, &core).await?;
 
     let previous = match read_manifest(&generation).await {
         Ok(previous) => previous,
