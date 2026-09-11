@@ -24,7 +24,7 @@ static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> = Lazy::new(|| Arc::n
 
 static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
-// Chunk responses exceed the control-message budget; mid-body retries can reuse a dirty connection.
+// Large cache chunks need a longer timeout than control messages.
 const RUNTIME_FILE_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn protected<'a>(request: kode_bridge::HttpRequestBuilder<'a>) -> kode_bridge::HttpRequestBuilder<'a> {
