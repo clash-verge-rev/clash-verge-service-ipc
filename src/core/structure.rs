@@ -62,6 +62,11 @@ impl ProtocolInfo {
         self.protocol.epoch == ProtocolVersion::current().epoch
             && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING
     }
+
+    pub const fn supports_runtime_file_read(&self) -> bool {
+        self.protocol.epoch == ProtocolVersion::current().epoch
+            && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_RUNTIME_FILE_READ
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +187,28 @@ pub enum StageRejection {
     },
     /// The running core changed during staging.
     CoreRestarted,
+}
+
+/// Chunk request for a manifest-declared provider cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeFileRequest {
+    /// Destination declared in the runtime bundle.
+    pub destination: String,
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RuntimeFileOutcome {
+    Chunk {
+        /// Hex-encoded bytes starting at the requested offset; empty once the offset reaches `len`.
+        hex: String,
+        /// Total file length; changes invalidate an in-progress read.
+        len: u64,
+        /// Unix-epoch nanoseconds; tagged enums cannot deserialize `u128`.
+        mtime_ns: Option<u64>,
+    },
+    Absent,
 }
 
 #[repr(u16)]

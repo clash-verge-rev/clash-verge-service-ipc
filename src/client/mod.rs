@@ -15,8 +15,8 @@ mod windows_identity;
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
     MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof, ProtocolInfo,
-    ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, ServiceStatusSnapshot, StageRuntimeOutcome, StartClashRequest,
-    StartClashResult, WriterConfig,
+    ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, ServiceStatusSnapshot,
+    StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
@@ -24,6 +24,8 @@ static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> = Lazy::new(|| Arc::n
 
 static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+// Chunk responses exceed the control-message budget; mid-body retries can reuse a dirty connection.
+const RUNTIME_FILE_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn protected<'a>(request: kode_bridge::HttpRequestBuilder<'a>) -> kode_bridge::HttpRequestBuilder<'a> {
     request.header(
@@ -225,6 +227,23 @@ pub async fn stage_runtime(
         Some(session),
         body.clone(),
         Some(LIFECYCLE_TIMEOUT),
+    )
+    .await
+}
+
+/// Requires [`ProtocolInfo::supports_runtime_file_read`]; advance `offset` until `len` is reached.
+pub async fn read_runtime_file(
+    credentials: &OwnerCredentials,
+    session: &OwnerSessionProof,
+    body: &RuntimeFileRequest,
+) -> Result<Response<RuntimeFileOutcome>> {
+    protected_call(
+        Verb::Get,
+        IpcCommand::ReadRuntimeFile,
+        credentials,
+        Some(session),
+        body.clone(),
+        Some(RUNTIME_FILE_TIMEOUT),
     )
     .await
 }

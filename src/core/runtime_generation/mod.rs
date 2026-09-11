@@ -3,7 +3,9 @@
 //! therefore plans first and declines whenever it cannot preserve consistency.
 
 mod assets;
+mod readback;
 mod staging;
 
 pub(crate) use assets::{PreparedRuntime, prepare_runtime, validate_core_path};
+pub(crate) use readback::read_runtime_file;
 pub(crate) use staging::stage_runtime;

@@ -9,15 +9,15 @@ use crate::core::legacy_cleanup::cleanup_legacy_owner_files;
 use crate::core::logger::{LOG_RING, flush_writer, set_or_update_writer};
 use crate::core::manager::CORE_MANAGER;
 use crate::core::paths::service_paths;
-use crate::core::runtime_generation::{PreparedRuntime, prepare_runtime, stage_runtime};
+use crate::core::runtime_generation::{PreparedRuntime, prepare_runtime, read_runtime_file, stage_runtime};
 use crate::core::state::{set_core_lifecycle_state, set_service_lifecycle_state};
 use crate::core::status::service_status_snapshot;
 use crate::core::structure::{OwnerSessionProof, Response, ServiceLifecycleState};
 use crate::core::{apply_proxy, apply_proxy_or_direct, clear_proxy, validate_proxy_config};
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IpcCommand, MIN_SUPPORTED_CLIENT_REVISION, MacosProxyConfig,
-    OwnerSessionHandle, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, SERVICE_PROTOCOL_HEADER,
-    StartClashRequest, StartClashResult, WriterConfig,
+    OwnerSessionHandle, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, RuntimeFileRequest,
+    SERVICE_PROTOCOL_HEADER, StartClashRequest, StartClashResult, WriterConfig,
 };
 use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
@@ -748,6 +748,23 @@ fn create_ipc_router() -> Result<Router> {
                     ControlFlow::Break(response) => return response,
                 };
             match stage_runtime(&owner, &request.payload).await {
+                Ok(outcome) => ok_json(outcome),
+                Err(error) => service_error(error),
+            }
+        })
+        .get(IpcCommand::ReadRuntimeFile.as_ref(), |ctx| async move {
+            trace!("Received ReadRuntimeFile command");
+            let (request, owner) = match authenticate_request::<AuthenticatedSessionRequest<RuntimeFileRequest>>(&ctx) {
+                ControlFlow::Continue(authenticated) => authenticated,
+                ControlFlow::Break(response) => return response,
+            };
+            // Reads require the session that owns the running core.
+            let _lifecycle_guard =
+                match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveSession(&request.session)).await {
+                    ControlFlow::Continue(guard) => guard,
+                    ControlFlow::Break(response) => return response,
+                };
+            match read_runtime_file(&owner, &request.payload.destination, request.payload.offset).await {
                 Ok(outcome) => ok_json(outcome),
                 Err(error) => service_error(error),
             }

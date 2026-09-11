@@ -563,6 +563,11 @@ pub(super) fn destination_key(destination: &Path) -> Result<String, ServiceError
                 "runtime asset destination {part:?} is reserved for staging temporaries"
             )));
         }
+        if is_windows_alias(&part) {
+            return Err(invalid_asset(format!(
+                "runtime asset destination {part:?} names another file on Windows filesystems"
+            )));
+        }
         parts.push(part.into_owned());
     }
     match parts.as_slice() {
@@ -594,6 +599,18 @@ fn is_staging_temporary(name: &str) -> bool {
             && !sequence.is_empty()
             && pid.bytes().all(|byte| byte.is_ascii_digit())
             && sequence.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+// Reject Win32 filename aliases on all platforms to keep manifest paths unambiguous.
+fn is_windows_alias(name: &str) -> bool {
+    if name.ends_with(['.', ' ']) || name.contains(':') {
+        return true;
+    }
+    let stem = name.split('.').next().unwrap_or(name).trim_end().to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
 }
 
 /// Resolves an untrusted bundle or manifest destination inside `generation`.
