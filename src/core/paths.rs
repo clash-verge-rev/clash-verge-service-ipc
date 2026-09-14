@@ -1,18 +1,10 @@
 use crate::core::structure::{OwnerIdentity, owner_key};
 use std::path::{Path, PathBuf};
 
-/// Extension the installer parks half-written copies under, beside their target.
-///
-/// The core resolution refuses names carrying it, so an installer that crashed mid-copy can never
-/// leave bytes in the core directory that the service would execute.
+/// Staging-file extension; core resolution rejects it so partial copies cannot run.
 pub const CORE_STAGING_EXTENSION: &str = "next";
 
-/// Extension a still-running core is moved aside under while its replacement is published.
-///
-/// Windows will rename a running executable but not overwrite it, so publishing over a live core
-/// displaces the old file here first. Refused by the core resolution and swept by the installer
-/// for the same reason as [`CORE_STAGING_EXTENSION`]: nothing an install left behind may ever be
-/// something the service will run.
+/// Extension for displaced Windows executables awaiting cleanup; core resolution rejects it.
 pub const CORE_DISPLACED_EXTENSION: &str = "old";
 
 #[derive(Debug, Clone)]
@@ -64,15 +56,8 @@ impl ServicePaths {
         self.persistent_state_dir.join("bin")
     }
 
-    /// Holds the copies of the core binaries that the service is willing to execute.
-    ///
-    /// See [`CORE_STAGING_EXTENSION`] and [`CORE_DISPLACED_EXTENSION`] for the two name shapes
-    /// inside it that are never runnable.
-    ///
-    /// The client names a core by path, but the service never runs the client's copy: an install
-    /// directory the requesting account can write is an invitation to hand root different bytes.
-    /// Only a privileged installer can populate this directory, so what lands here is what an
-    /// administrator approved.
+    /// Approved cores published only by the privileged installer.
+    /// Files with [`CORE_STAGING_EXTENSION`] or [`CORE_DISPLACED_EXTENSION`] cannot run.
     pub fn core_dir(&self) -> PathBuf {
         self.persistent_state_dir.join("cores")
     }

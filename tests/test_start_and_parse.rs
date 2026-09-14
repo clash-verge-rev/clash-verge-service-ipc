@@ -1,11 +1,10 @@
-#![cfg(all(feature = "standalone", feature = "client"))]
+#![cfg(all(feature = "standalone", feature = "client", feature = "test"))]
 
 mod common;
 
 use anyhow::{Context as _, Result};
-use clash_verge_service_ipc::{
-    PROTOCOL_EPOCH, PROTOCOL_REVISION, VERSION, get_status, get_version, run_ipc_server, stop_ipc_server,
-};
+use clash_verge_service_ipc::{PROTOCOL_EPOCH, PROTOCOL_REVISION, VERSION, get_status, get_version, stop_ipc_server};
+use common::{start_server, stop_server};
 use serial_test::serial;
 
 #[cfg(unix)]
@@ -26,9 +25,7 @@ async fn a_stale_ipc_path_requires_service_reinstallation() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn running_server_reports_its_protocol_and_status() -> Result<()> {
-    let _ = stop_ipc_server().await;
-    let server = run_ipc_server().await?;
-    common::wait_for_ipc().await?;
+    let server = start_server().await?;
 
     let version = get_version().await?.data.context("version omitted data")?;
     assert_eq!(version.build_version, VERSION);
@@ -50,7 +47,5 @@ async fn running_server_reports_its_protocol_and_status() -> Result<()> {
         );
     }
 
-    stop_ipc_server().await?;
-    server.await??;
-    Ok(())
+    stop_server(server).await
 }

@@ -189,16 +189,8 @@ pub async fn restore_desired_state() -> Result<()> {
     Ok(())
 }
 
-/// Returns whether the persisted core path can never launch, so retrying it is pointless.
-///
-/// Only a verdict from core-path validation counts. A bare `NotFound` anywhere in the chain used
-/// to qualify, which also caught unrelated failures such as a volatile IPC directory missing after
-/// a reboot and then wiped a perfectly good desired state; validation now reports a vanished
-/// binary as `InvalidRuntimeAsset`, so that broad match no longer buys anything.
-///
-/// A transient inspection failure (an I/O error while reading a path's metadata or ACL) also
-/// arrives under these codes and will clear the state. The cost is one manual restart on a machine
-/// whose filesystem is already failing, which is not worth a wire-visible error code to separate.
+/// Clears intent only for core-path validation errors, including metadata/ACL failures.
+/// An unrelated `NotFound`, such as a missing volatile IPC directory, must retain intent.
 fn core_path_is_unusable(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<ServiceError>().is_some_and(|service_error| {

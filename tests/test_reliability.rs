@@ -5,23 +5,13 @@ mod common;
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::{
     CoreWatchdogTestConfig, OwnerSessionProof, RuntimeBundle, ServiceLifecycleState, StartClashRequest, connect,
-    get_status, run_ipc_server, run_ipc_supervisor_until_shutdown, service_lifecycle_state,
-    set_core_watchdog_config_for_tests, start_clash, stop_clash, stop_ipc_server,
+    get_status, run_ipc_supervisor_until_shutdown, service_lifecycle_state, set_core_watchdog_config_for_tests,
+    start_clash, stop_clash, stop_ipc_server,
 };
+use common::{start_server, stop_server, wait_until};
 use serial_test::serial;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::oneshot;
-
-async fn wait_until(label: &str, mut condition: impl AsyncFnMut() -> bool) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if condition().await {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    anyhow::bail!("timed out waiting for {label}")
-}
 
 #[tokio::test]
 #[serial]
@@ -52,8 +42,7 @@ async fn a_healthy_service_owner_prevents_a_second_instance() -> Result<()> {
     let owner = clash_verge_service_ipc::acquire_service_owner()
         .await?
         .context("current process did not acquire the service owner lock")?;
-    let server = run_ipc_server().await?;
-    common::wait_for_ipc().await?;
+    let server = start_server().await?;
 
     let status = tokio::time::timeout(
         Duration::from_secs(5),
@@ -64,8 +53,7 @@ async fn a_healthy_service_owner_prevents_a_second_instance() -> Result<()> {
     assert_eq!(status.code(), Some(2));
     assert!(connect().await.is_ok());
 
-    stop_ipc_server().await?;
-    server.await??;
+    stop_server(server).await?;
     drop(owner);
     Ok(())
 }
@@ -86,9 +74,7 @@ async fn core_watchdog_stops_a_bounded_crash_loop() -> Result<()> {
         restart_window: Duration::from_secs(10),
         max_backoff: Duration::ZERO,
     }));
-    let _ = stop_ipc_server().await;
-    let server = run_ipc_server().await?;
-    common::wait_for_ipc().await?;
+    let server = start_server().await?;
     let credentials = common::owner_credentials();
     let token = "41".repeat(32);
     let response = start_clash(
@@ -129,7 +115,5 @@ async fn core_watchdog_stops_a_bounded_crash_loop() -> Result<()> {
     );
 
     assert_eq!(stop_clash(&credentials, &session).await?.code, 0);
-    stop_ipc_server().await?;
-    server.await??;
-    Ok(())
+    stop_server(server).await
 }

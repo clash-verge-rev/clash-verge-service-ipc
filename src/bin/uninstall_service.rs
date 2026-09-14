@@ -12,11 +12,7 @@ use shared::run_command;
 use shared::uninstall_old_service;
 use shared::{enter_repair_gate, run_maintenance_if_requested};
 
-/// Removes the cores the installer published, as far as the filesystem allows.
-///
-/// Best-effort by design: this runs after the service is already deleted, and a leftover core
-/// process or a scanner holding a file open must not turn a completed uninstall into a reported
-/// failure. What stays behind is admin-only and inert without the service.
+/// Removes approved cores after service deletion. Locked files are left for a later retry.
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn remove_installed_cores() {
     let cores = clash_verge_service_ipc::service_paths().core_dir();
@@ -32,11 +28,9 @@ fn remove_installed_cores() {
     }
 }
 
-/// Removes recorded Windows Firewall rules and discovers cores staged by older installers.
-///
-/// Failed deletions keep their records outside `cores` so an uninstall retry still knows the names
-/// after the binaries have gone. An absent rule also gives netsh a nonzero status; conservatively
-/// keep that record rather than mistaking an unavailable firewall for successful cleanup.
+/// Removes recorded firewall rules and discovers cores staged by older installers.
+/// Keep failed records outside `cores` for retries: netsh cannot distinguish an absent rule
+/// from an unavailable firewall by exit status.
 #[cfg(windows)]
 fn remove_core_firewall_rules(cores: &std::path::Path) {
     let records = shared::core_firewall_records(cores);
@@ -242,8 +236,7 @@ fn main() -> anyhow::Result<()> {
                 "timed out waiting for service deletion",
             )?;
         }
-        // A previous run may have deleted the service and then failed before the file cleanup
-        // below; a rerun must finish that cleanup rather than stop at the missing service.
+        // A retry must finish file cleanup even if the service was already deleted.
         Err(error) if has_raw_error(&error, ERROR_SERVICE_DOES_NOT_EXIST) => {}
         Err(error) => return Err(error.into()),
     }

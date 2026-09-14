@@ -501,6 +501,10 @@ mod tests {
         );
 
         assert_eq!(plan.required_deletes, ["rules/ads.yaml"]);
+        assert!(
+            plan.hygiene_deletes.is_empty(),
+            "declared destinations must not be swept"
+        );
     }
 
     #[test]
@@ -531,35 +535,6 @@ mod tests {
         assert!(
             plan.required_deletes.is_empty() && plan.copies.is_empty(),
             "housekeeping alone must not make staging look like it has work to do"
-        );
-    }
-
-    #[test]
-    fn a_file_the_service_never_wrote_is_never_a_deletion_candidate() {
-        // Core-owned files such as `cache.db` never appear in the manifest.
-        let previous = manifest(&[("geoip.metadb", identity("/app/geoip.metadb", 1, 1))], &[]);
-
-        let plan = plan_stage(&previous, &[], &[]);
-
-        assert!(!plan.required_deletes.iter().any(|path| path == "cache.db"));
-        assert!(!plan.hygiene_deletes.iter().any(|path| path == "cache.db"));
-        assert_eq!(plan.hygiene_deletes, ["geoip.metadb"]);
-    }
-
-    #[test]
-    fn a_destination_that_stays_declared_is_not_swept() {
-        let previous = manifest(&[], &[("rules/ads.yaml", "https://one.example/ads.yaml")]);
-
-        let plan = plan_stage(
-            &previous,
-            &[],
-            &[remote("rules/ads.yaml", "https://two.example/ads.yaml")],
-        );
-
-        assert_eq!(plan.required_deletes, ["rules/ads.yaml"]);
-        assert!(
-            plan.hygiene_deletes.is_empty(),
-            "a destination that is still declared is replaced, not swept"
         );
     }
 

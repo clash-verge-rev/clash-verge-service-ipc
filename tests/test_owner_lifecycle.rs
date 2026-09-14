@@ -5,8 +5,9 @@ mod common;
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::{
     IpcCommand, OwnerCredentials, OwnerSessionProof, RuntimeBundle, ServiceErrorCode, StartClashRequest,
-    StartClashResult, connect, get_status, run_ipc_server, start_clash, stop_clash, stop_ipc_server,
+    StartClashResult, connect, get_status, start_clash, stop_clash,
 };
+use common::{start_server, stop_server};
 use serde::Deserialize;
 use serial_test::serial;
 
@@ -41,19 +42,6 @@ async fn start(credentials: &OwnerCredentials, token: &str) -> Result<(StartClas
         token: token.to_owned(),
     };
     Ok((result, session))
-}
-
-async fn start_server() -> Result<tokio::task::JoinHandle<kode_bridge::Result<()>>> {
-    let _ = stop_ipc_server().await;
-    let server = run_ipc_server().await?;
-    common::wait_for_ipc().await?;
-    Ok(server)
-}
-
-async fn stop_server(server: tokio::task::JoinHandle<kode_bridge::Result<()>>) -> Result<()> {
-    stop_ipc_server().await?;
-    server.await??;
-    Ok(())
 }
 
 #[tokio::test]

@@ -375,11 +375,7 @@ pub(super) async fn gather_bundle(
     Ok(GatheredBundle { sources, remote })
 }
 
-/// A core a client named, paired with the copy the service is willing to execute.
-///
-/// The two differ whenever the operator installed the application somewhere ordinary accounts can
-/// write. Keeping both lets the assets stay where the application put them while the binary that
-/// runs as root comes from a directory only an installer could fill.
+/// Pairs the client path used to locate assets with the approved executable path.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedCore {
     requested: PathBuf,
@@ -392,28 +388,15 @@ impl ResolvedCore {
         &self.executable
     }
 
-    /// The application directory runtime assets may additionally be copied from, when there is one.
-    ///
-    /// Asset sources are opened by the service as root, so the directory they come from must not
-    /// be writable by unprivileged accounts: a writable root would let a requester point root at
-    /// files the requester cannot read and collect their contents through the core. The client's
-    /// install directory therefore qualifies only when it passes the same location rule the
-    /// executed copy must — the guarantee the pre-resolution code gave by validating the client
-    /// path itself. An install somewhere writable simply has no bundle root, and its assets have
-    /// to come from the owner's own data root, which is where the application sources them anyway.
+    /// Allows bundle assets only from a trusted install directory. Otherwise use owner data.
+    /// A writable bundle root could redirect privileged reads to files the owner cannot read.
     pub(super) fn trusted_asset_bundle_root(&self) -> Option<PathBuf> {
         require_trusted_core_location(&self.requested).ok()?;
         application_bundle_root(&self.requested)
     }
 }
 
-/// Resolves a client-named core to the copy a privileged installer approved.
-///
-/// The service executes the result as root or LocalSystem, so it cannot be a file the requesting
-/// owner could have written. Owner identity says nothing here: any local account may become an
-/// owner. Earlier revisions demanded that the client's own path be unwritable, which held for
-/// `%ProgramFiles%` but rejected every operator who chose their own install directory. The service
-/// now runs its own copy instead, so where the application lives stops being a security question.
+/// Resolves the requested core to an installer-approved copy safe for privileged execution.
 pub(crate) fn validate_core_path(core_path: &str) -> Result<ResolvedCore, ServiceError> {
     let requested = canonical_regular_file(Path::new(core_path), "core")?;
     // Integration tests stage cores in temporary directories that no installer has approved.
@@ -424,32 +407,23 @@ pub(crate) fn validate_core_path(core_path: &str) -> Result<ResolvedCore, Servic
         });
     }
     let executable = approved_core_copy(&crate::core::paths::service_paths().core_dir(), &requested)?;
-    // Defence in depth. The installer builds this directory so that only SYSTEM and the
-    // Administrators group can write it, so this holds by construction; it is worth checking
-    // anyway, because a directory that fails it is one someone else has been rearranging.
+    // Recheck the approved location in case its permissions changed after installation.
     require_trusted_core_location(&executable)?;
     Ok(ResolvedCore { requested, executable })
 }
 
-/// Finds the installer-staged copy that corresponds to a client-named core.
-///
-/// Only the file name carries over. The client's directory may be anywhere the operator chose,
-/// and the service never has to trust it, because it never runs what is there.
+/// Looks up the approved copy by file name without trusting the client directory.
 fn approved_core_copy(core_dir: &Path, requested: &Path) -> Result<PathBuf, ServiceError> {
     let Some(name) = requested.file_name() else {
         return Err(untrusted("core path has no file name"));
     };
     let approved = core_dir.join(name);
-    // `file_name` on a canonicalized path is always a single ordinary component, so this cannot
-    // escape the directory. Assert it rather than rely on that reasoning holding forever.
     if approved.parent() != Some(core_dir) {
         return Err(untrusted(format!(
             "core name {name:?} does not name a file in {core_dir:?}"
         )));
     }
-    // The installer parks half-written copies and displaced live cores beside their target under
-    // these extensions. Nothing an install leaves behind may become something root runs, so the
-    // suffixes are simply not runnable names.
+    // Never execute staging or displaced files left by the installer.
     let bookkeeping = approved.extension().is_some_and(|extension| {
         extension.eq_ignore_ascii_case(crate::core::paths::CORE_STAGING_EXTENSION)
             || extension.eq_ignore_ascii_case(crate::core::paths::CORE_DISPLACED_EXTENSION)
@@ -473,12 +447,8 @@ fn approved_core_copy(core_dir: &Path, requested: &Path) -> Result<PathBuf, Serv
         .map_err(|error| untrusted(format!("failed to canonicalize approved core {approved:?}: {error}")))
 }
 
-/// Reports an in-place core update that never reached the approved directory.
-///
-/// The approved copy is the one that runs, so an application that replaced its own core without
-/// going through the privileged installer would otherwise appear to update and change nothing.
-/// The installer stamps each staged copy with its source's modified time, so length plus modified
-/// time changing together is the shape every real file replacement has.
+/// Warns when the client copy differs from the approved core that will actually run.
+/// Uses length and the source timestamp preserved by the installer.
 fn warn_if_the_client_core_has_moved_ahead(requested: &Path, approved: &Path, approved_metadata: &std::fs::Metadata) {
     if requested == approved {
         return;
@@ -794,8 +764,6 @@ mod approved_core_tests {
         }
     }
 
-    /// The install directory an operator chose is not the service's business, because the service
-    /// runs its own copy. This is the case the location-only rule used to reject.
     #[test]
     fn a_core_named_from_a_writable_install_directory_resolves_to_the_approved_copy() -> anyhow::Result<()> {
         let cores = scratch("writable-install")?;
@@ -816,7 +784,6 @@ mod approved_core_tests {
         Ok(())
     }
 
-    /// Every spawn re-resolves, and the recorded path is already the approved copy.
     #[test]
     fn resolving_the_approved_copy_again_yields_the_same_path() -> anyhow::Result<()> {
         let cores = scratch("idempotent")?;
@@ -846,8 +813,6 @@ mod approved_core_tests {
         Ok(())
     }
 
-    /// An interrupted install leaves `<name>.next` (half-written) or `<name>.old` (a displaced
-    /// live core) beside the target; naming either must not run it.
     #[test]
     fn installer_bookkeeping_leftovers_are_never_runnable_cores() -> anyhow::Result<()> {
         let cores = scratch("bookkeeping-leftover")?;
@@ -889,9 +854,6 @@ mod approved_core_tests {
 mod asset_bundle_root_tests {
     use super::ResolvedCore;
 
-    /// The confused-deputy guard: a core named from a user-writable directory anchors no asset
-    /// root, so the service (running as root) will not copy files out of a directory the
-    /// requesting account controls.
     #[test]
     fn a_writable_install_directory_provides_no_asset_bundle_root() -> anyhow::Result<()> {
         let timestamp = std::time::SystemTime::now()

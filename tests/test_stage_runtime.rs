@@ -5,9 +5,9 @@ mod common;
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::{
     OwnerCredentials, OwnerSessionProof, RuntimeAsset, RuntimeBundle, StageRejection, StageRuntimeOutcome,
-    StartClashRequest, get_status, run_ipc_server, service_paths, stage_runtime, start_clash, stop_clash,
-    stop_ipc_server, test_owner_credentials,
+    StartClashRequest, get_status, service_paths, stage_runtime, start_clash, stop_clash, test_owner_credentials,
 };
+use common::{start_server, stop_server};
 use serial_test::serial;
 use std::path::{Path, PathBuf};
 
@@ -91,12 +91,9 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
-    let _ = stop_ipc_server().await;
-    let server = run_ipc_server().await?;
-    common::wait_for_ipc().await?;
+    let server = start_server().await?;
     let result = test().await;
-    stop_ipc_server().await?;
-    server.await??;
+    stop_server(server).await?;
     result
 }
 

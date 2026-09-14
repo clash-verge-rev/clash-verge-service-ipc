@@ -101,10 +101,7 @@ fn stage_binary(source: &Path, target: &Path) -> Result<PathBuf, Error> {
     Ok(staged)
 }
 
-/// Core binaries Clash Verge ships beside this installer.
-///
-/// Named rather than discovered by scanning: the application directory also holds the launcher and
-/// the uninstaller, and neither may become something the service is willing to execute as root.
+/// Allowlist for auto-staging; excludes other executables shipped beside the installer.
 const BUNDLED_CORE_NAMES: [&str; 2] = ["verge-mihomo", "verge-mihomo-alpha"];
 
 fn core_file_name(stem: &str) -> String {
@@ -115,15 +112,8 @@ fn core_file_name(stem: &str) -> String {
     }
 }
 
-/// Publishes a core into the directory the service executes from, under the caller-chosen `name`.
-///
-/// Elevation alone does not make the bytes trustworthy: the caller must either have taken them
-/// from a location only privileged accounts can write, or attest what they are. `expected_sha256`
-/// carries that attestation — it is checked against both the source and the staged copy, so a
-/// file swapped between the caller computing the digest and this copy landing is refused rather
-/// than published. The published name is fixed by the caller rather than read off `source`, so a
-/// link-shaped source resolved during validation cannot smuggle a different name into the
-/// approved directory.
+/// The caller must supply a trusted source or `expected_sha256`, verified against both copies.
+/// The caller fixes `name` before resolving source links so they cannot change the published name.
 fn install_core(
     source: &Path,
     cores: &Path,
@@ -151,17 +141,13 @@ fn install_core(
              The file may have been replaced since the digest was computed."
         );
     }
-    // An unchanged core needs no republish. This also keeps a routine service reinstall from
-    // fighting a still-running core over its open file: same bytes, nothing to fight about.
+    // Avoid replacing an unchanged executable that Windows may still have open.
     if let Ok(existing) = std::fs::symlink_metadata(&target)
         && existing.is_file()
         && sha256(&target)? == source_hash
     {
         println!("Core {} is already current", target.display());
-        // Best-effort metadata repair: a copy staged earlier may carry a stale stamp (or, on
-        // Unix, loosened permissions) while its bytes are fine. A running core holds its file
-        // open on Windows, so a failure here only means the drift warning stays until the next
-        // successful publish.
+        // Metadata repair is best-effort while a running Windows core holds the file open.
         if let Err(error) = propagate_source_modified_time(&target, &metadata) {
             eprintln!("Could not refresh the stamp on {}: {error:#}", target.display());
         }
@@ -185,11 +171,7 @@ fn install_core(
     Ok(target)
 }
 
-/// Stamps the staged copy with its source's modified time.
-///
-/// The service reports an in-place core update the installer never saw by comparing the client
-/// core's length and modified time against the approved copy's; the copy has to carry the
-/// source's stamp for that comparison to mean anything.
+/// Preserves the source timestamp for the service's core-update drift check.
 fn propagate_source_modified_time(staged: &Path, source_metadata: &std::fs::Metadata) -> Result<(), Error> {
     let modified = source_metadata
         .modified()
@@ -205,12 +187,7 @@ fn propagate_source_modified_time(staged: &Path, source_metadata: &std::fs::Meta
         .with_context(|| format!("failed to stamp staged binary {staged:?}"))
 }
 
-/// Removes bookkeeping leftovers — half-written staging copies and displaced live cores — from an
-/// earlier interrupted or in-flight run.
-///
-/// The service refuses to run them regardless; sweeping keeps the directory describable as
-/// "exactly what an administrator published". A displaced core whose process is still running
-/// stays locked and simply survives until a later sweep.
+/// Best-effort cleanup of staging and displaced files; locked cores survive until a later sweep.
 fn sweep_core_bookkeeping_leftovers(cores: &Path) {
     let Ok(entries) = std::fs::read_dir(cores) else {
         return;
@@ -277,17 +254,9 @@ fn parse_sha256_hex(value: &str) -> Result<[u8; 32], Error> {
     Ok(digest)
 }
 
-/// Admits the approved copy of `core` through Windows Firewall.
-///
-/// Windows Firewall matches rules by executable path. The copy the service executes lives under
-/// `%ProgramData%`, so a rule the user granted the file beside the application does not cover it,
-/// and a core spawned from session 0 never raises the interactive prompt that would offer one.
-/// With inbound blocking, the TUN `system` and `mixed` stacks can lose TCP traffic: they hand it
-/// to a host listener on the tun address. `gvisor` handles that TCP reception in userspace instead;
-/// the core's other host listeners, including LAN proxy ports, still need firewall permission.
-/// Reported rather than fatal: a staged core without a rule still runs, and the message
-/// names the path an administrator can admit by hand. netsh appends a second rule under a repeated
-/// name instead of replacing it, hence the delete first.
+/// Adds a best-effort inbound rule for the approved executable path.
+/// App-directory rules do not cover this copy, and session 0 cannot prompt for access.
+/// TUN system/mixed stacks and LAN listeners need the rule. Delete first to avoid duplicates.
 #[cfg(windows)]
 fn allow_core_through_firewall(core: &Path) {
     let result = shared::core_firewall_rule_name(core).and_then(|name| {
@@ -313,16 +282,10 @@ fn allow_core_through_firewall(core: &Path) {
     }
 }
 
-/// This installer manages executable-path firewall rules only on Windows.
 #[cfg(not(windows))]
 fn allow_core_through_firewall(_core: &Path) {}
 
-/// Handles a core-only update and reports whether it took over the run.
-///
-/// The application downloads a new core and asks this privileged binary to publish it, because the
-/// destination is closed to unprivileged writers by design. A core already running is locked on
-/// Windows, so the application has to stop it first; the publish failure says so rather than
-/// leaving a half-written core behind.
+/// Handles `--install-core` and returns whether a core-only update was requested.
 fn run_core_install_if_requested() -> Result<bool, Error> {
     let requested = requested_core_installs()?;
     if requested.is_empty() {
@@ -332,13 +295,8 @@ fn run_core_install_if_requested() -> Result<bool, Error> {
     let cores = clash_verge_service_ipc::prepare_core_install_directory()?;
     sweep_core_bookkeeping_leftovers(&cores);
     for request in &requested {
-        // An unattested request is honored only for a source no unprivileged account can write.
-        // Anywhere else the file holds whatever the directory's writers last made it, and an
-        // elevated copy must not turn that into something root executes. The digest closes that
-        // channel: it travels on this process's own command line, which other local accounts
-        // cannot alter, and describes the bytes the caller actually obtained. The copy must then
-        // read the canonical path the verdict covered, not the caller's spelling of it, or a
-        // retargetable link between the two would undo the check.
+        // Without a digest, require a protected source and copy its validated canonical path
+        // so a retargeted link cannot substitute untrusted bytes.
         let name = request
             .source
             .file_name()
@@ -362,11 +320,7 @@ fn run_core_install_if_requested() -> Result<bool, Error> {
     Ok(true)
 }
 
-/// Publishes the cores shipped beside the installer.
-///
-/// Runs as part of an ordinary install so a stock setup works without the application knowing that
-/// any of this happens. A build that ships no core is not an error: the application can stage one
-/// later with `--install-core`.
+/// Publishes bundled cores when present; missing cores can be staged later with `--install-core`.
 fn install_bundled_cores() -> Result<(), Error> {
     let installer = std::env::current_exe().context("failed to locate the running installer")?;
     let Some(directory) = installer.parent() else {
@@ -397,13 +351,7 @@ fn install_bundled_cores() -> Result<(), Error> {
                 continue;
             }
             seen.push(name.clone());
-            // Only a source that itself sits behind administrative write control may be staged
-            // without an attestation. An application installed somewhere ordinary accounts can
-            // write ships bytes any of them may have replaced, and this elevated pass must not
-            // launder those into the directory root executes from; such installs stage their
-            // cores explicitly through --install-core with a --sha256 digest. Copying then reads
-            // the canonical path the verdict covered, so a link retargeted afterwards changes
-            // nothing.
+            // Auto-staging requires a protected source; copy the canonical path that passed validation.
             let source = match clash_verge_service_ipc::require_trusted_core_source(&candidate) {
                 Ok(canonical) => canonical,
                 Err(reason) => {
@@ -416,13 +364,10 @@ fn install_bundled_cores() -> Result<(), Error> {
             };
             match install_core(&source, &cores, std::ffi::OsStr::new(&name), None) {
                 Ok(installed) => println!("Installed core {}", installed.display()),
-                // A core still running holds its own file open on Windows, and the copy already
-                // staged is the one that keeps working; failing a routine reinstall over that
-                // would break a healthy setup. With nothing staged there is nothing to fall back
-                // to — reporting success would hand over a service whose every core start fails.
+                // A locked Windows core may prevent an update; retain an existing approved copy.
+                // Without that fallback, installation must fail.
                 Err(error) => {
-                    // symlink_metadata: a link in the approved slot is not a fallback the runtime
-                    // would accept, so it must not suppress the failure either.
+                    // A symlink is not a fallback the runtime would accept.
                     let fallback_is_regular = std::fs::symlink_metadata(cores.join(&name))
                         .map(|metadata| metadata.is_file())
                         .unwrap_or(false);
@@ -496,10 +441,8 @@ fn publish_staged_binary(staged: &Path, target: &Path) -> Result<(), Error> {
             return Ok(());
         };
 
-        // Windows will not overwrite a running executable, but it will rename one. Move the live
-        // file aside and slot the replacement into its name; a core start after this picks up the
-        // new bytes without the caller having to stop the old core first. The displaced file is
-        // never runnable through the core resolution and is swept on the next install.
+        // Windows can rename a running executable but cannot overwrite it.
+        // Displace it to a non-runnable name for cleanup on a later install.
         let displaced = target.with_extension(clash_verge_service_ipc::CORE_DISPLACED_EXTENSION);
         if move_over(target, &displaced).is_err() {
             return Err(direct_error).with_context(|| format!("failed to publish {staged:?} at {target:?}"));
@@ -566,7 +509,6 @@ fn wait_for_service_ready() -> Result<(), Error> {
     })
 }
 
-// Only launchd code needs the concrete target; tests exercise the plan classifier instead.
 #[cfg(target_os = "macos")]
 fn launchd_service_target() -> String {
     format!("system/{}", clash_verge_service_ipc::MACOS_SERVICE_ID)

@@ -1,7 +1,7 @@
 .PHONY: help test test_one test_all
 
 RUST_LOG ?= clash_verge_service_ipc=trace,kode_bridge=error
-TEST_NAME ?= test_start_from_start
+TEST_NAME ?=
 CARGO ?= cargo
 CARGO_FLAGS ?= --all-features
 TEST_BIN_ARGS ?= -- --nocapture
