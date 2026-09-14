@@ -277,6 +277,45 @@ fn parse_sha256_hex(value: &str) -> Result<[u8; 32], Error> {
     Ok(digest)
 }
 
+/// Admits the approved copy of `core` through Windows Firewall.
+///
+/// Windows Firewall matches rules by executable path. The copy the service executes lives under
+/// `%ProgramData%`, so a rule the user granted the file beside the application does not cover it,
+/// and a core spawned from session 0 never raises the interactive prompt that would offer one.
+/// Without a rule the TUN `system` and `mixed` stacks pass no traffic: they hand TCP to a listener
+/// on the tun address, and the firewall drops those flows before the core sees them (`gvisor`
+/// opens no host socket and is unaffected); LAN access to the listening ports is blocked the same
+/// way. Reported rather than fatal: a staged core without a rule still runs, and the message
+/// names the path an administrator can admit by hand. netsh appends a second rule under a repeated
+/// name instead of replacing it, hence the delete first.
+#[cfg(windows)]
+fn allow_core_through_firewall(core: &Path) {
+    let result = shared::core_firewall_rule_name(core).and_then(|name| {
+        let _ = shared::netsh_firewall(&["delete", "rule", &format!("name={name}")]);
+        shared::netsh_firewall(&[
+            "add",
+            "rule",
+            &format!("name={name}"),
+            "dir=in",
+            "action=allow",
+            "enable=yes",
+            "profile=any",
+            &format!("program={}", core.display()),
+        ])
+    });
+    if let Err(error) = result {
+        eprintln!(
+            "Could not allow {} through Windows Firewall: {error:#}. TUN system/mixed stacks and LAN access \
+             need an inbound rule for that path.",
+            core.display()
+        );
+    }
+}
+
+/// Only Windows filters inbound traffic by executable path; elsewhere the staged copy needs nothing.
+#[cfg(not(windows))]
+fn allow_core_through_firewall(_core: &Path) {}
+
 /// Handles a core-only update and reports whether it took over the run.
 ///
 /// The application downloads a new core and asks this privileged binary to publish it, because the
@@ -317,6 +356,7 @@ fn run_core_install_if_requested() -> Result<bool, Error> {
         };
         let installed = install_core(&source, &cores, &name, request.sha256.as_ref())?;
         println!("Installed core {}", installed.display());
+        allow_core_through_firewall(&installed);
     }
     Ok(true)
 }
@@ -392,6 +432,7 @@ fn install_bundled_cores() -> Result<(), Error> {
                     }
                 }
             }
+            allow_core_through_firewall(&cores.join(&name));
         }
     }
     if seen.is_empty() {

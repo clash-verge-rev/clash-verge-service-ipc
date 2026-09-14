@@ -20,6 +20,8 @@ use shared::{enter_repair_gate, run_maintenance_if_requested};
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn remove_installed_cores() {
     let cores = clash_verge_service_ipc::service_paths().core_dir();
+    #[cfg(windows)]
+    remove_core_firewall_rules(&cores);
     match std::fs::remove_dir_all(&cores) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -27,6 +29,33 @@ fn remove_installed_cores() {
             "Could not remove core directory {cores:?}: {error}. \
              A process may still hold a core open; this does not affect the uninstall."
         ),
+    }
+}
+
+/// Removes the Windows Firewall rules the installer created for the cores still staged in `cores`.
+///
+/// Best-effort like the core removal that follows: a rule left behind admits a path that no longer
+/// holds an executable.
+#[cfg(windows)]
+fn remove_core_firewall_rules(cores: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(cores) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let bookkeeping = path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case(clash_verge_service_ipc::CORE_STAGING_EXTENSION)
+                || extension.eq_ignore_ascii_case(clash_verge_service_ipc::CORE_DISPLACED_EXTENSION)
+        });
+        if bookkeeping || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let Ok(name) = shared::core_firewall_rule_name(&path) else {
+            continue;
+        };
+        if let Err(error) = shared::netsh_firewall(&["delete", "rule", &format!("name={name}")]) {
+            eprintln!("Could not remove firewall rule {name:?}: {error:#}");
+        }
     }
 }
 
