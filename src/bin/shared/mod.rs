@@ -91,6 +91,49 @@ pub(crate) fn core_firewall_rule_name(core: &std::path::Path) -> Result<String, 
     ))
 }
 
+/// Survives removal of `cores`, so a later uninstall can retry failed rule deletions.
+#[cfg(windows)]
+pub(crate) fn core_firewall_records(cores: &std::path::Path) -> std::path::PathBuf {
+    cores.with_file_name("core-firewall-rules")
+}
+
+#[cfg(windows)]
+pub(crate) fn record_core_firewall_rule(core: &std::path::Path) -> Result<(), Error> {
+    use anyhow::Context as _;
+
+    // Record before changing the firewall. Independent empty files cannot truncate an
+    // existing inventory if the installer crashes. The parent is installer-protected.
+    let records = core_firewall_records(core.parent().context("core path has no parent")?);
+    std::fs::create_dir_all(&records).context("failed to create firewall cleanup records")?;
+    let record = records.join(core.file_name().context("core path has no file name")?);
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&record) {
+        Ok(file) => file.sync_all().context("failed to persist firewall cleanup record"),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).context("failed to record firewall cleanup obligation"),
+    }
+}
+
+#[cfg(windows)]
+fn netsh_path() -> Result<std::path::PathBuf, Error> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    // The caller controls inherited environment variables, including SystemRoot and PATH.
+    // Ask Windows instead. WOW64 may redirect this to its own system netsh, which also
+    // supports advfirewall; no filesystem-redirection override is needed.
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        if length == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if length < buffer.len() {
+            return Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length])).join("netsh.exe"));
+        }
+        buffer.resize(length, 0);
+    }
+}
+
 /// Runs `netsh advfirewall firewall` with `arguments`, failing on a non-zero exit.
 ///
 /// netsh prints localized text only, so callers can react to the status alone.
@@ -100,9 +143,7 @@ pub(crate) fn netsh_firewall(arguments: &[&str]) -> Result<(), Error> {
     use std::os::windows::process::CommandExt as _;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // Resolved absolutely: this process is elevated and must not let PATH choose what it runs.
-    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    let netsh = std::path::Path::new(&system_root).join("System32").join("netsh.exe");
+    let netsh = netsh_path().context("failed to locate the Windows system netsh")?;
     let output = std::process::Command::new(&netsh)
         .args(["advfirewall", "firewall"])
         .args(arguments)
@@ -119,4 +160,23 @@ pub(crate) fn netsh_firewall(arguments: &[&str]) -> Result<(), Error> {
         String::from_utf8_lossy(&output.stdout).trim(),
         String::from_utf8_lossy(&output.stderr).trim()
     ))
+}
+
+#[cfg(all(windows, test))]
+mod tests {
+    #[test]
+    fn netsh_ignores_caller_system_root() -> anyhow::Result<()> {
+        const EXPECTED: &str = "CVR_TEST_EXPECTED_NETSH";
+        if let Some(expected) = std::env::var_os(EXPECTED) {
+            assert_eq!(super::netsh_path()?, std::path::PathBuf::from(expected));
+            return Ok(());
+        }
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "shared::tests::netsh_ignores_caller_system_root"])
+            .env(EXPECTED, super::netsh_path()?)
+            .env("SystemRoot", std::env::temp_dir().join("caller controlled (windows)"))
+            .status()?;
+        assert!(status.success());
+        Ok(())
+    }
 }

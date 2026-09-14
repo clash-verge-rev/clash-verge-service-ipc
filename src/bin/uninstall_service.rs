@@ -32,31 +32,57 @@ fn remove_installed_cores() {
     }
 }
 
-/// Removes the Windows Firewall rules the installer created for the cores still staged in `cores`.
+/// Removes recorded Windows Firewall rules and discovers cores staged by older installers.
 ///
-/// Best-effort like the core removal that follows: a rule left behind admits a path that no longer
-/// holds an executable.
+/// Failed deletions keep their records outside `cores` so an uninstall retry still knows the names
+/// after the binaries have gone. An absent rule also gives netsh a nonzero status; conservatively
+/// keep that record rather than mistaking an unavailable firewall for successful cleanup.
 #[cfg(windows)]
 fn remove_core_firewall_rules(cores: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(cores) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let bookkeeping = path.extension().is_some_and(|extension| {
-            extension.eq_ignore_ascii_case(clash_verge_service_ipc::CORE_STAGING_EXTENSION)
-                || extension.eq_ignore_ascii_case(clash_verge_service_ipc::CORE_DISPLACED_EXTENSION)
-        });
-        if bookkeeping || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            continue;
-        }
-        let Ok(name) = shared::core_firewall_rule_name(&path) else {
-            continue;
+    let records = shared::core_firewall_records(cores);
+    let mut names = std::collections::BTreeSet::new();
+    for directory in [cores, records.as_path()] {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                eprintln!("Could not read firewall cleanup names from {directory:?}: {error}");
+                continue;
+            }
         };
-        if let Err(error) = shared::netsh_firewall(&["delete", "rule", &format!("name={name}")]) {
-            eprintln!("Could not remove firewall rule {name:?}: {error:#}");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let bookkeeping = path.extension().is_some_and(|extension| {
+                extension.eq_ignore_ascii_case(clash_verge_service_ipc::CORE_STAGING_EXTENSION)
+                    || extension.eq_ignore_ascii_case(clash_verge_service_ipc::CORE_DISPLACED_EXTENSION)
+            });
+            if !bookkeeping && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                names.insert(entry.file_name());
+            }
         }
     }
+    for file_name in names {
+        let Ok(name) = shared::core_firewall_rule_name(std::path::Path::new(&file_name)) else {
+            continue;
+        };
+        // Preserve newly discovered names from older installers before removing their cores.
+        if let Err(error) = shared::record_core_firewall_rule(&cores.join(&file_name)) {
+            eprintln!("Could not retain firewall cleanup record for {name:?}: {error:#}");
+        }
+        match shared::netsh_firewall(&["delete", "rule", &format!("name={name}")]) {
+            Ok(()) => {
+                let record = records.join(&file_name);
+                if let Err(error) = std::fs::remove_file(&record)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!("Could not remove firewall cleanup record {record:?}: {error}");
+                }
+            }
+            Err(error) => eprintln!("Could not remove firewall rule {name:?}: {error:#}"),
+        }
+    }
+    // Only remove an empty inventory; failed deletions must remain retryable.
+    let _ = std::fs::remove_dir(&records);
 }
 
 #[cfg(any(windows, test))]

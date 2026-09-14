@@ -282,15 +282,16 @@ fn parse_sha256_hex(value: &str) -> Result<[u8; 32], Error> {
 /// Windows Firewall matches rules by executable path. The copy the service executes lives under
 /// `%ProgramData%`, so a rule the user granted the file beside the application does not cover it,
 /// and a core spawned from session 0 never raises the interactive prompt that would offer one.
-/// Without a rule the TUN `system` and `mixed` stacks pass no traffic: they hand TCP to a listener
-/// on the tun address, and the firewall drops those flows before the core sees them (`gvisor`
-/// opens no host socket and is unaffected); LAN access to the listening ports is blocked the same
-/// way. Reported rather than fatal: a staged core without a rule still runs, and the message
+/// With inbound blocking, the TUN `system` and `mixed` stacks can lose TCP traffic: they hand it
+/// to a host listener on the tun address. `gvisor` handles that TCP reception in userspace instead;
+/// the core's other host listeners, including LAN proxy ports, still need firewall permission.
+/// Reported rather than fatal: a staged core without a rule still runs, and the message
 /// names the path an administrator can admit by hand. netsh appends a second rule under a repeated
 /// name instead of replacing it, hence the delete first.
 #[cfg(windows)]
 fn allow_core_through_firewall(core: &Path) {
     let result = shared::core_firewall_rule_name(core).and_then(|name| {
+        shared::record_core_firewall_rule(core)?;
         let _ = shared::netsh_firewall(&["delete", "rule", &format!("name={name}")]);
         shared::netsh_firewall(&[
             "add",
@@ -312,7 +313,7 @@ fn allow_core_through_firewall(core: &Path) {
     }
 }
 
-/// Only Windows filters inbound traffic by executable path; elsewhere the staged copy needs nothing.
+/// This installer manages executable-path firewall rules only on Windows.
 #[cfg(not(windows))]
 fn allow_core_through_firewall(_core: &Path) {}
 
