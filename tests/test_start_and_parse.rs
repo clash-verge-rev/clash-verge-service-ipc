@@ -3,7 +3,9 @@
 mod common;
 
 use anyhow::{Context as _, Result};
-use clash_verge_service_ipc::{PROTOCOL_EPOCH, PROTOCOL_REVISION, VERSION, get_status, get_version, stop_ipc_server};
+#[cfg(unix)]
+use clash_verge_service_ipc::stop_ipc_server;
+use clash_verge_service_ipc::{PROTOCOL_EPOCH, PROTOCOL_REVISION, VERSION, get_status, get_version};
 use common::{start_server, stop_server};
 use serial_test::serial;
 
