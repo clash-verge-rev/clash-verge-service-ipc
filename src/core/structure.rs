@@ -67,6 +67,12 @@ impl ProtocolInfo {
         self.protocol.epoch == ProtocolVersion::current().epoch
             && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_RUNTIME_FILE_READ
     }
+
+    /// Whether this service can safely switch the Windows Mobile Hotspot ICS public side.
+    pub const fn supports_mobile_hotspot_compatibility(&self) -> bool {
+        self.protocol.epoch == ProtocolVersion::current().epoch
+            && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_MOBILE_HOTSPOT_COMPATIBILITY
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +146,21 @@ pub enum ProxyApplyOutcome {
     NotRequested,
     Applied,
     DirectFallback { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileHotspotCompatibilityRequest {
+    pub enabled: bool,
+    pub tun_device_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MobileHotspotCompatibilityOutcome {
+    Applied,
+    Restored,
+    Unchanged,
+    WaitingForHotspot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +246,7 @@ pub enum ServiceErrorCode {
     InvalidProxyConfig = 1009,
     ProxyClearFailed = 1010,
     ProxyApplyFailed = 1011,
+    MobileHotspotCompatibilityFailed = 1012,
 }
 
 pub fn owner_key(identity: &OwnerIdentity) -> String {
@@ -377,6 +399,7 @@ mod tests {
         assert_eq!(ServiceErrorCode::InvalidProxyConfig as u16, 1009);
         assert_eq!(ServiceErrorCode::ProxyClearFailed as u16, 1010);
         assert_eq!(ServiceErrorCode::ProxyApplyFailed as u16, 1011);
+        assert_eq!(ServiceErrorCode::MobileHotspotCompatibilityFailed as u16, 1012);
     }
 
     #[test]
@@ -412,6 +435,19 @@ mod tests {
             !newer_epoch.supports_runtime_staging(),
             "a revision number means nothing across an epoch boundary"
         );
+    }
+
+    #[test]
+    fn mobile_hotspot_compatibility_has_its_own_protocol_gate() {
+        let mut older = ProtocolInfo::current();
+        older.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_MOBILE_HOTSPOT_COMPATIBILITY - 1;
+
+        assert!(!older.supports_mobile_hotspot_compatibility());
+        assert!(ProtocolInfo::current().supports_mobile_hotspot_compatibility());
+
+        let mut newer_epoch = ProtocolInfo::current();
+        newer_epoch.protocol.epoch += 1;
+        assert!(!newer_epoch.supports_mobile_hotspot_compatibility());
     }
 
     #[test]

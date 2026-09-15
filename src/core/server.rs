@@ -16,8 +16,8 @@ use crate::core::structure::{OwnerSessionProof, Response, ServiceLifecycleState}
 use crate::core::{apply_proxy, apply_proxy_or_direct, clear_proxy, validate_proxy_config};
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IpcCommand, MIN_SUPPORTED_CLIENT_REVISION, MacosProxyConfig,
-    OwnerSessionHandle, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, RuntimeFileRequest,
-    SERVICE_PROTOCOL_HEADER, StartClashRequest, StartClashResult, WriterConfig,
+    MobileHotspotCompatibilityRequest, OwnerSessionHandle, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome,
+    RuntimeBundle, RuntimeFileRequest, SERVICE_PROTOCOL_HEADER, StartClashRequest, StartClashResult, WriterConfig,
 };
 use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
@@ -36,7 +36,8 @@ use tracing::{info, trace, warn};
 const IPC_MAX_RESTARTS: u32 = 10;
 const IPC_RESTART_WINDOW: Duration = Duration::from_secs(10);
 const IPC_MAX_BACKOFF: Duration = Duration::from_millis(500);
-const IPC_HANDLER_TIMEOUT: Duration = Duration::from_secs(25);
+// Hotspot recovery waits for Windows to remove and recreate the ICS private adapter.
+const IPC_HANDLER_TIMEOUT: Duration = Duration::from_secs(65);
 #[cfg(any(test, all(windows, not(feature = "test"))))]
 const WINDOWS_CONTROL_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012019b;;;AU)";
 #[cfg(all(windows, feature = "test"))]
@@ -816,6 +817,35 @@ fn create_ipc_router() -> Result<Router> {
             match apply_service_proxy_or_direct(Some(&request.payload)).await {
                 Ok(outcome) => ok_json(outcome),
                 Err(error) => service_error(ServiceError::proxy_apply_failed(error.to_string())),
+            }
+        })
+        .put(IpcCommand::SetMobileHotspotCompatibility.as_ref(), |ctx| async move {
+            trace!("Received SetMobileHotspotCompatibility command");
+            let (request, owner) =
+                match authenticate_request::<AuthenticatedSessionRequest<MobileHotspotCompatibilityRequest>>(&ctx) {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
+            let _lifecycle_guard =
+                match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveSession(&request.session)).await {
+                    ControlFlow::Continue(guard) => guard,
+                    ControlFlow::Break(response) => return response,
+                };
+            #[cfg(windows)]
+            {
+                match crate::core::mobile_hotspot::set_mobile_hotspot_compatibility(&owner.identity, &request.payload)
+                    .await
+                {
+                    Ok(outcome) => ok_json(outcome),
+                    Err(error) => service_error(ServiceError::mobile_hotspot_compatibility_failed(error.to_string())),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = request;
+                service_error(ServiceError::mobile_hotspot_compatibility_failed(
+                    "Windows Mobile Hotspot compatibility is only available on Windows",
+                ))
             }
         });
     Ok(router)

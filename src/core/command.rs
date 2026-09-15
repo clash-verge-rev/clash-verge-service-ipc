@@ -23,6 +23,8 @@ pub enum IpcCommand {
     ReadRuntimeFile,
     #[strum(serialize = "/system-proxy")]
     SetSystemProxy,
+    #[strum(serialize = "/windows/mobile-hotspot-compatibility")]
+    SetMobileHotspotCompatibility,
     #[strum(serialize = "/writer")]
     UpdateWriter,
     #[strum(serialize = "/magic")]
