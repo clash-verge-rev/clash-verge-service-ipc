@@ -112,14 +112,11 @@ fn core_file_name(stem: &str) -> String {
     }
 }
 
-/// The caller must supply a trusted source or `expected_sha256`, verified against both copies.
-/// The caller fixes `name` before resolving source links so they cannot change the published name.
-fn install_core(
+fn validate_core_candidate(
     source: &Path,
-    cores: &Path,
     name: &std::ffi::OsStr,
     expected_sha256: Option<&[u8; 32]>,
-) -> Result<PathBuf, Error> {
+) -> Result<(std::fs::Metadata, [u8; 32]), Error> {
     let metadata = std::fs::symlink_metadata(source).with_context(|| format!("failed to inspect core {source:?}"))?;
     if !metadata.file_type().is_file() {
         bail!("core candidate is not an ordinary file: {source:?}");
@@ -130,8 +127,6 @@ fn install_core(
     }) {
         bail!("core name {name:?} collides with an installer bookkeeping suffix and could never be run");
     }
-    let target = cores.join(name);
-
     let source_hash = sha256(source)?;
     if let Some(expected) = expected_sha256
         && &source_hash != expected
@@ -141,6 +136,19 @@ fn install_core(
              The file may have been replaced since the digest was computed."
         );
     }
+    Ok((metadata, source_hash))
+}
+
+/// The caller must supply a trusted source or `expected_sha256`, verified against both copies.
+/// The caller fixes `name` before resolving source links so they cannot change the published name.
+fn install_core(
+    source: &Path,
+    cores: &Path,
+    name: &std::ffi::OsStr,
+    expected_sha256: Option<&[u8; 32]>,
+) -> Result<PathBuf, Error> {
+    let (metadata, source_hash) = validate_core_candidate(source, name, expected_sha256)?;
+    let target = cores.join(name);
     // Avoid replacing an unchanged executable that Windows may still have open.
     if let Ok(existing) = std::fs::symlink_metadata(&target)
         && existing.is_file()
@@ -207,24 +215,32 @@ fn sweep_core_bookkeeping_leftovers(cores: &Path) {
 /// A core named on the command line, with the digest the caller vouches for.
 struct CoreInstallRequest {
     source: PathBuf,
+    name: std::ffi::OsString,
     sha256: Option<[u8; 32]>,
 }
 
-/// Reads the `--install-core <path>` arguments and each one's optional `--sha256 <hex>` attestation.
-fn requested_core_installs() -> Result<Vec<CoreInstallRequest>, Error> {
-    parse_core_install_arguments(std::env::args_os().skip(1))
+struct InstallOptions {
+    install_service: bool,
+    cores: Vec<CoreInstallRequest>,
+    debug: bool,
 }
 
-fn parse_core_install_arguments(
-    arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<Vec<CoreInstallRequest>, Error> {
+fn parse_install_arguments(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<InstallOptions, Error> {
     let mut requested: Vec<CoreInstallRequest> = Vec::new();
+    let mut install_service = false;
+    let mut debug = false;
     let mut arguments = arguments;
     while let Some(argument) = arguments.next() {
         if argument == "--install-core" {
             let value = arguments.next().context("--install-core requires a path")?;
+            let source = PathBuf::from(value);
+            let name = source
+                .file_name()
+                .context("--install-core path has no file name")?
+                .to_owned();
             requested.push(CoreInstallRequest {
-                source: PathBuf::from(value),
+                source,
+                name,
                 sha256: None,
             });
         } else if argument == "--sha256" {
@@ -237,9 +253,19 @@ fn parse_core_install_arguments(
                 bail!("--sha256 was given twice for {:?}", request.source);
             }
             request.sha256 = Some(parse_sha256_hex(value)?);
+        } else if argument == "--install-service" {
+            install_service = true;
+        } else if argument == "--debug" {
+            debug = true;
+        } else {
+            bail!("unknown installer argument: {argument:?}");
         }
     }
-    Ok(requested)
+    Ok(InstallOptions {
+        install_service: install_service || requested.is_empty(),
+        cores: requested,
+        debug,
+    })
 }
 
 fn parse_sha256_hex(value: &str) -> Result<[u8; 32], Error> {
@@ -285,39 +311,42 @@ fn allow_core_through_firewall(core: &Path) {
 #[cfg(not(windows))]
 fn allow_core_through_firewall(_core: &Path) {}
 
-/// Handles `--install-core` and returns whether a core-only update was requested.
-fn run_core_install_if_requested() -> Result<bool, Error> {
-    let requested = requested_core_installs()?;
-    if requested.is_empty() {
-        return Ok(false);
+fn prepare_requested_cores(requested: &mut [CoreInstallRequest]) -> Result<(), Error> {
+    for request in requested {
+        // The destination name was fixed before resolving links in the source path.
+        if request.sha256.is_none() {
+            request.source =
+                clash_verge_service_ipc::require_trusted_core_source(&request.source).with_context(|| {
+                    format!(
+                        "core source {:?} sits where unprivileged accounts can write; pass --sha256 <digest \
+                     of the downloaded bytes> so the copy can be verified",
+                        request.source
+                    )
+                })?;
+        }
+        validate_core_candidate(&request.source, &request.name, request.sha256.as_ref())?;
     }
-    let _gate = enter_repair_gate()?;
+    Ok(())
+}
+
+fn publish_requested_cores(cores: &Path, requested: &[CoreInstallRequest]) -> Result<Vec<PathBuf>, Error> {
+    requested
+        .iter()
+        .map(|request| install_core(&request.source, cores, &request.name, request.sha256.as_ref()))
+        .collect()
+}
+
+fn install_service_cores(requested: &[CoreInstallRequest]) -> Result<(), Error> {
+    if requested.is_empty() {
+        return install_bundled_cores();
+    }
     let cores = clash_verge_service_ipc::prepare_core_install_directory()?;
     sweep_core_bookkeeping_leftovers(&cores);
-    for request in &requested {
-        // Without a digest, require a protected source and copy its validated canonical path
-        // so a retargeted link cannot substitute untrusted bytes.
-        let name = request
-            .source
-            .file_name()
-            .context("--install-core path has no file name")?
-            .to_owned();
-        let source = if request.sha256.is_none() {
-            clash_verge_service_ipc::require_trusted_core_source(&request.source).with_context(|| {
-                format!(
-                    "core source {:?} sits where unprivileged accounts can write; pass --sha256 <digest \
-                     of the downloaded bytes> so the copy can be verified",
-                    request.source
-                )
-            })?
-        } else {
-            request.source.clone()
-        };
-        let installed = install_core(&source, &cores, &name, request.sha256.as_ref())?;
+    for installed in publish_requested_cores(&cores, requested)? {
         println!("Installed core {}", installed.display());
         allow_core_through_firewall(&installed);
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Publishes bundled cores when present; missing cores can be staged later with `--install-core`.
@@ -616,11 +645,13 @@ fn main() -> Result<(), Error> {
     if run_maintenance_if_requested()? {
         return Ok(());
     }
-    if run_core_install_if_requested()? {
-        return Ok(());
-    }
+    let mut options = parse_install_arguments(std::env::args_os().skip(1))?;
     let _gate = enter_repair_gate()?;
-    let debug = std::env::args().any(|arg| arg == "--debug");
+    prepare_requested_cores(&mut options.cores)?;
+    if !options.install_service {
+        return install_service_cores(&options.cores);
+    }
+    let debug = options.debug;
     let launchd_install_plan = probe_launchd_service(debug)?;
     let service_binary_path = bundled_service_binary()?;
 
@@ -661,7 +692,7 @@ fn main() -> Result<(), Error> {
         run_command("launchctl", &["bootout", "system", &plist_path], debug)?;
     }
     // Staged where the service is already down, so a core it was running no longer holds its file.
-    install_bundled_cores()?;
+    install_service_cores(&options.cores)?;
     publish_staged_binary(&staged, &target_binary_path)?;
     std::fs::write(&info_plist_path, info_plist_content)
         .with_context(|| format!("failed to write Info.plist {info_plist_path:?}"))?;
@@ -696,11 +727,13 @@ fn main() -> Result<(), Error> {
     if run_maintenance_if_requested()? {
         return Ok(());
     }
-    if run_core_install_if_requested()? {
-        return Ok(());
-    }
+    let mut options = parse_install_arguments(std::env::args_os().skip(1))?;
     let _gate = enter_repair_gate()?;
-    let debug = std::env::args().any(|arg| arg == "--debug");
+    prepare_requested_cores(&mut options.cores)?;
+    if !options.install_service {
+        return install_service_cores(&options.cores);
+    }
+    let debug = options.debug;
     let source = bundled_service_binary()?;
     let install_dir = clash_verge_service_ipc::prepare_service_install_directory()?;
     let target = install_dir.join("clash-verge-service");
@@ -710,7 +743,7 @@ fn main() -> Result<(), Error> {
 
     let _ = run_command("systemctl", &["stop", &unit_name], debug);
     // Staged where the service is already down, so a core it was running no longer holds its file.
-    install_bundled_cores()?;
+    install_service_cores(&options.cores)?;
     publish_staged_binary(&staged, &target)?;
 
     let unit_file_content = format!(
@@ -750,10 +783,18 @@ fn main() -> anyhow::Result<()> {
     if run_maintenance_if_requested()? {
         return Ok(());
     }
-    if run_core_install_if_requested()? {
-        return Ok(());
-    }
+    let mut options = parse_install_arguments(std::env::args_os().skip(1))?;
     let _gate = enter_repair_gate()?;
+    prepare_requested_cores(&mut options.cores)?;
+    if !options.install_service {
+        return install_service_cores(&options.cores);
+    }
+    if options.debug {
+        println!(
+            "Installing service with {} explicitly requested cores",
+            options.cores.len()
+        );
+    }
     let source = bundled_service_binary()?;
     let install_dir = clash_verge_service_ipc::prepare_service_install_directory()?;
     let target = install_dir.join("clash-verge-service.exe");
@@ -808,7 +849,7 @@ fn main() -> anyhow::Result<()> {
 
             // Staged where the service is already down, so a core it was running no longer holds
             // its file open.
-            install_bundled_cores()?;
+            install_service_cores(&options.cores)?;
             publish_staged_binary(&staged, &target)?;
             service.change_config(&service_info)?;
             configure_windows_service_recovery(&service)?;
@@ -820,7 +861,7 @@ fn main() -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     }
 
-    install_bundled_cores()?;
+    install_service_cores(&options.cores)?;
     publish_staged_binary(&staged, &target)?;
     let start_access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;
     let service = service_manager.create_service(&service_info, start_access)?;
@@ -869,6 +910,78 @@ mod install_core_tests {
         let root = std::env::temp_dir().join(format!("install-core-{label}-{}-{timestamp}", std::process::id()));
         std::fs::create_dir_all(root.join("cores"))?;
         Ok(root)
+    }
+
+    fn combined_options(sources: &[PathBuf]) -> anyhow::Result<super::InstallOptions> {
+        let mut arguments = vec![std::ffi::OsString::from("--install-service")];
+        for source in sources {
+            let digest: String = super::sha256(source)?
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            arguments.extend([
+                "--install-core".into(),
+                source.as_os_str().to_owned(),
+                "--sha256".into(),
+                digest.into(),
+            ]);
+        }
+        super::parse_install_arguments(arguments.into_iter())
+    }
+
+    #[test]
+    fn combined_install_publishes_both_attested_cores_from_a_writable_directory() -> anyhow::Result<()> {
+        let root = scratch("scoop install")?;
+        let stable = root.join(super::core_file_name("verge-mihomo"));
+        let alpha = root.join(super::core_file_name("verge-mihomo-alpha"));
+        std::fs::write(&stable, b"stable core")?;
+        std::fs::write(&alpha, b"alpha core")?;
+        let mut options = combined_options(&[stable, alpha])?;
+        assert!(options.install_service);
+        super::prepare_requested_cores(&mut options.cores)?;
+        let installed = super::publish_requested_cores(&root.join("cores"), &options.cores)?;
+        assert_eq!(installed.len(), 2);
+        assert_eq!(std::fs::read(&installed[0])?, b"stable core");
+        assert_eq!(std::fs::read(&installed[1])?, b"alpha core");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn combined_install_preflight_rejects_a_missing_or_mismatched_second_core() -> anyhow::Result<()> {
+        let root = scratch("preflight")?;
+        let stable = root.join(super::core_file_name("verge-mihomo"));
+        let alpha = root.join(super::core_file_name("verge-mihomo-alpha"));
+        std::fs::write(&stable, b"stable core")?;
+        std::fs::write(&alpha, b"alpha core")?;
+        let mut options = combined_options(&[stable, alpha.clone()])?;
+        std::fs::write(&alpha, b"changed alpha")?;
+        let error =
+            super::prepare_requested_cores(&mut options.cores).expect_err("must reject before stopping the service");
+        assert!(error.to_string().contains("attested sha256"), "got {error:#}");
+        std::fs::remove_file(alpha)?;
+        assert!(super::prepare_requested_cores(&mut options.cores).is_err());
+        assert!(std::fs::read_dir(root.join("cores"))?.next().is_none());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_core_failure_after_preflight_does_not_accept_the_previous_copy() -> anyhow::Result<()> {
+        let root = scratch("changed-after-preflight")?;
+        let source = root.join(super::core_file_name("verge-mihomo"));
+        let previous = root.join("cores").join(source.file_name().unwrap());
+        std::fs::write(&source, b"new core")?;
+        std::fs::write(&previous, b"old core")?;
+        let mut options = combined_options(std::slice::from_ref(&source))?;
+        super::prepare_requested_cores(&mut options.cores)?;
+        std::fs::write(&source, b"replaced after preflight")?;
+        let error = super::publish_requested_cores(&root.join("cores"), &options.cores)
+            .expect_err("an existing approved copy must not hide an explicit installation failure");
+        assert!(error.to_string().contains("attested sha256"), "got {error:#}");
+        assert_eq!(std::fs::read(previous)?, b"old core");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]
@@ -978,11 +1091,48 @@ mod install_core_tests {
 
 #[cfg(test)]
 mod core_install_argument_tests {
-    use super::{parse_core_install_arguments, parse_sha256_hex};
+    use super::{parse_install_arguments, parse_sha256_hex};
     use std::ffi::OsString;
 
     fn parse(arguments: &[&str]) -> anyhow::Result<Vec<super::CoreInstallRequest>> {
-        parse_core_install_arguments(arguments.iter().map(OsString::from))
+        Ok(parse_install_arguments(arguments.iter().map(OsString::from))?.cores)
+    }
+
+    #[test]
+    fn combined_install_keeps_the_service_step() -> anyhow::Result<()> {
+        let options = parse_install_arguments(
+            [
+                "--install-service",
+                "--install-core",
+                "/dl/verge-mihomo",
+                "--sha256",
+                &"ab".repeat(32),
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )?;
+        assert!(
+            options.install_service,
+            "explicit cores must not turn combined installation into a core-only update"
+        );
+        assert_eq!(options.cores.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_install_modes_are_preserved() -> anyhow::Result<()> {
+        assert!(parse_install_arguments(std::iter::empty())?.install_service);
+        let debug = parse_install_arguments(["--debug"].into_iter().map(OsString::from))?;
+        assert!(debug.install_service && debug.debug);
+        assert!(
+            !parse_install_arguments(["--install-core", "/dl/core"].into_iter().map(OsString::from))?.install_service
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_install_options_are_rejected() {
+        assert!(parse_install_arguments(["--install-servce"].into_iter().map(OsString::from)).is_err());
     }
 
     #[test]
