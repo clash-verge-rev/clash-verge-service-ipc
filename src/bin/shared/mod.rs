@@ -13,7 +13,7 @@ pub(crate) fn enter_repair_gate() -> Result<clash_verge_service_ipc::ServiceRepa
 }
 
 pub(crate) fn run_maintenance_if_requested() -> Result<bool, Error> {
-    if !std::env::args().any(|argument| argument == "--cleanup-stale-owners") {
+    if !std::env::args_os().any(|argument| argument == "--cleanup-stale-owners") {
         return Ok(false);
     }
     let removed = clash_verge_service_ipc::cleanup_stale_owner_state()?;

@@ -1,0 +1,27 @@
+#![cfg(all(feature = "standalone", feature = "client"))]
+
+#[test]
+fn non_unicode_arguments_do_not_panic_before_parsing() -> std::io::Result<()> {
+    use std::ffi::OsString;
+
+    #[cfg(windows)]
+    let argument = {
+        use std::os::windows::ffi::OsStringExt as _;
+        OsString::from_wide(&[0xd800])
+    };
+    #[cfg(unix)]
+    let argument = {
+        use std::os::unix::ffi::OsStringExt as _;
+        OsString::from_vec(vec![0xff])
+    };
+
+    // Reject before entering the repair gate or changing any service state.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_clash-verge-service-install"))
+        .arg("--unknown-option")
+        .arg(argument)
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("unknown installer argument"), "{stderr}");
+    Ok(())
+}
