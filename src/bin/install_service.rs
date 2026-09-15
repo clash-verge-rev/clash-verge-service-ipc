@@ -340,9 +340,14 @@ fn install_service_cores(requested: &[CoreInstallRequest]) -> Result<(), Error> 
     if requested.is_empty() {
         return install_bundled_cores();
     }
+    // An explicit list replaces bundle discovery; omitted cores are left untouched.
+    // Publication is per file, so a later failure does not roll back earlier copies.
     let cores = clash_verge_service_ipc::prepare_core_install_directory()?;
     sweep_core_bookkeeping_leftovers(&cores);
-    for installed in publish_requested_cores(&cores, requested)? {
+    let installed = publish_requested_cores(&cores, requested).context(
+        "explicit core installation did not finish; earlier cores may already be installed; rerun the installer to complete installation",
+    )?;
+    for installed in installed {
         println!("Installed core {}", installed.display());
         allow_core_through_firewall(&installed);
     }
