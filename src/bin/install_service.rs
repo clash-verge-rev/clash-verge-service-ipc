@@ -3,6 +3,9 @@ fn main() {
     panic!("This program is not intended to run on this platform.");
 }
 
+#[cfg(all(target_os = "linux", not(test)))]
+#[path = "installer/selinux.rs"]
+mod selinux;
 mod shared;
 
 use anyhow::Error;
@@ -64,6 +67,16 @@ fn remove_ordinary_file_if_exists(path: &Path) -> Result<(), Error> {
     std::fs::remove_file(path).with_context(|| format!("failed to remove {path:?}"))
 }
 
+fn ensure_executable_label(path: &Path) -> Result<(), Error> {
+    #[cfg(all(target_os = "linux", not(test)))]
+    return selinux::ensure_executable_label(path);
+    #[cfg(any(not(target_os = "linux"), test))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 fn stage_binary(source: &Path, target: &Path) -> Result<PathBuf, Error> {
     let parent = target.parent().context("protected target has no parent")?;
     std::fs::create_dir_all(parent).with_context(|| format!("failed to create protected directory {parent:?}"))?;
@@ -97,6 +110,11 @@ fn stage_binary(source: &Path, target: &Path) -> Result<PathBuf, Error> {
     if sha256(source)? != sha256(&staged)? {
         let _ = std::fs::remove_file(&staged);
         bail!("staged binary hash does not match its source: {source:?}");
+    }
+    // Label the new inode before rename; neither chmod nor copying bytes preserves SELinux context.
+    if let Err(error) = ensure_executable_label(&staged) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
     }
     Ok(staged)
 }
@@ -154,6 +172,7 @@ fn install_core(
         && existing.is_file()
         && sha256(&target)? == source_hash
     {
+        ensure_executable_label(&target)?;
         println!("Core {} is already current", target.display());
         // Metadata repair is best-effort while a running Windows core holds the file open.
         if let Err(error) = propagate_source_modified_time(&target, &metadata) {
@@ -401,15 +420,7 @@ fn install_bundled_cores() -> Result<(), Error> {
                 // A locked Windows core may prevent an update; retain an existing approved copy.
                 // Without that fallback, installation must fail.
                 Err(error) => {
-                    // A symlink is not a fallback the runtime would accept.
-                    let fallback_is_regular = std::fs::symlink_metadata(cores.join(&name))
-                        .map(|metadata| metadata.is_file())
-                        .unwrap_or(false);
-                    if fallback_is_regular {
-                        eprintln!("Kept the existing copy of {name}: {error:#}");
-                    } else {
-                        return Err(error.context(format!("failed to stage {name}, and no approved copy exists")));
-                    }
+                    keep_existing_core(error, &cores.join(&name))?;
                 }
             }
             allow_core_through_firewall(&cores.join(&name));
@@ -421,6 +432,25 @@ fn install_bundled_cores() -> Result<(), Error> {
             installer.display()
         );
     }
+    Ok(())
+}
+
+fn keep_existing_core(error: Error, target: &Path) -> Result<(), Error> {
+    #[cfg(all(target_os = "linux", not(test)))]
+    if error.is::<selinux::LabelError>() {
+        return Err(error);
+    }
+    // A symlink is not a fallback the runtime would accept.
+    let fallback_is_regular = std::fs::symlink_metadata(target)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false);
+    if !fallback_is_regular {
+        return Err(error.context(format!("failed to stage {target:?}, and no approved copy exists")));
+    }
+    ensure_executable_label(target).with_context(|| {
+        format!("failed to stage {target:?}: {error:#}; could not repair the existing copy's label")
+    })?;
+    eprintln!("Kept the existing copy of {}: {error:#}", target.display());
     Ok(())
 }
 
