@@ -398,7 +398,13 @@ impl ResolvedCore {
 
 /// Resolves the requested core to an installer-approved copy safe for privileged execution.
 pub(crate) fn validate_core_path(core_path: &str) -> Result<ResolvedCore, ServiceError> {
-    let requested = canonical_regular_file(Path::new(core_path), "core")?;
+    let client_path = Path::new(core_path);
+    if !client_path.is_absolute() {
+        return Err(invalid_asset("core path must be absolute"));
+    }
+    let source = std::fs::canonicalize(client_path)
+        .map_err(|error| invalid_asset(format!("failed to canonicalize core: {error}")))?;
+    let requested = canonical_regular_file(&source, "core")?;
     // Integration tests stage cores in temporary directories that no installer has approved.
     if cfg!(feature = "test") {
         return Ok(ResolvedCore {
@@ -410,7 +416,8 @@ pub(crate) fn validate_core_path(core_path: &str) -> Result<ResolvedCore, Servic
         &crate::core::paths::service_paths()
             .map_err(|error| untrusted(error.to_string()))?
             .core_dir(),
-        &requested,
+        // The installer stages symlinked cores under the original name, not the target name.
+        client_path,
     )?;
     // Recheck the approved location in case its permissions changed after installation.
     require_trusted_core_location(&executable)?;
@@ -458,7 +465,7 @@ fn warn_if_the_client_core_has_moved_ahead(requested: &Path, approved: &Path, ap
     if requested == approved {
         return;
     }
-    let Ok(metadata) = std::fs::symlink_metadata(requested) else {
+    let Ok(metadata) = std::fs::metadata(requested) else {
         return;
     };
     let modified = |metadata: &std::fs::Metadata| metadata.modified().ok();
