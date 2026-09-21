@@ -107,7 +107,7 @@ fn check_platform_location(canonical: &Path) -> Result<(), ServiceError> {
     windows_location::check(canonical)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "test")))]
 pub(crate) fn require_trusted_service_registration(
     service: &platform_lib::service::Service,
 ) -> Result<(), ServiceError> {
@@ -123,7 +123,7 @@ mod windows_location {
     use std::path::Path;
     use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT, SE_OBJECT_TYPE, SE_SERVICE,
+        ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT, SE_OBJECT_TYPE,
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, IsValidSid, IsWellKnownSid,
@@ -185,7 +185,10 @@ mod windows_location {
         review_security(&security, hijack_rights, trusted, &label)
     }
 
+    #[cfg(not(feature = "test"))]
     pub(super) fn check_service_registration(service: &platform_lib::service::Service) -> Result<(), ServiceError> {
+        use windows_sys::Win32::Security::Authorization::SE_SERVICE;
+
         let label = format!("registered service {:?}", crate::WINDOWS_SERVICE_NAME);
         let security = SecurityInfo::read(service.raw_handle().cast(), SE_SERVICE, &label)?;
         let rights = platform_lib::service::ServiceAccess::CHANGE_CONFIG.bits()
