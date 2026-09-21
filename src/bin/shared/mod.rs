@@ -2,6 +2,15 @@
 
 use anyhow::Error;
 
+pub(crate) fn repair_active_owner_state() -> Result<(), Error> {
+    if let Some(backup) = clash_verge_service_ipc::repair_active_owner_state()? {
+        eprintln!(
+            "Quarantined corrupt active owner state at {backup:?}; the next start will establish a new owner session"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn enter_repair_gate() -> Result<clash_verge_service_ipc::ServiceRepairGate, Error> {
     match clash_verge_service_ipc::acquire_service_repair_gate()? {
         Some(gate) => Ok(gate),

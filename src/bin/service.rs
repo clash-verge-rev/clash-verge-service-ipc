@@ -102,7 +102,7 @@ fn run_service() -> platform_lib::Result<()> {
             Ok(()) => {
                 if let Err(error) = restore_desired_state().await {
                     tracing::warn!(
-                        "Desired state restoration failed; keeping IPC available for GUI recovery: {}",
+                        "Desired state restoration failed; keeping IPC available for GUI recovery: {:#}",
                         error
                     );
                 }

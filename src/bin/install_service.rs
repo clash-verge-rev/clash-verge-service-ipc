@@ -532,7 +532,7 @@ fn publish_staged_binary(staged: &Path, target: &Path) -> Result<(), Error> {
 }
 
 fn wait_for_service_ready() -> Result<(), Error> {
-    const READY_TIMEOUT: Duration = Duration::from_secs(20);
+    const READY_TIMEOUT: Duration = Duration::from_secs(45);
     const READY_INTERVAL: Duration = Duration::from_millis(250);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -726,6 +726,7 @@ fn main() -> Result<(), Error> {
     if launchd_install_plan == LaunchdInstallPlan::Bootout {
         run_command("launchctl", &["bootout", "system", &plist_path], debug)?;
     }
+    shared::repair_active_owner_state()?;
     // Staged where the service is already down, so a core it was running no longer holds its file.
     install_service_cores(&options.cores)?;
     publish_staged_binary(&staged, &target_binary_path)?;
@@ -777,6 +778,7 @@ fn main() -> Result<(), Error> {
     let unit_path = PathBuf::from("/etc/systemd/system").join(&unit_name);
 
     let _ = run_command("systemctl", &["stop", &unit_name], debug);
+    shared::repair_active_owner_state()?;
     // Staged where the service is already down, so a core it was running no longer holds its file.
     install_service_cores(&options.cores)?;
     publish_staged_binary(&staged, &target)?;
@@ -884,6 +886,7 @@ fn main() -> anyhow::Result<()> {
 
             // Staged where the service is already down, so a core it was running no longer holds
             // its file open.
+            shared::repair_active_owner_state()?;
             install_service_cores(&options.cores)?;
             publish_staged_binary(&staged, &target)?;
             service.change_config(&service_info)?;
@@ -896,6 +899,7 @@ fn main() -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     }
 
+    shared::repair_active_owner_state()?;
     install_service_cores(&options.cores)?;
     publish_staged_binary(&staged, &target)?;
     let start_access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START;

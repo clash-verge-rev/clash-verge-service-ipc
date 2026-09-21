@@ -23,8 +23,9 @@ pub use core::{
     ActiveOwnerState, DesiredState, REPAIR_IN_PROGRESS_EXIT_CODE, ServiceOwnerGuard, ServiceRepairGate,
     acquire_service_owner, acquire_service_repair_gate, cleanup_stale_owner_state, load_active_owner,
     load_owner_desired_state, prepare_core_install_directory, prepare_service_install_directory,
-    reconcile_service_startup, require_trusted_core_source, restore_desired_state, run_ipc_server,
-    run_ipc_supervisor_until_shutdown, service_lifecycle_state, set_service_lifecycle_state, stop_ipc_server,
+    reconcile_service_startup, repair_active_owner_state, require_trusted_core_source, restore_desired_state,
+    run_ipc_server, run_ipc_supervisor_until_shutdown, service_lifecycle_state, set_service_lifecycle_state,
+    stop_ipc_server,
 };
 
 #[cfg(feature = "test")]

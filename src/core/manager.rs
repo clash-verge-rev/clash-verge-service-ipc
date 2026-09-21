@@ -25,6 +25,9 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
+const CORE_IPC_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const CORE_IPC_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 #[derive(Debug)]
 pub struct CoreExitInfo {
     pub exit_code: Option<i32>,
@@ -71,6 +74,23 @@ impl ChildGuard {
 
     fn take(mut self) -> Option<Child> {
         self.child.take()
+    }
+
+    async fn await_ipc(&mut self, path: String, owner: OwnerIdentity) -> Result<()> {
+        let child = self.inner().context("core process is unavailable during startup")?;
+        let pid = child.id();
+        tokio::select! {
+            status = child.wait() => {
+                let status = status.context("failed to wait for the starting core")?;
+                for reader in self.readers.drain(..) {
+                    if let Err(error) = reader.await {
+                        warn!("Failed to finish reading exited core output: {error}");
+                    }
+                }
+                Err(anyhow!("core exited before its IPC endpoint became ready: {status}"))
+            }
+            result = secure_core_ipc_socket(path, owner, pid) => result,
+        }
     }
 
     async fn kill_now(&mut self) -> Result<()> {
@@ -304,8 +324,9 @@ impl CoreManager {
             run_with_logging(&config.core_config.core_path, &args, &config.log_config, &owner).await?;
         let child_pid = child_guard.id();
 
-        if let Err(error) =
-            secure_core_ipc_socket(config.core_config.core_ipc_path.clone(), owner.clone(), child_pid).await
+        if let Err(error) = child_guard
+            .await_ipc(config.core_config.core_ipc_path.clone(), owner.clone())
+            .await
         {
             if let Err(kill_error) = child_guard.kill_now().await {
                 let now_secs = unix_timestamp_secs();
@@ -500,9 +521,9 @@ impl CoreManager {
                     match run_with_logging(&config.core_config.core_path, &args, &config.log_config, &owner).await {
                         Ok(mut new_guard) => {
                             let new_pid = new_guard.id();
-                            if let Err(error) =
-                                secure_core_ipc_socket(config.core_config.core_ipc_path.clone(), owner.clone(), new_pid)
-                                    .await
+                            if let Err(error) = new_guard
+                                .await_ipc(config.core_config.core_ipc_path.clone(), owner.clone())
+                                .await
                             {
                                 error!("Failed to secure restarted core IPC: {error:#}");
                                 if let Err(kill_error) = new_guard.kill_now().await {
@@ -811,7 +832,8 @@ async fn secure_core_ipc_socket(core_ipc_path: String, owner: OwnerIdentity, exp
         };
         let target = std::path::PathBuf::from(core_ipc_path);
         let mut found = false;
-        for _ in 0..40 {
+        let deadline = tokio::time::Instant::now() + CORE_IPC_READY_TIMEOUT;
+        loop {
             match tokio::fs::symlink_metadata(&target).await {
                 Ok(metadata) if metadata.file_type().is_socket() => {
                     found = true;
@@ -821,7 +843,10 @@ async fn secure_core_ipc_socket(core_ipc_path: String, owner: OwnerIdentity, exp
                     anyhow::bail!("core IPC path {target:?} is not a socket");
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(CORE_IPC_POLL_INTERVAL).await;
                 }
                 Err(error) => {
                     return Err(error.into());
@@ -829,7 +854,7 @@ async fn secure_core_ipc_socket(core_ipc_path: String, owner: OwnerIdentity, exp
             }
         }
         if !found {
-            anyhow::bail!("core IPC socket did not appear at {target:?}");
+            anyhow::bail!("core IPC socket did not appear at {target:?} within {CORE_IPC_READY_TIMEOUT:?}");
         }
         let path = std::ffi::CString::new(target.as_os_str().as_bytes())
             .map_err(|_| anyhow::anyhow!("core IPC socket path contains NUL"))?;
@@ -873,9 +898,9 @@ async fn secure_core_ipc_socket(core_ipc_path: String, owner: OwnerIdentity, exp
         };
         let mut pipe: Vec<u16> = std::ffi::OsStr::new(&core_ipc_path).encode_wide().collect();
         pipe.push(0);
-        let mut handle_value = INVALID_HANDLE_VALUE as isize;
-        for _ in 0..40 {
-            handle_value = unsafe {
+        let deadline = tokio::time::Instant::now() + CORE_IPC_READY_TIMEOUT;
+        let handle_value = loop {
+            let handle_value = unsafe {
                 CreateFileW(
                     pipe.as_ptr(),
                     READ_CONTROL | WRITE_DAC,
@@ -887,13 +912,14 @@ async fn secure_core_ipc_socket(core_ipc_path: String, owner: OwnerIdentity, exp
                 )
             } as isize;
             if handle_value != INVALID_HANDLE_VALUE as isize {
-                break;
+                break handle_value;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        if handle_value == INVALID_HANDLE_VALUE as isize {
-            return Err(std::io::Error::last_os_error().into());
-        }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("core IPC pipe did not become ready within {CORE_IPC_READY_TIMEOUT:?}"));
+            }
+            tokio::time::sleep(CORE_IPC_POLL_INTERVAL).await;
+        };
         let handle = handle_value as *mut std::ffi::c_void;
         let _pipe = unsafe { std::fs::File::from_raw_handle(handle) };
         let mut server_pid = 0u32;

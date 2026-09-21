@@ -619,7 +619,7 @@ fn create_ipc_router() -> Result<Router> {
             };
             match service_status_snapshot(&owner).await {
                 Ok(status) => ok_json(status),
-                Err(error) => service_unavailable(format!("Failed to collect service status: {}", error)),
+                Err(error) => service_unavailable(format!("Failed to collect service status: {error:#}")),
             }
         })
         .post(IpcCommand::StartClash.as_ref(), |ctx| async move {
@@ -644,7 +644,7 @@ fn create_ipc_router() -> Result<Router> {
             let previous_owner = match load_active_owner().await {
                 Ok(owner) => owner,
                 Err(error) => {
-                    return service_unavailable(format!("Failed to load active owner: {error}"));
+                    return service_unavailable(format!("Failed to load active owner: {error:#}"));
                 }
             };
             let prepared_runtime = match prepare_runtime(&owner, &start_request.runtime).await {

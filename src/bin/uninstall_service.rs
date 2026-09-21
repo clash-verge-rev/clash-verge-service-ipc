@@ -133,6 +133,9 @@ fn main() -> Result<(), Error> {
             .map_err(|e| anyhow::anyhow!("Failed to remove bundle directory: {}", e))?;
     }
 
+    if let Err(error) = shared::repair_active_owner_state() {
+        eprintln!("Warning: failed to repair active owner state during uninstall: {error:#}");
+    }
     remove_installed_cores();
 
     Ok(())
@@ -166,6 +169,9 @@ fn main() -> Result<(), Error> {
     // A fallback publish may have displaced a locked service image aside; best-effort.
     let _ = std::fs::remove_file(target.with_extension(clash_verge_service_ipc::CORE_DISPLACED_EXTENSION));
 
+    if let Err(error) = shared::repair_active_owner_state() {
+        eprintln!("Warning: failed to repair active owner state during uninstall: {error:#}");
+    }
     remove_installed_cores();
 
     Ok(())
@@ -247,6 +253,7 @@ fn main() -> anyhow::Result<()> {
     }
     // A fallback publish may have displaced a locked service image aside; best-effort.
     let _ = std::fs::remove_file(target.with_extension(clash_verge_service_ipc::CORE_DISPLACED_EXTENSION));
+    shared::repair_active_owner_state()?;
     remove_installed_cores();
     println!("Service uninstalled successfully. Resource cleanup warnings can be ignored.");
     Ok(())

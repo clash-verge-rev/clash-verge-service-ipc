@@ -72,7 +72,7 @@ pub(in crate::core) use windows_security as platform_security;
 #[cfg(feature = "standalone")]
 pub use desired::{ActiveOwnerState, DesiredState, load_active_owner, load_owner_desired_state, restore_desired_state};
 #[cfg(feature = "standalone")]
-pub use maintenance::cleanup_stale_owner_state;
+pub use maintenance::{cleanup_stale_owner_state, repair_active_owner_state};
 #[cfg(all(feature = "standalone", feature = "test"))]
 pub use manager::{CoreWatchdogTestConfig, set_core_watchdog_config_for_tests};
 #[cfg(feature = "standalone")]

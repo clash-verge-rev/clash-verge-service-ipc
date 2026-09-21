@@ -4,6 +4,38 @@ use crate::{OwnerIdentity, owner_key};
 use anyhow::{Context as _, Result};
 use std::fs::{File, OpenOptions};
 
+/// Only privileged installation/repair may discard unreadable authorization state.
+pub fn repair_active_owner_state() -> Result<Option<std::path::PathBuf>> {
+    crate::prepare_service_install_directory()?;
+    let _stopped_guard = acquire_stopped_service_guard()?;
+    let path = service_paths().active_owner_path();
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed to inspect active owner state for repair"),
+    };
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("active owner state {path:?} is not an ordinary file");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if metadata.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            anyhow::bail!("active owner state {path:?} is a reparse point");
+        }
+    }
+    let content = std::fs::read(&path).context("failed to read active owner state for repair")?;
+    if serde_json::from_slice::<ActiveOwnerState>(&content).is_ok() {
+        return Ok(None);
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let backup = path.with_file_name(format!("active-owner.json.corrupt-{}-{timestamp}", std::process::id()));
+    std::fs::rename(&path, &backup).context("failed to quarantine corrupt active owner state")?;
+    Ok(Some(backup))
+}
+
 pub fn cleanup_stale_owner_state() -> Result<Vec<String>> {
     let _stopped_guard = acquire_stopped_service_guard()?;
     let paths = service_paths();
@@ -87,7 +119,7 @@ fn acquire_stopped_service_guard() -> Result<StoppedServiceGuard> {
         use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Win32::Storage::FileSystem::LockFile;
 
-        crate::core::windows_security::ensure_private_service_directory(paths.runtime_dir())?;
+        crate::core::windows_security::ensure_private_installer_directory(paths.runtime_dir())?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
