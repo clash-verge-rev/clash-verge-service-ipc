@@ -130,6 +130,8 @@ mod windows_location {
     const TRUSTED_INSTALLER_SID: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+    const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+    const ACCESS_DENIED_CALLBACK_ACE_TYPE: u8 = 10;
     const INHERIT_ONLY_ACE_FLAG: u8 = 0x08;
 
     /// Rights that let a principal put different bytes behind the core's own path.
@@ -191,10 +193,10 @@ mod windows_location {
                 continue;
             }
             match header.AceType {
-                ACCESS_DENIED_ACE_TYPE => continue,
-                ACCESS_ALLOWED_ACE_TYPE => {}
-                // Callback and object ACEs place the SID at a different offset; refuse rather
-                // than read the wrong bytes.
+                ACCESS_DENIED_ACE_TYPE | ACCESS_DENIED_CALLBACK_ACE_TYPE => continue,
+                // Callback allows have the same SID layout; assume their condition can hold.
+                ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => {}
+                // Object ACEs have a different SID layout; unknown types remain untrusted.
                 _ => {
                     return Err(untrusted(format!(
                         "core path {component:?} carries an ACE type this check cannot evaluate"
