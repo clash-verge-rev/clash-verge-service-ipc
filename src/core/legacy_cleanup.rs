@@ -6,6 +6,7 @@ use tracing::{info, warn};
 
 pub(crate) async fn cleanup_legacy_owner_files(owner: &AuthenticatedOwner) -> Result<(), ServiceError> {
     let marker = service_paths()
+        .map_err(|error| cleanup_error(error.to_string()))?
         .for_owner(&owner.identity)
         .root()
         .join("legacy-cleanup-v1");

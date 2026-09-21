@@ -406,7 +406,12 @@ pub(crate) fn validate_core_path(core_path: &str) -> Result<ResolvedCore, Servic
             requested,
         });
     }
-    let executable = approved_core_copy(&crate::core::paths::service_paths().core_dir(), &requested)?;
+    let executable = approved_core_copy(
+        &crate::core::paths::service_paths()
+            .map_err(|error| untrusted(error.to_string()))?
+            .core_dir(),
+        &requested,
+    )?;
     // Recheck the approved location in case its permissions changed after installation.
     require_trusted_core_location(&executable)?;
     Ok(ResolvedCore { requested, executable })

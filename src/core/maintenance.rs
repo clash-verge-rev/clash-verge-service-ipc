@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 pub fn repair_active_owner_state() -> Result<Option<std::path::PathBuf>> {
     crate::prepare_service_install_directory()?;
     let _stopped_guard = acquire_stopped_service_guard()?;
-    let path = service_paths().active_owner_path();
+    let path = service_paths()?.active_owner_path();
     let metadata = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -38,7 +38,7 @@ pub fn repair_active_owner_state() -> Result<Option<std::path::PathBuf>> {
 
 pub fn cleanup_stale_owner_state() -> Result<Vec<String>> {
     let _stopped_guard = acquire_stopped_service_guard()?;
-    let paths = service_paths();
+    let paths = service_paths()?;
     let users_root = paths.persistent_state_dir().join("users");
     let entries = match std::fs::read_dir(&users_root) {
         Ok(entries) => entries,
@@ -95,7 +95,7 @@ struct StoppedServiceGuard {
 }
 
 fn acquire_stopped_service_guard() -> Result<StoppedServiceGuard> {
-    let paths = service_paths();
+    let paths = service_paths()?;
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
@@ -135,7 +135,7 @@ fn acquire_stopped_service_guard() -> Result<StoppedServiceGuard> {
 }
 
 fn read_active_owner() -> Result<Option<ActiveOwnerState>> {
-    let path = service_paths().active_owner_path();
+    let path = service_paths()?.active_owner_path();
     match std::fs::read(&path) {
         Ok(content) => serde_json::from_slice(&content)
             .map(Some)

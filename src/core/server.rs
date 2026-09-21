@@ -418,7 +418,7 @@ fn ipc_backoff_delay(attempt: u32) -> Duration {
 async fn make_ipc_dir() -> Result<()> {
     #[cfg(unix)]
     {
-        let paths = service_paths();
+        let paths = service_paths()?;
         let Some(dir_path) = paths.ipc_path().parent() else {
             return Ok(());
         };
@@ -439,7 +439,7 @@ async fn cleanup_ipc_path() -> Result<()> {
     {
         use tokio::fs;
 
-        let paths = service_paths();
+        let paths = service_paths()?;
         if paths.ipc_path().exists() {
             fs::remove_file(paths.ipc_path()).await?;
         }
@@ -450,7 +450,7 @@ async fn cleanup_ipc_path() -> Result<()> {
 async fn cleanup_stale_ipc_socket() -> Result<()> {
     #[cfg(unix)]
     {
-        let paths = service_paths();
+        let paths = service_paths()?;
         let socket_path = paths.ipc_path();
         if !socket_path.exists() {
             return Ok(());
@@ -485,7 +485,7 @@ async fn init_ipc_state() -> Result<()> {
 }
 
 fn create_ipc_server() -> Result<IpcHttpServer> {
-    let paths = service_paths();
+    let paths = service_paths()?;
 
     let server = IpcHttpServer::with_config(
         paths.ipc_path(),
@@ -695,10 +695,11 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Continue(guard) => guard,
                 ControlFlow::Break(response) => return response,
             };
-            let path = service_paths()
-                .for_owner(&owner.identity)
-                .logs_dir()
-                .join("service_latest.log");
+            let paths = match service_paths() {
+                Ok(paths) => paths,
+                Err(error) => return service_unavailable(format!("Failed to locate service data: {error}")),
+            };
+            let path = paths.for_owner(&owner.identity).logs_dir().join("service_latest.log");
             match read_log_snapshot(&path).await {
                 Ok(snapshot) => ok_json(snapshot),
                 Err(error) => service_unavailable(format!("Failed to read core log snapshot: {error}")),
@@ -782,7 +783,11 @@ fn create_ipc_router() -> Result<Router> {
                     ControlFlow::Break(response) => return response,
                 };
             // Never let the client choose a service-owned log destination.
-            writer_config.directory = service_paths()
+            let paths = match service_paths() {
+                Ok(paths) => paths,
+                Err(error) => return service_unavailable(format!("Failed to locate service data: {error}")),
+            };
+            writer_config.directory = paths
                 .for_owner(&owner.identity)
                 .logs_dir()
                 .to_string_lossy()

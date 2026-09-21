@@ -1,6 +1,9 @@
 use crate::core::structure::{OwnerIdentity, owner_key};
 use std::path::{Path, PathBuf};
 
+#[cfg(all(windows, not(feature = "test")))]
+mod windows;
+
 /// Staging-file extension; core resolution rejects it so partial copies cannot run.
 pub const CORE_STAGING_EXTENSION: &str = "next";
 
@@ -99,10 +102,13 @@ impl OwnerPaths {
     }
 }
 
-pub fn service_paths() -> ServicePaths {
+pub fn service_paths() -> std::io::Result<ServicePaths> {
+    let persistent_state_dir = persistent_state_dir()?;
+    #[cfg(unix)]
     let runtime_dir = runtime_dir();
-    let persistent_state_dir = persistent_state_dir();
-    ServicePaths {
+    #[cfg(windows)]
+    let runtime_dir = persistent_state_dir.join("runtime");
+    Ok(ServicePaths {
         desired_state_path: persistent_state_dir.join("desired-state.json"),
         persistent_state_dir,
         ipc_path: PathBuf::from(crate::IPC_PATH),
@@ -110,12 +116,12 @@ pub fn service_paths() -> ServicePaths {
         pid_file_path: runtime_dir.join(format!("{}.pid", crate::SERVICE_SLUG)),
         core_runtime_path: runtime_dir.join(format!("{}.core.json", crate::SERVICE_SLUG)),
         runtime_dir,
-    }
+    })
 }
 
 #[cfg(feature = "standalone")]
 pub(crate) fn ensure_persistent_state_layout() -> anyhow::Result<()> {
-    let paths = service_paths();
+    let paths = service_paths()?;
     let root = paths.persistent_state_dir();
     use crate::core::platform_security;
 
@@ -132,7 +138,7 @@ pub(crate) fn ensure_persistent_state_layout() -> anyhow::Result<()> {
 
 #[cfg(feature = "standalone")]
 pub fn prepare_service_install_directory() -> anyhow::Result<PathBuf> {
-    let paths = service_paths();
+    let paths = service_paths()?;
     let root = paths.persistent_state_dir();
     let install = paths.install_dir();
     use crate::core::platform_security;
@@ -149,7 +155,7 @@ pub fn prepare_service_install_directory() -> anyhow::Result<PathBuf> {
 /// Letting both create it would flip the owner back and forth on every start.
 #[cfg(feature = "standalone")]
 pub fn prepare_core_install_directory() -> anyhow::Result<PathBuf> {
-    let paths = service_paths();
+    let paths = service_paths()?;
     let root = paths.persistent_state_dir();
     let cores = paths.core_dir();
     use crate::core::platform_security;
@@ -162,73 +168,41 @@ pub fn prepare_core_install_directory() -> anyhow::Result<PathBuf> {
 #[cfg(feature = "standalone")]
 pub(crate) fn ensure_owner_state_directory(identity: &OwnerIdentity) -> anyhow::Result<OwnerPaths> {
     ensure_persistent_state_layout()?;
-    let owner = service_paths().for_owner(identity);
+    let owner = service_paths()?.for_owner(identity);
     crate::core::platform_security::ensure_private_service_directory(owner.root())?;
     Ok(owner)
 }
 
+#[cfg(unix)]
 fn runtime_dir() -> PathBuf {
-    #[cfg(unix)]
-    {
-        Path::new(crate::IPC_PATH)
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("/run/clash-verge-service"))
-    }
-
-    #[cfg(windows)]
-    {
-        persistent_state_dir().join("runtime")
-    }
+    Path::new(crate::IPC_PATH)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/run/clash-verge-service"))
 }
 
-fn persistent_state_dir() -> PathBuf {
+fn persistent_state_dir() -> std::io::Result<PathBuf> {
     #[cfg(feature = "test")]
     {
-        std::env::temp_dir().join("clash-verge-service-ipc-test-state")
+        Ok(std::env::temp_dir().join("clash-verge-service-ipc-test-state"))
     }
 
     // A root launchd daemon needs stable system state independent of unreliable HOME/XDG values
     // (issue #7333).
     #[cfg(all(target_os = "macos", not(feature = "test")))]
     {
-        PathBuf::from("/Library/Application Support").join(crate::SERVICE_SLUG)
+        Ok(PathBuf::from("/Library/Application Support").join(crate::SERVICE_SLUG))
     }
 
     #[cfg(all(unix, not(target_os = "macos"), not(feature = "test")))]
     {
-        PathBuf::from("/var/lib").join(crate::SERVICE_SLUG)
+        Ok(PathBuf::from("/var/lib").join(crate::SERVICE_SLUG))
     }
 
     #[cfg(all(windows, not(feature = "test")))]
     {
-        windows_program_data()
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-            .join(crate::SERVICE_SLUG)
+        windows::persistent_state_dir()
     }
-}
-
-#[cfg(all(windows, not(feature = "test")))]
-fn windows_program_data() -> Option<PathBuf> {
-    use std::os::windows::ffi::OsStringExt as _;
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
-
-    let mut raw = std::ptr::null_mut();
-    let status = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, std::ptr::null_mut(), &mut raw) };
-    if status < 0 || raw.is_null() {
-        return None;
-    }
-    let length = unsafe {
-        let mut length = 0;
-        while *raw.add(length) != 0 {
-            length += 1;
-        }
-        length
-    };
-    let value = std::ffi::OsString::from_wide(unsafe { std::slice::from_raw_parts(raw, length) });
-    unsafe { CoTaskMemFree(raw.cast()) };
-    Some(PathBuf::from(value))
 }
 
 #[cfg(unix)]
@@ -257,7 +231,7 @@ pub fn mihomo_ipc_path(identity: &OwnerIdentity) -> String {
                 #[cfg(feature = "test")]
                 let runtime_root = PathBuf::from("/tmp/clash-verge-service-ipc-test");
                 #[cfg(not(feature = "test"))]
-                let runtime_root = service_paths().runtime_dir().to_path_buf();
+                let runtime_root = runtime_dir();
 
                 unix_mihomo_ipc_path(&runtime_root, *_uid)
                     .to_string_lossy()
@@ -297,8 +271,8 @@ mod tests {
     }
 
     #[test]
-    fn owner_paths_isolate_state_runtime_and_logs() {
-        let paths = service_paths();
+    fn owner_paths_isolate_state_runtime_and_logs() -> std::io::Result<()> {
+        let paths = service_paths()?;
         let owner = paths.for_owner(&OwnerIdentity::Unix { uid: 501, gid: 20 });
 
         assert!(owner.root().ends_with("users/501"));
@@ -309,6 +283,7 @@ mod tests {
             paths.active_owner_path(),
             paths.persistent_state_dir().join("active-owner.json")
         );
+        Ok(())
     }
 
     #[cfg(all(windows, feature = "test"))]

@@ -12,7 +12,7 @@ pub(super) struct CoreRuntimeRecord {
 }
 
 pub(super) async fn write_core_runtime_record(record: &CoreRuntimeRecord) -> Result<()> {
-    let paths = service_paths();
+    let paths = service_paths()?;
     if let Some(parent) = paths.core_runtime_path().parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -41,7 +41,7 @@ pub(super) async fn write_core_runtime_record(record: &CoreRuntimeRecord) -> Res
 }
 
 pub(super) async fn read_core_runtime_record() -> Result<Option<CoreRuntimeRecord>> {
-    let paths = service_paths();
+    let paths = service_paths()?;
     let content = match tokio::fs::read(paths.core_runtime_path()).await {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -57,7 +57,13 @@ pub(super) async fn read_core_runtime_record() -> Result<Option<CoreRuntimeRecor
 }
 
 pub(super) async fn remove_core_runtime_record() {
-    let paths = service_paths();
+    let paths = match service_paths() {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::warn!("Could not locate core runtime record for cleanup: {error}");
+            return;
+        }
+    };
     let _ = tokio::fs::remove_file(paths.core_runtime_path()).await;
 }
 

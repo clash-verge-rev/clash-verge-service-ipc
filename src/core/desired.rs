@@ -55,7 +55,7 @@ struct OwnerGenerationState {
 }
 
 pub async fn load_owner_desired_state(owner_key: &str) -> Result<DesiredState> {
-    let path = service_paths().for_owner_key(owner_key).desired_state_path();
+    let path = service_paths()?.for_owner_key(owner_key).desired_state_path();
     Ok(read_owner_desired_state_resilient(&path).await)
 }
 
@@ -90,7 +90,7 @@ pub async fn persist_owner_writer_config(owner: &AuthenticatedOwner, config: &Wr
 }
 
 pub async fn load_active_owner() -> Result<Option<ActiveOwnerState>> {
-    let path = service_paths().active_owner_path();
+    let path = service_paths()?.active_owner_path();
     secure_state_file_if_exists(&path)?;
     match tokio::fs::read(&path).await {
         Ok(content) => serde_json::from_slice(&content)
@@ -105,14 +105,14 @@ pub async fn load_active_owner() -> Result<Option<ActiveOwnerState>> {
 pub async fn persist_active_owner(owner: &AuthenticatedOwner) -> Result<ActiveOwnerState> {
     let _guard = DESIRED_STATE_LOCK.lock().await;
     let state = ActiveOwnerState::from(owner);
-    write_json_atomic(&service_paths().active_owner_path(), &state).await?;
+    write_json_atomic(&service_paths()?.active_owner_path(), &state).await?;
     Ok(state)
 }
 
 pub async fn commit_active_owner_session(owner: &AuthenticatedOwner, session_token: &str) -> Result<ActiveOwnerState> {
     let session_token_hash = hash_session_token(session_token)?;
     let _guard = DESIRED_STATE_LOCK.lock().await;
-    let paths = service_paths();
+    let paths = service_paths()?;
     let generation_path = paths.owner_generation_path();
     let mut generation_state: OwnerGenerationState = read_json_or_default(&generation_path).await?;
     generation_state.generation = generation_state.generation.saturating_add(1);
@@ -131,7 +131,7 @@ pub async fn commit_active_owner_session(owner: &AuthenticatedOwner, session_tok
 
 pub async fn clear_active_owner() -> Result<()> {
     let _guard = DESIRED_STATE_LOCK.lock().await;
-    let path = service_paths().active_owner_path();
+    let path = service_paths()?.active_owner_path();
     match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -203,7 +203,14 @@ fn core_path_is_unusable(error: &anyhow::Error) -> bool {
 }
 
 async fn backup_legacy_desired_states() {
-    let legacy_files = vec![service_paths().desired_state_path().to_path_buf()];
+    let paths = match service_paths() {
+        Ok(paths) => paths,
+        Err(error) => {
+            warn!("Could not locate legacy desired state for backup: {error}");
+            return;
+        }
+    };
+    let legacy_files = vec![paths.desired_state_path().to_path_buf()];
     #[cfg(target_os = "macos")]
     let legacy_files = legacy_files
         .into_iter()
@@ -240,7 +247,7 @@ async fn backup_legacy_state_file(path: &std::path::Path) -> Result<Option<std::
 
 async fn update_owner_desired_state(owner_key: &str, update: impl FnOnce(&mut DesiredState)) -> Result<DesiredState> {
     let _guard = DESIRED_STATE_LOCK.lock().await;
-    let path = service_paths().for_owner_key(owner_key).desired_state_path();
+    let path = service_paths()?.for_owner_key(owner_key).desired_state_path();
     let mut state = read_owner_desired_state_resilient(&path).await;
     update(&mut state);
     state.generation = state.generation.saturating_add(1);
@@ -465,7 +472,7 @@ mod owner_tests {
 
         assert_ne!(first.session_token_hash, first_token);
         assert!(
-            !tokio::fs::read_to_string(crate::service_paths().active_owner_path())
+            !tokio::fs::read_to_string(crate::service_paths()?.active_owner_path())
                 .await?
                 .contains(&first_token)
         );
@@ -488,7 +495,7 @@ mod owner_tests {
             "identity": owner.identity,
             "app_data_root": owner.app_data_root.to_string_lossy(),
         });
-        write_json_atomic(&crate::service_paths().active_owner_path(), &legacy_state).await?;
+        write_json_atomic(&crate::service_paths()?.active_owner_path(), &legacy_state).await?;
 
         let active = load_active_owner().await?.expect("legacy owner should load");
 
@@ -515,7 +522,7 @@ mod owner_tests {
     #[serial]
     async fn corrupt_owner_desired_state_is_quarantined_and_rebuilt() -> anyhow::Result<()> {
         let owner = test_owner(90_008);
-        let owner_root = crate::service_paths().for_owner_key(&owner.key).root().to_path_buf();
+        let owner_root = crate::service_paths()?.for_owner_key(&owner.key).root().to_path_buf();
         let _ = std::fs::remove_dir_all(&owner_root);
         std::fs::create_dir_all(&owner_root)?;
         let path = owner_root.join("desired-state.json");
@@ -545,7 +552,7 @@ mod owner_tests {
     #[serial]
     async fn corrupt_owner_desired_state_load_returns_safe_default() -> anyhow::Result<()> {
         let owner = test_owner(90_010);
-        let owner_root = crate::service_paths().for_owner_key(&owner.key).root().to_path_buf();
+        let owner_root = crate::service_paths()?.for_owner_key(&owner.key).root().to_path_buf();
         let _ = std::fs::remove_dir_all(&owner_root);
         std::fs::create_dir_all(&owner_root)?;
         let path = owner_root.join("desired-state.json");
@@ -575,7 +582,7 @@ mod owner_tests {
     #[serial]
     async fn unavailable_owner_desired_state_does_not_reject_live_state_change() -> anyhow::Result<()> {
         let owner = test_owner(90_009);
-        let owner_root = crate::service_paths().for_owner_key(&owner.key).root().to_path_buf();
+        let owner_root = crate::service_paths()?.for_owner_key(&owner.key).root().to_path_buf();
         let _ = std::fs::remove_dir_all(&owner_root);
         std::fs::create_dir_all(owner_root.join("desired-state.json"))?;
 

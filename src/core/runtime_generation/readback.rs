@@ -18,7 +18,10 @@ pub(crate) async fn read_runtime_file(
     destination: &str,
     offset: u64,
 ) -> Result<RuntimeFileOutcome, ServiceError> {
-    let generation = service_paths().for_owner(&owner.identity).runtime_dir();
+    let generation = service_paths()
+        .map_err(|error| invalid_asset(error.to_string()))?
+        .for_owner(&owner.identity)
+        .runtime_dir();
     let key = destination_key(&validate_destination(destination)?)?;
     let manifest = read_manifest(&generation).await.map_err(invalid_asset)?;
     if !manifest.remote_providers.contains_key(&key) {

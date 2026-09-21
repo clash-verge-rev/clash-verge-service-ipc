@@ -33,7 +33,7 @@ pub fn require_trusted_core_source(path: &Path) -> anyhow::Result<PathBuf> {
 #[cfg(target_os = "macos")]
 fn check_platform_location(canonical: &Path) -> Result<(), ServiceError> {
     // Stop at the protected state root: macOS makes its parent admin-group-writable.
-    let paths = crate::core::paths::service_paths();
+    let paths = crate::core::paths::service_paths().map_err(|error| untrusted(error.to_string()))?;
     let state_root = paths.persistent_state_dir();
     if canonical.starts_with(state_root) {
         return require_root_owned_chain(canonical, Some(state_root));
@@ -108,6 +108,13 @@ fn check_platform_location(canonical: &Path) -> Result<(), ServiceError> {
 }
 
 #[cfg(windows)]
+pub(crate) fn require_trusted_service_registration(
+    service: &platform_lib::service::Service,
+) -> Result<(), ServiceError> {
+    windows_location::check_service_registration(service)
+}
+
+#[cfg(windows)]
 mod windows_location {
     use super::{ServiceError, untrusted};
     use std::ffi::c_void;
@@ -115,7 +122,9 @@ mod windows_location {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use std::path::Path;
     use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT, SE_OBJECT_TYPE, SE_SERVICE,
+    };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, IsValidSid, IsWellKnownSid,
         OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, WinBuiltinAdministratorsSid, WinLocalSystemSid,
@@ -171,21 +180,43 @@ mod windows_location {
         hijack_rights: u32,
         trusted: &TrustedSids,
     ) -> Result<(), ServiceError> {
-        let security = SecurityInfo::read(handle, component)?;
+        let label = format!("core path {component:?}");
+        let security = SecurityInfo::read(handle, SE_FILE_OBJECT, &label)?;
+        review_security(&security, hijack_rights, trusted, &label)
+    }
+
+    pub(super) fn check_service_registration(service: &platform_lib::service::Service) -> Result<(), ServiceError> {
+        let label = format!("registered service {:?}", crate::WINDOWS_SERVICE_NAME);
+        let security = SecurityInfo::read(service.raw_handle().cast(), SE_SERVICE, &label)?;
+        let rights = platform_lib::service::ServiceAccess::CHANGE_CONFIG.bits()
+            | DELETE
+            | WRITE_DAC
+            | WRITE_OWNER
+            | GENERIC_WRITE
+            | GENERIC_ALL;
+        review_security(&security, rights, &TrustedSids::new()?, &label)
+    }
+
+    fn review_security(
+        security: &SecurityInfo,
+        hijack_rights: u32,
+        trusted: &TrustedSids,
+        label: &str,
+    ) -> Result<(), ServiceError> {
         if !trusted.contains(security.owner) {
             return Err(untrusted(format!(
-                "core path {component:?} is owned by an account other than SYSTEM, Administrators or TrustedInstaller"
+                "{label} is owned by an account other than SYSTEM, Administrators or TrustedInstaller"
             )));
         }
         // A null DACL grants everyone everything; an empty one denies everyone.
         if security.dacl.is_null() {
-            return Err(untrusted(format!("core path {component:?} has no DACL")));
+            return Err(untrusted(format!("{label} has no DACL")));
         }
 
         for index in 0..u32::from(unsafe { (*security.dacl).AceCount }) {
             let mut ace = std::ptr::null_mut();
             if unsafe { GetAce(security.dacl, index, &mut ace) } == 0 || ace.is_null() {
-                return Err(untrusted(format!("core path {component:?} has an unreadable DACL")));
+                return Err(untrusted(format!("{label} has an unreadable DACL")));
             }
             let header = unsafe { *ace.cast::<ACE_HEADER>() };
             // Inherit-only entries do not apply to this object, only to children it later gains.
@@ -199,7 +230,7 @@ mod windows_location {
                 // Object ACEs have a different SID layout; unknown types remain untrusted.
                 _ => {
                     return Err(untrusted(format!(
-                        "core path {component:?} carries an ACE type this check cannot evaluate"
+                        "{label} carries an ACE type this check cannot evaluate"
                     )));
                 }
             }
@@ -210,7 +241,7 @@ mod windows_location {
             let sid = std::ptr::addr_of!(allowed.SidStart).cast_mut().cast::<c_void>();
             if !trusted.contains(sid) {
                 return Err(untrusted(format!(
-                    "core path {component:?} is writable by an account other than SYSTEM, Administrators or TrustedInstaller"
+                    "{label} is writable by an account other than SYSTEM, Administrators or TrustedInstaller"
                 )));
             }
         }
@@ -307,14 +338,14 @@ mod windows_location {
     }
 
     impl SecurityInfo {
-        fn read(handle: *mut c_void, component: &Path) -> Result<Self, ServiceError> {
+        fn read(handle: *mut c_void, object_type: SE_OBJECT_TYPE, label: &str) -> Result<Self, ServiceError> {
             let mut owner = std::ptr::null_mut();
             let mut dacl = std::ptr::null_mut();
             let mut descriptor = std::ptr::null_mut();
             let status = unsafe {
                 GetSecurityInfo(
                     handle,
-                    SE_FILE_OBJECT,
+                    object_type,
                     OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                     &mut owner,
                     std::ptr::null_mut(),
@@ -325,7 +356,7 @@ mod windows_location {
             };
             if status != 0 || descriptor.is_null() {
                 return Err(untrusted(format!(
-                    "core path {component:?} security could not be inspected"
+                    "{label} security could not be inspected (Win32 {status})"
                 )));
             }
             Ok(Self {

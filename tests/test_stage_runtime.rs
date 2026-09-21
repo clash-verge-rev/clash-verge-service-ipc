@@ -60,7 +60,7 @@ impl RunningCore {
             .context("status omitted data")?
             .core_pid
             .context("started core has no pid")?;
-        let runtime_dir = service_paths().for_owner(&credentials.identity).runtime_dir();
+        let runtime_dir = service_paths()?.for_owner(&credentials.identity).runtime_dir();
 
         Ok(Self {
             credentials,

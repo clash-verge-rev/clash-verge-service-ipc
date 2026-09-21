@@ -39,7 +39,7 @@ impl Drop for ServiceOwnerGuard {
 }
 
 pub async fn acquire_service_owner() -> Result<Option<ServiceOwnerGuard>> {
-    let paths = service_paths();
+    let paths = service_paths()?;
     crate::core::paths::ensure_persistent_state_layout()?;
     #[cfg(unix)]
     crate::core::unix_security::ensure_service_directory(paths.runtime_dir(), 0o755)?;

@@ -15,7 +15,14 @@ use shared::{enter_repair_gate, run_maintenance_if_requested};
 /// Removes approved cores after service deletion. Locked files are left for a later retry.
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn remove_installed_cores() {
-    let cores = clash_verge_service_ipc::service_paths().core_dir();
+    let paths = match clash_verge_service_ipc::service_paths() {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("Could not locate core directory for cleanup: {error}");
+            return;
+        }
+    };
+    let cores = paths.core_dir();
     #[cfg(windows)]
     remove_core_firewall_rules(&cores);
     match std::fs::remove_dir_all(&cores) {
@@ -198,6 +205,8 @@ fn main() -> anyhow::Result<()> {
     if run_maintenance_if_requested()? {
         return Ok(());
     }
+    // Resolve before deleting the SCM registration that may supply the recovery path.
+    clash_verge_service_ipc::service_paths()?;
     let _gate = enter_repair_gate()?;
     let manager_access = ServiceManagerAccess::CONNECT;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
