@@ -34,6 +34,30 @@ async fn ipc_supervisor_restarts_a_stopped_listener() -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+#[tokio::test]
+#[serial]
+async fn sidecar_probe_does_not_inherit_long_client_retries() -> Result<()> {
+    let _ = stop_ipc_server().await;
+    clash_verge_service_ipc::set_config(Some(clash_verge_service_ipc::IpcConfig {
+        default_timeout: Duration::from_secs(1),
+        max_retries: 20,
+        retry_delay: Duration::from_millis(500),
+    }))
+    .await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        clash_verge_service_ipc::execution::check_sidecar_available(),
+    )
+    .await;
+    clash_verge_service_ipc::set_config(None).await;
+    assert!(
+        result.is_ok(),
+        "Sidecar inspection inherited the client's long retry budget"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[serial]

@@ -76,7 +76,9 @@ impl Staging {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos();
             let root = std::env::temp_dir().join(format!("clash-verge-install-{}-{nonce}-{index}", std::process::id()));
-            let mut builder = std::fs::DirBuilder::new();
+            let builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            let mut builder = builder;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::DirBuilderExt as _;

@@ -198,8 +198,10 @@ fn open_coordination_file(path: &Path) -> Result<File> {
 
 #[cfg(feature = "client")]
 pub async fn check_sidecar_available() -> Result<()> {
-    let ipc_failed = match crate::inspect_installation(&[]).await {
-        Ok(status) => {
+    // GUI lifecycle requests can retry for minutes; occupancy checks need their own deadline.
+    let inspection = tokio::time::timeout(std::time::Duration::from_secs(1), crate::inspect_installation(&[])).await;
+    let ipc_failed = match inspection {
+        Ok(Ok(status)) => {
             anyhow::ensure!(
                 status
                     .protocol
@@ -212,7 +214,7 @@ pub async fn check_sidecar_available() -> Result<()> {
             );
             false
         }
-        Err(_) => true,
+        Ok(Err(_)) | Err(_) => true,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         #[cfg(windows)]
