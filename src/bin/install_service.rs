@@ -240,6 +240,8 @@ struct CoreInstallRequest {
 
 struct InstallOptions {
     install_service: bool,
+    #[cfg(windows)]
+    ensure_service: bool,
     cores: Vec<CoreInstallRequest>,
     debug: bool,
 }
@@ -247,6 +249,8 @@ struct InstallOptions {
 fn parse_install_arguments(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<InstallOptions, Error> {
     let mut requested: Vec<CoreInstallRequest> = Vec::new();
     let mut install_service = false;
+    #[cfg(windows)]
+    let mut ensure_service = false;
     let mut debug = false;
     let mut arguments = arguments;
     while let Some(argument) = arguments.next() {
@@ -274,6 +278,14 @@ fn parse_install_arguments(arguments: impl Iterator<Item = std::ffi::OsString>) 
             request.sha256 = Some(parse_sha256_hex(value)?);
         } else if argument == "--install-service" {
             install_service = true;
+        } else if argument == "--ensure-service" {
+            #[cfg(windows)]
+            {
+                ensure_service = true;
+                install_service = true;
+            }
+            #[cfg(not(windows))]
+            bail!("--ensure-service is only supported on Windows");
         } else if argument == "--debug" {
             debug = true;
         } else {
@@ -282,9 +294,31 @@ fn parse_install_arguments(arguments: impl Iterator<Item = std::ffi::OsString>) 
     }
     Ok(InstallOptions {
         install_service: install_service || requested.is_empty(),
+        #[cfg(windows)]
+        ensure_service,
         cores: requested,
         debug,
     })
+}
+
+#[cfg(any(windows, test))]
+fn installed_payload_matches(
+    source: &Path,
+    target: &Path,
+    cores: &[CoreInstallRequest],
+    core_dir: &Path,
+) -> Result<bool, Error> {
+    let matches = |path: &Path, expected: &[u8; 32]| -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+            && sha256(path).is_ok_and(|actual| actual == *expected)
+    };
+    Ok(matches(target, &sha256(source)?)
+        && !cores.is_empty()
+        && cores.iter().all(|core| {
+            core.sha256
+                .as_ref()
+                .is_some_and(|digest| matches(&core_dir.join(&core.name), digest))
+        }))
 }
 
 fn parse_sha256_hex(value: &str) -> Result<[u8; 32], Error> {
@@ -866,12 +900,35 @@ fn main() -> anyhow::Result<()> {
         account_password: None,
     };
 
-    let service_access =
-        ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::STOP | ServiceAccess::CHANGE_CONFIG;
+    let service_access = ServiceAccess::QUERY_STATUS
+        | ServiceAccess::QUERY_CONFIG
+        | ServiceAccess::START
+        | ServiceAccess::STOP
+        | ServiceAccess::CHANGE_CONFIG;
     match service_manager.open_service(clash_verge_service_ipc::WINDOWS_SERVICE_NAME, service_access) {
         Ok(service) => {
             const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
             let status = service.query_status()?;
+            if options.ensure_service
+                && status.current_state == ServiceState::Stopped
+                && service
+                    .query_config()?
+                    .executable_path
+                    .to_string_lossy()
+                    .trim_matches('"')
+                    == target.to_string_lossy()
+                && installed_payload_matches(
+                    &source,
+                    &target,
+                    &options.cores,
+                    &clash_verge_service_ipc::service_paths()?.core_dir(),
+                )?
+            {
+                service.start(&Vec::<&OsStr>::new())?;
+                wait_for_service_ready()?;
+                remove_ordinary_file_if_exists(&staged)?;
+                return Ok(());
+            }
             if status.current_state != ServiceState::Stopped {
                 if let Err(error) = service.stop()
                     && !matches!(
@@ -975,6 +1032,41 @@ mod install_core_tests {
             ]);
         }
         super::parse_install_arguments(arguments.into_iter())
+    }
+
+    #[test]
+    fn stopped_service_can_be_reused_only_with_matching_service_and_cores() -> anyhow::Result<()> {
+        let root = scratch("ensure payload")?;
+        let source = root.join("bundled-service");
+        let target = root.join("installed-service");
+        let core = root.join(super::core_file_name("verge-mihomo"));
+        std::fs::write(&source, b"service")?;
+        std::fs::write(&target, b"service")?;
+        std::fs::write(&core, b"core")?;
+        let options = combined_options(std::slice::from_ref(&core))?;
+        assert!(super::installed_payload_matches(
+            &source,
+            &target,
+            &options.cores,
+            &root
+        )?);
+        std::fs::write(&core, b"different core")?;
+        assert!(!super::installed_payload_matches(
+            &source,
+            &target,
+            &options.cores,
+            &root
+        )?);
+        std::fs::write(&core, b"core")?;
+        std::fs::write(&target, b"old service")?;
+        assert!(!super::installed_payload_matches(
+            &source,
+            &target,
+            &options.cores,
+            &root
+        )?);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

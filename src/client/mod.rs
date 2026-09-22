@@ -282,10 +282,21 @@ pub async fn set_system_proxy(
 
 /// Inspects approved cores and global occupancy without exposing another owner's session.
 pub async fn inspect_installation(requirements: &[crate::CoreRequirement]) -> Result<crate::InstallationStatus> {
+    inspect_installation_with_digest(requirements, false).await
+}
+
+pub(crate) async fn inspect_installation_with_digest(
+    requirements: &[crate::CoreRequirement],
+    include_service_digest: bool,
+) -> Result<crate::InstallationStatus> {
     let client = connect().await?;
     let response = protected(client.post(IpcCommand::InspectInstallation.as_ref()))
         .timeout(LIFECYCLE_TIMEOUT)
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
+        .header(
+            "X-Service-Digest",
+            if include_service_digest { "true" } else { "false" },
+        )
         .json_body(&serde_json::to_value(requirements)?)
         .send()
         .await?

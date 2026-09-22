@@ -486,6 +486,7 @@ pub struct CoreInspection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallationStatus {
+    /// Empty when the caller opts out of hashing the service executable.
     pub service_sha256: String,
     pub protocol: ProtocolInfo,
     pub cores: Vec<CoreInspection>,

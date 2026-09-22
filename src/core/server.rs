@@ -617,7 +617,9 @@ fn create_ipc_router() -> Result<Router> {
                 Err(error) => return bad_request(format!("Invalid core requirements: {error}")),
             };
             let _guard = OWNER_LIFECYCLE_LOCK.lock().await;
-            match crate::core::installation::inspect(&requirements).await {
+            // Omitting this header retains the original response with a service digest.
+            let include_service_digest = ctx.headers.get("X-Service-Digest").is_none_or(|value| value != "false");
+            match crate::core::installation::inspect(&requirements, include_service_digest).await {
                 Ok(status) => ok_json(status),
                 Err(error) => service_unavailable(format!("Failed to inspect installation: {error:#}")),
             }

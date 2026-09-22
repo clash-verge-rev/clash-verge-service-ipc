@@ -12,6 +12,13 @@ pub struct CoreExecutionGuard {
     _file: File,
 }
 
+impl Drop for CoreExecutionGuard {
+    fn drop(&mut self) {
+        // fork can briefly inherit this open file description before exec closes it.
+        let _ = self._file.unlock();
+    }
+}
+
 impl CoreExecutionGuard {
     pub fn acquire() -> Result<Self> {
         Self::acquire_at(&coordination_path()?)
@@ -27,10 +34,21 @@ impl CoreExecutionGuard {
     }
 
     /// Keep the reservation until the OS confirms exit, even if killing or event delivery fails.
-    pub fn release_after_exit(self, pid: u32) -> tokio::task::JoinHandle<()> {
+    pub fn release_after_exit(
+        self,
+        pid: u32,
+        mut terminated: tokio::sync::oneshot::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let mut events_open = true;
             while !process_has_exited(pid) {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::select! {
+                    result = &mut terminated, if events_open => {
+                        if result.is_ok() { break; }
+                        events_open = false;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                }
             }
             drop(self);
         })
@@ -39,7 +57,10 @@ impl CoreExecutionGuard {
     pub fn is_held() -> Result<bool> {
         let file = open_coordination_file(&coordination_path()?)?;
         match file.try_lock() {
-            Ok(()) => Ok(false),
+            Ok(()) => {
+                file.unlock()?;
+                Ok(false)
+            }
             Err(std::fs::TryLockError::WouldBlock) => Ok(true),
             Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
         }
@@ -81,10 +102,11 @@ fn coordination_path() -> Result<PathBuf> {
         );
         PathBuf::from(String::from_utf16(&buffer[..size])?).join("Temp")
     };
+    // Both channels may keep idle helpers, but core execution is shared.
     #[cfg(feature = "test")]
-    let name = format!("{}.core-execution-test.lock", crate::SERVICE_SLUG);
+    let name = "clash-verge-service.core-execution-test.lock";
     #[cfg(not(feature = "test"))]
-    let name = format!("{}.core-execution.lock", crate::SERVICE_SLUG);
+    let name = "clash-verge-service.core-execution.lock";
     Ok(root.join(name))
 }
 
@@ -105,7 +127,7 @@ fn open_coordination_file(path: &Path) -> Result<File> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let file = OpenOptions::new()
                 .read(true)
-                .custom_flags(platform_lib::O_NOFOLLOW)
+                .custom_flags(platform_lib::O_NOFOLLOW | platform_lib::O_NONBLOCK)
                 .open(path)?;
             anyhow::ensure!(file.metadata()?.is_file(), "coordination entry is not a regular file");
             Ok(file)
@@ -176,7 +198,7 @@ fn open_coordination_file(path: &Path) -> Result<File> {
 
 #[cfg(feature = "client")]
 pub async fn check_sidecar_available() -> Result<()> {
-    match crate::inspect_installation(&[]).await {
+    let ipc_failed = match crate::inspect_installation(&[]).await {
         Ok(status) => {
             anyhow::ensure!(
                 status
@@ -188,32 +210,37 @@ pub async fn check_sidecar_available() -> Result<()> {
                 !status.core_busy,
                 "the service has an active or recovering core session"
             );
+            false
         }
-        Err(error) => {
-            #[cfg(windows)]
-            windows_fallback::require_stopped_service()
-                .with_context(|| format!("service did not answer: {error:#}"))?;
-            #[cfg(unix)]
-            {
-                let output = std::process::Command::new("ps")
-                    .args(["-axo", "comm="])
-                    .output()
-                    .context("could not inspect remaining cores")?;
-                anyhow::ensure!(
-                    output.status.success(),
-                    "could not inspect remaining cores after IPC failure: {error:#}"
-                );
-                require_no_unix_core_processes(&String::from_utf8_lossy(&output.stdout))?;
+        Err(_) => true,
+    };
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        #[cfg(windows)]
+        {
+            if ipc_failed {
+                windows_fallback::require_stopped_service()?;
             }
+            windows_fallback::require_no_core_process(false)?;
         }
-    }
-    #[cfg(windows)]
-    windows_fallback::require_no_core_process(false)?;
-    Ok(())
+        #[cfg(unix)]
+        {
+            let mut command = std::process::Command::new("ps");
+            #[cfg(target_os = "linux")]
+            command.args(["-axo", "comm=,args="]);
+            #[cfg(not(target_os = "linux"))]
+            command.args(["-axo", "comm="]);
+            let output = command.output().context("could not inspect remaining cores")?;
+            anyhow::ensure!(output.status.success(), "could not inspect remaining cores");
+            require_no_unix_core_processes(&String::from_utf8_lossy(&output.stdout), ipc_failed)?;
+        }
+        Ok(())
+    })
+    .await
+    .context("core process inspection failed")?
 }
 
 #[cfg(all(unix, feature = "client"))]
-fn require_no_unix_core_processes(processes: &str) -> Result<()> {
+fn require_no_unix_core_processes(processes: &str, include_service: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     let other_helper = PathBuf::from("/Library/PrivilegedHelperTools")
         .join(format!(
@@ -225,25 +252,35 @@ fn require_no_unix_core_processes(processes: &str) -> Result<()> {
             }
         ))
         .join("Contents/MacOS/clash-verge-service");
+    #[cfg(target_os = "linux")]
+    let other_helper = PathBuf::from("/var/lib")
+        .join(if cfg!(feature = "development-channel") {
+            "clash-verge-service"
+        } else {
+            "clash-verge-service-dev"
+        })
+        .join("bin/clash-verge-service");
     for process in processes.lines() {
+        #[cfg(target_os = "linux")]
+        let (process, arguments) = process
+            .trim()
+            .split_once(char::is_whitespace)
+            .unwrap_or((process.trim(), ""));
         let executable = Path::new(process.trim());
-        // Dev and Production helpers share a basename but supervise separate channels.
-        #[cfg(target_os = "macos")]
-        if executable == other_helper {
-            continue;
-        }
         let name = executable.file_name().and_then(|name| name.to_str()).unwrap_or("");
         anyhow::ensure!(
-            ![
-                "verge-mihomo",
-                "verge-mihomo-alpha",
-                "clash-verge-service",
-                "verge-mihomo-alp",
-                "clash-verge-ser"
-            ]
-            .contains(&name),
+            !["verge-mihomo", "verge-mihomo-alpha", "verge-mihomo-al"].contains(&name),
             "process {name} remains after IPC failure; refusing a second core"
         );
+        if include_service && ["clash-verge-service", "clash-verge-ser"].contains(&name) {
+            // Linux comm is truncated; argv[0] retains the installed helper's channel path.
+            #[cfg(target_os = "linux")]
+            let executable = Path::new(arguments.split_whitespace().next().unwrap_or(""));
+            anyhow::ensure!(
+                executable == other_helper,
+                "process {name} remains after IPC failure; refusing a second core"
+            );
+        }
     }
     Ok(())
 }
@@ -261,6 +298,94 @@ mod windows_fallback;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn termination_event_releases_reservation_even_when_pid_still_exists() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("execution-reused-pid-test-{}", std::process::id()));
+        let guard = CoreExecutionGuard::acquire_at(&path).context("initial reservation")?;
+        let (terminated, receiver) = tokio::sync::oneshot::channel();
+        let waiter = guard.release_after_exit(std::process::id(), receiver);
+        assert!(CoreExecutionGuard::acquire_at(&path).is_err());
+        terminated
+            .send(())
+            .map_err(|_| anyhow::anyhow!("exit observer dropped"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await??;
+        drop(CoreExecutionGuard::acquire_at(&path).context("reservation after termination event")?);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "client"))]
+    #[test]
+    fn linux_idle_helper_from_other_channel_does_not_block_fallback() -> Result<()> {
+        let other = if cfg!(feature = "development-channel") {
+            "clash-verge-service"
+        } else {
+            "clash-verge-service-dev"
+        };
+        let current = crate::SERVICE_SLUG;
+        require_no_unix_core_processes(
+            &format!("clash-verge-ser /var/lib/{other}/bin/clash-verge-service"),
+            true,
+        )?;
+        assert!(
+            require_no_unix_core_processes(
+                &format!("clash-verge-ser /var/lib/{current}/bin/clash-verge-service"),
+                true
+            )
+            .is_err()
+        );
+        assert!(require_no_unix_core_processes("clash-verge-ser /tmp/clash-verge-service", true).is_err());
+        assert!(
+            require_no_unix_core_processes(
+                &format!(
+                    "clash-verge-ser /var/lib/{other}/bin/clash-verge-service\nverge-mihomo-al /tmp/verge-mihomo-alpha"
+                ),
+                true
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+    #[cfg(all(unix, feature = "client"))]
+    #[test]
+    fn linux_truncated_alpha_core_blocks_fallback() {
+        for ipc_failed in [false, true] {
+            assert!(require_no_unix_core_processes("verge-mihomo-al", ipc_failed).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_coordination_entry_does_not_block() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = std::env::temp_dir().join(format!("execution-fifo-test-{}", std::process::id()));
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        anyhow::ensure!(unsafe { platform_lib::mkfifo(name.as_ptr(), 0o600) } == 0);
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "execution::tests::child_lock_probe"])
+            .env("CLASH_VERGE_TEST_LOCK", &path)
+            .spawn()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let result = loop {
+            if let Some(status) = child.try_wait()? {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        if result.is_none() {
+            child.kill()?;
+            child.wait()?;
+        }
+        std::fs::remove_file(path)?;
+        assert!(
+            result.is_some_and(|status| status.success()),
+            "opening a FIFO must fail without waiting for a writer"
+        );
+        Ok(())
+    }
     #[cfg(all(target_os = "macos", feature = "client"))]
     #[test]
     fn an_idle_helper_from_the_other_channel_does_not_block_fallback() -> Result<()> {
@@ -271,7 +396,7 @@ mod tests {
         } else {
             (production, development)
         };
-        require_no_unix_core_processes(other)?;
+        require_no_unix_core_processes(other, true)?;
         for residual in [
             current.to_owned(),
             "clash-verge-service".into(),
@@ -279,7 +404,7 @@ mod tests {
             format!("{other}\n/Library/Application Support/clash-verge-service/cores/verge-mihomo"),
         ] {
             assert!(
-                require_no_unix_core_processes(&residual).is_err(),
+                require_no_unix_core_processes(&residual, true).is_err(),
                 "unconfirmed idle state must remain blocked: {residual}"
             );
         }
@@ -316,7 +441,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("execution-exit-test-{}", std::process::id()));
         let mut child = std::process::Command::new("sleep").arg("30").spawn()?;
         let guard = CoreExecutionGuard::acquire_at(&root)?;
-        let waiter = guard.release_after_exit(child.id());
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        let waiter = guard.release_after_exit(child.id(), receiver);
         assert!(CoreExecutionGuard::acquire_at(&root).is_err());
         child.kill()?;
         child.wait()?;

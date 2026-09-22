@@ -136,6 +136,7 @@ async fn installation_query_reports_global_occupancy_and_guards_handoff() -> Res
     requirement.sha256 = Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into());
     let status = inspect_installation(&[requirement.clone()]).await?;
     assert!(status.satisfies(&[requirement.clone()]));
+    assert!(status.service_sha256.is_empty());
     requirement.sha256 = Some("00".repeat(32));
     let status = inspect_installation(&[requirement.clone()]).await?;
     assert_eq!(status.cores[0].availability, CoreAvailability::DigestMismatch);

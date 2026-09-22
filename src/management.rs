@@ -34,6 +34,11 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 
 pub fn install(installer: &Path, cores: &[CoreSource], core_only: bool, gid: Option<u32>, prompt: &str) -> Result<()> {
     let mut command = Command::new(installer);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
     command.arg("--prepare-install");
     if core_only {
         command.arg("--core-only");
@@ -114,9 +119,12 @@ impl PreparedCores {
                 "unsupported core name {}",
                 core.name
             );
-            if !core.path.is_file() {
-                continue;
-            }
+            anyhow::ensure!(
+                core.path.is_file(),
+                "requested core {} is unavailable at {}",
+                core.name,
+                core.path.display()
+            );
             let target = staging.0.join(&core.name);
             anyhow::ensure!(!target.exists(), "duplicate core name {}", core.name);
             std::fs::copy(&core.path, &target)?;
@@ -215,11 +223,22 @@ pub fn prepare_install_if_requested() -> Result<bool> {
     };
     if ensure
         && runtime
-            .block_on(crate::inspect_installation(&requirements))
+            .block_on(crate::client::inspect_installation_with_digest(
+                &requirements,
+                !core_only,
+            ))
             .is_ok_and(|status| verified(&status))
     {
         return Ok(true);
     }
+    #[cfg(windows)]
+    let elevated = {
+        let mut arguments = elevated;
+        if ensure && !core_only {
+            arguments.push("--ensure-service".into());
+        }
+        arguments
+    };
     // Both executables must be beside each other; a temporary copy also avoids macOS TCC paths.
     let staged_installer = staging.0.join(installer.file_name().context("installer has no name")?);
     std::fs::copy(&installer, &staged_installer)?;
@@ -233,8 +252,12 @@ pub fn prepare_install_if_requested() -> Result<bool> {
     elevate(&staged_installer, &elevated, gid, &prompt)?;
     #[cfg(windows)]
     elevate(&staged_installer, &elevated, &prompt)?;
+    // Core-only publication is verified by the privileged installer and must also work offline.
+    if core_only {
+        return Ok(true);
+    }
     let status = runtime
-        .block_on(crate::inspect_installation(&requirements))
+        .block_on(crate::client::inspect_installation_with_digest(&requirements, true))
         .context("installation finished but its approved cores could not be verified")?;
     anyhow::ensure!(
         verified(&status),
@@ -291,6 +314,7 @@ fn elevate(installer: &Path, arguments: &[OsString], gid: u32, prompt: &str) -> 
 
 #[cfg(all(windows, feature = "client"))]
 fn elevate(installer: &Path, arguments: &[OsString], _prompt: &str) -> Result<()> {
+    use std::os::windows::process::CommandExt as _;
     let command_line = arguments
         .iter()
         .map(|arg| windows_quote(&arg.to_string_lossy()))
@@ -298,6 +322,7 @@ fn elevate(installer: &Path, arguments: &[OsString], _prompt: &str) -> Result<()
         .join(" ");
     let script = "$ErrorActionPreference = 'Stop'; $child = Start-Process -FilePath $env:CLASH_VERGE_INSTALLER -ArgumentList $env:CLASH_VERGE_INSTALL_ARGUMENTS -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $child.ExitCode";
     let status = Command::new("powershell.exe")
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .env("CLASH_VERGE_INSTALLER", installer)
         .env("CLASH_VERGE_INSTALL_ARGUMENTS", command_line)
@@ -338,16 +363,10 @@ mod tests {
         let path = source.0.join("core with spaces and 'quotes'");
         std::fs::write(&path, b"abc")?;
         let plan = PreparedCores::new(
-            &[
-                CoreSource {
-                    name: name.clone(),
-                    path: path.clone(),
-                },
-                CoreSource {
-                    name: format!("verge-mihomo-alpha{}", std::env::consts::EXE_SUFFIX),
-                    path: source.0.join("missing"),
-                },
-            ],
+            &[CoreSource {
+                name: name.clone(),
+                path: path.clone(),
+            }],
             false,
         )?;
         std::fs::write(&path, b"changed source")?;
@@ -365,6 +384,16 @@ mod tests {
         drop(plan);
         assert!(!staged.exists());
         assert!(PreparedCores::new(&[], false).is_err());
+        assert!(
+            PreparedCores::new(
+                &[CoreSource {
+                    name,
+                    path: source.0.join("missing")
+                }],
+                false
+            )
+            .is_err()
+        );
         Ok(())
     }
 

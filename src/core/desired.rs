@@ -414,6 +414,33 @@ mod owner_tests {
     }
 
     #[tokio::test]
+    #[serial]
+    async fn unusable_restored_core_does_not_reserve_execution() -> anyhow::Result<()> {
+        let owner = test_owner(90_019);
+        let directory = std::env::temp_dir().join(format!("missing-core-restore-{}", std::process::id()));
+        std::fs::create_dir_all(&directory)?;
+        let config = ClashConfig {
+            core_config: CoreConfig {
+                core_path: "/missing/verge-mihomo".into(),
+                core_ipc_path: directory.join("core.sock").to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            log_config: Default::default(),
+        };
+        persist_owner_core_started(&owner, &config).await?;
+        persist_active_owner(&owner).await?;
+        assert!(crate::core::installation::inspect(&[], false).await?.core_busy);
+        super::restore_desired_state().await?;
+        let status = crate::core::installation::inspect(&[], false).await?;
+        let occupied = status.core_busy;
+        assert!(status.service_sha256.is_empty());
+        clear_active_owner().await?;
+        std::fs::remove_dir_all(directory)?;
+        assert!(!occupied, "a failed restore with no core must permit Sidecar handoff");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn desired_state_is_scoped_by_owner_key() -> anyhow::Result<()> {
         let owner_a = test_owner(90_001);
         let owner_b = test_owner(90_002);

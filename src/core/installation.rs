@@ -1,31 +1,50 @@
 use crate::core::runtime_generation::approved_core_copy;
 use crate::core::trusted_core_location::require_trusted_core_location;
-use crate::core::{desired::load_active_owner, manager::CORE_MANAGER, paths::service_paths};
+use crate::core::{
+    desired::{load_active_owner, load_owner_desired_state},
+    manager::CORE_MANAGER,
+    paths::service_paths,
+};
 use crate::{CoreAvailability, CoreInspection, CoreRequirement, InstallationStatus, ProtocolInfo};
 use std::path::Path;
 
-pub(super) async fn inspect(requirements: &[CoreRequirement]) -> anyhow::Result<InstallationStatus> {
+pub(super) async fn inspect(
+    requirements: &[CoreRequirement],
+    include_service_digest: bool,
+) -> anyhow::Result<InstallationStatus> {
     anyhow::ensure!(requirements.len() <= 2, "at most two cores can be inspected");
-    let directory = service_paths()?.core_dir();
-    let cores = requirements
-        .iter()
-        .map(|required| {
-            let availability = inspect_core(&directory, required);
-            CoreInspection {
-                name: required.name.clone(),
-                availability,
-            }
-        })
-        .collect();
-    let core_busy = load_active_owner().await?.is_some()
+    let recovering = match load_active_owner().await? {
+        Some(owner) => load_owner_desired_state(&owner.owner_key).await?.core_should_be_running,
+        None => false,
+    };
+    let core_busy = recovering
         || CORE_MANAGER.lock().await.status().await.core_pid.is_some()
         || crate::execution::CoreExecutionGuard::is_held()?;
-    Ok(InstallationStatus {
-        service_sha256: crate::management::sha256_file(&std::env::current_exe()?)?,
-        protocol: ProtocolInfo::current(),
-        cores,
-        core_busy,
+    let requirements = requirements.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let directory = service_paths()?.core_dir();
+        let cores = requirements
+            .iter()
+            .map(|required| {
+                let availability = inspect_core(&directory, required);
+                CoreInspection {
+                    name: required.name.clone(),
+                    availability,
+                }
+            })
+            .collect();
+        Ok(InstallationStatus {
+            service_sha256: if include_service_digest {
+                crate::management::sha256_file(&std::env::current_exe()?)?
+            } else {
+                String::new()
+            },
+            protocol: ProtocolInfo::current(),
+            cores,
+            core_busy,
+        })
     })
+    .await?
 }
 
 fn inspect_core(directory: &Path, required: &CoreRequirement) -> CoreAvailability {
