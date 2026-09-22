@@ -425,7 +425,7 @@ pub(crate) fn validate_core_path(core_path: &str) -> Result<ResolvedCore, Servic
 }
 
 /// Looks up the approved copy by file name without trusting the client directory.
-fn approved_core_copy(core_dir: &Path, requested: &Path) -> Result<PathBuf, ServiceError> {
+pub(crate) fn approved_core_copy(core_dir: &Path, requested: &Path) -> Result<PathBuf, ServiceError> {
     let Some(name) = requested.file_name() else {
         return Err(untrusted("core path has no file name"));
     };

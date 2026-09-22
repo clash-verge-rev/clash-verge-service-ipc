@@ -101,6 +101,8 @@ async fn a_new_owner_takes_over_and_the_previous_owner_becomes_inactive() -> Res
     let (_, session_b) = start(&owner_b, &"44".repeat(32)).await?;
 
     assert!(!get_status(&owner_a).await?.data.context("no status")?.is_active);
+    assert!(clash_verge_service_ipc::inspect_installation(&[]).await?.core_busy);
+    assert!(clash_verge_service_ipc::execution::reserve_sidecar().await.is_err());
     assert!(get_status(&owner_b).await?.data.context("no status")?.is_active);
     assert_eq!(
         stop_clash(&owner_a, &session_a).await?.code,
@@ -108,5 +110,52 @@ async fn a_new_owner_takes_over_and_the_previous_owner_becomes_inactive() -> Res
     );
     assert_eq!(stop_clash(&owner_b, &session_b).await?.code, 0);
 
+    stop_server(server).await
+}
+
+#[tokio::test]
+#[serial]
+async fn installation_query_reports_global_occupancy_and_guards_handoff() -> Result<()> {
+    use clash_verge_service_ipc::execution::reserve_sidecar;
+    use clash_verge_service_ipc::{CoreAvailability, CoreRequirement, inspect_installation};
+    let server = start_server().await?;
+    let name = format!("verge-mihomo-alpha{}", std::env::consts::EXE_SUFFIX);
+    let directory = clash_verge_service_ipc::service_paths()?.core_dir();
+    std::fs::create_dir_all(&directory)?;
+    let core = directory.join(&name);
+    let previous = std::fs::read(&core).ok();
+    if core.exists() {
+        std::fs::remove_file(&core)?;
+    }
+    let mut requirement = CoreRequirement { name, sha256: None };
+    assert_eq!(
+        inspect_installation(&[requirement.clone()]).await?.cores[0].availability,
+        CoreAvailability::Missing
+    );
+    std::fs::write(&core, b"abc")?;
+    requirement.sha256 = Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into());
+    let status = inspect_installation(&[requirement.clone()]).await?;
+    assert!(status.satisfies(&[requirement.clone()]));
+    requirement.sha256 = Some("00".repeat(32));
+    let status = inspect_installation(&[requirement.clone()]).await?;
+    assert_eq!(status.cores[0].availability, CoreAvailability::DigestMismatch);
+    assert!(!status.satisfies(&[requirement]));
+    if let Some(previous) = previous {
+        std::fs::write(&core, previous)?;
+    } else {
+        std::fs::remove_file(&core)?;
+    }
+
+    let credentials = common::owner_credentials();
+    let (_, session) = start(&credentials, &"aa".repeat(32)).await?;
+    assert!(inspect_installation(&[]).await?.core_busy);
+    assert!(reserve_sidecar().await.is_err());
+    assert_eq!(stop_clash(&credentials, &session).await?.code, 0);
+    let sidecar = reserve_sidecar().await?;
+    assert!(inspect_installation(&[]).await?.core_busy);
+    assert!(start(&credentials, &"bb".repeat(32)).await.is_err());
+    drop(sidecar);
+    let (_, session) = start(&credentials, &"cc".repeat(32)).await?;
+    assert_eq!(stop_clash(&credentials, &session).await?.code, 0);
     stop_server(server).await
 }

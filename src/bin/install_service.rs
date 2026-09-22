@@ -677,6 +677,9 @@ fn set_macos_permissions(path: &Path, mode: u32) -> Result<(), Error> {
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<(), Error> {
+    if clash_verge_service_ipc::management::prepare_install_if_requested()? {
+        return Ok(());
+    }
     if run_maintenance_if_requested()? {
         return Ok(());
     }
@@ -760,6 +763,9 @@ fn main() -> Result<(), Error> {
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Error> {
+    if clash_verge_service_ipc::management::prepare_install_if_requested()? {
+        return Ok(());
+    }
     if run_maintenance_if_requested()? {
         return Ok(());
     }
@@ -817,6 +823,9 @@ fn main() -> anyhow::Result<()> {
     use std::ffi::{OsStr, OsString};
     use std::{thread, time::Duration};
 
+    if clash_verge_service_ipc::management::prepare_install_if_requested()? {
+        return Ok(());
+    }
     if run_maintenance_if_requested()? {
         return Ok(());
     }

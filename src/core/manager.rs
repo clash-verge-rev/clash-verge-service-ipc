@@ -268,6 +268,7 @@ pub struct CoreManager {
     watchdog_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     watchdog_handle: Mutex<Option<JoinHandle<Result<()>>>>,
     failed_child: Arc<Mutex<Option<ChildGuard>>>,
+    execution: Mutex<Option<std::sync::Arc<crate::execution::CoreExecutionGuard>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +293,7 @@ impl CoreManager {
             watchdog_shutdown: Mutex::new(None),
             watchdog_handle: Mutex::new(None),
             failed_child: Arc::new(Mutex::new(None)),
+            execution: Mutex::new(None),
         }
     }
 
@@ -310,11 +312,25 @@ impl CoreManager {
     pub async fn start_core(&self, config: ClashConfig, owner: OwnerIdentity) -> Result<()> {
         ensure_startup_reconciled()?;
         set_core_lifecycle_state(ServiceLifecycleState::Starting);
-        if self.running_pid.load(Ordering::Relaxed) != 0 {
+        if self.running_pid.load(Ordering::Relaxed) != 0 || self.execution.lock().await.is_some() {
             info!("Core is already running, stopping existing instance");
             self.stop_core().await?;
         }
 
+        let execution = std::sync::Arc::new(crate::execution::CoreExecutionGuard::acquire()?);
+        let result = self.start_reserved_core(config, owner, execution.clone()).await;
+        if result.is_ok() || self.running_pid.load(Ordering::Acquire) != 0 {
+            *self.execution.lock().await = Some(execution);
+        }
+        result
+    }
+
+    async fn start_reserved_core(
+        &self,
+        config: ClashConfig,
+        owner: OwnerIdentity,
+        execution: Arc<crate::execution::CoreExecutionGuard>,
+    ) -> Result<()> {
         info!("Starting core with config: {:?}", config);
 
         prepare_core_ipc_socket(&config.core_config.core_ipc_path, &owner)?;
@@ -369,7 +385,7 @@ impl CoreManager {
         self.running_pid.store(child_pid.unwrap_or_default(), Ordering::Release);
         *self.running_config.lock().await = Some(config.clone());
 
-        self.start_watchdog(child_guard, config, owner).await;
+        self.start_watchdog(child_guard, config, owner, execution).await;
         set_core_lifecycle_state(ServiceLifecycleState::Running);
 
         Ok(())
@@ -413,7 +429,13 @@ impl CoreManager {
         Ok(())
     }
 
-    async fn start_watchdog(&self, child_guard: ChildGuard, config: ClashConfig, owner: OwnerIdentity) {
+    async fn start_watchdog(
+        &self,
+        child_guard: ChildGuard,
+        config: ClashConfig,
+        owner: OwnerIdentity,
+        execution: Arc<crate::execution::CoreExecutionGuard>,
+    ) {
         let running_pid_arc = Arc::clone(&self.running_pid);
         let start_time_arc = Arc::clone(&self.core_start_time);
         let started_at_arc = Arc::clone(&self.core_started_at);
@@ -425,6 +447,7 @@ impl CoreManager {
         let watchdog_config = watchdog_config();
 
         let handle = tokio::spawn(async move {
+            let _execution = execution;
             let mut recovery_exhausted = false;
             let mut child_guard = Some(child_guard);
             let mut shutdown_rx = shutdown_rx;
@@ -633,6 +656,7 @@ impl CoreManager {
     }
 
     async fn after_stop(&self, core_ipc_path: Option<String>) {
+        self.execution.lock().await.take();
         #[cfg(unix)]
         {
             use std::path::Path;

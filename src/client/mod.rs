@@ -279,3 +279,24 @@ pub async fn set_system_proxy(
     )
     .await
 }
+
+/// Inspects approved cores and global occupancy without exposing another owner's session.
+pub async fn inspect_installation(requirements: &[crate::CoreRequirement]) -> Result<crate::InstallationStatus> {
+    let client = connect().await?;
+    let response = protected(client.post(IpcCommand::InspectInstallation.as_ref()))
+        .timeout(LIFECYCLE_TIMEOUT)
+        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
+        .json_body(&serde_json::to_value(requirements)?)
+        .send()
+        .await?
+        .json::<Response<crate::InstallationStatus>>()?;
+    anyhow::ensure!(
+        response.code == 0,
+        "installation inspection rejected: {} ({})",
+        response.message,
+        response.code
+    );
+    response
+        .data
+        .ok_or_else(|| anyhow::anyhow!("service omitted installation status"))
+}

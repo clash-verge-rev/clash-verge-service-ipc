@@ -607,6 +607,21 @@ fn create_ipc_router() -> Result<Router> {
             ipc_request_context_to_auth_context(&ctx)?;
             ok_json(ProtocolInfo::current())
         })
+        .post(IpcCommand::InspectInstallation.as_ref(), |ctx| async move {
+            ipc_request_context_to_auth_context(&ctx)?;
+            if let Err(error) = require_protocol_version(&ctx) {
+                return service_error(error);
+            }
+            let requirements = match ctx.json::<Vec<crate::CoreRequirement>>() {
+                Ok(requirements) => requirements,
+                Err(error) => return bad_request(format!("Invalid core requirements: {error}")),
+            };
+            let _guard = OWNER_LIFECYCLE_LOCK.lock().await;
+            match crate::core::installation::inspect(&requirements).await {
+                Ok(status) => ok_json(status),
+                Err(error) => service_unavailable(format!("Failed to inspect installation: {error:#}")),
+            }
+        })
         .get(IpcCommand::Status.as_ref(), |ctx| async move {
             trace!("Received Status command");
             let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {

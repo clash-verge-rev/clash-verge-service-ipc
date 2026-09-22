@@ -392,13 +392,14 @@ mod tests {
         older.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING - 1;
 
         assert!(
-            older.supports_client(ProtocolVersion::current(), crate::MIN_REQUIRED_SERVICE_REVISION),
-            "a service without staging is still a service this client can talk to"
+            older.supports_client(ProtocolVersion::current(), 1),
+            "a caller with an older minimum can still use the base protocol"
         );
         assert!(
             !older.supports_runtime_staging(),
             "but it must not be asked to stage a runtime"
         );
+        assert!(!older.supports_client(ProtocolVersion::current(), crate::MIN_REQUIRED_SERVICE_REVISION));
         assert!(ProtocolInfo::current().supports_runtime_staging());
     }
 
@@ -459,5 +460,50 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreRequirement {
+    pub name: String,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CoreAvailability {
+    Ready,
+    Missing,
+    Rejected { reason: String },
+    DigestMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreInspection {
+    pub name: String,
+    pub availability: CoreAvailability,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallationStatus {
+    pub service_sha256: String,
+    pub protocol: ProtocolInfo,
+    pub cores: Vec<CoreInspection>,
+    /// Global occupancy; deliberately omits other owners' identities and process details.
+    pub core_busy: bool,
+}
+
+impl InstallationStatus {
+    pub fn satisfies(&self, requirements: &[CoreRequirement]) -> bool {
+        self.protocol.build_version == crate::VERSION
+            && self
+                .protocol
+                .supports_client(ProtocolVersion::current(), crate::MIN_REQUIRED_SERVICE_REVISION)
+            && !requirements.is_empty()
+            && requirements.iter().all(|required| {
+                self.cores
+                    .iter()
+                    .any(|core| core.name == required.name && core.availability == CoreAvailability::Ready)
+            })
     }
 }

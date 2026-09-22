@@ -3,12 +3,12 @@ pub use command::IpcCommand;
 
 pub mod structure;
 pub use structure::{
-    AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreConfig, MacosProxyConfig,
-    OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, OwnerSessionHandle, OwnerSessionProof, ProtocolInfo,
-    ProtocolVersion, ProxyApplyOutcome, RemoteProvider, RuntimeAsset, RuntimeBundle, RuntimeFileOutcome,
-    RuntimeFileRequest, SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState,
-    ServiceStatusSnapshot, StageRejection, StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig,
-    owner_key,
+    AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreAvailability, CoreConfig, CoreInspection,
+    CoreRequirement, InstallationStatus, MacosProxyConfig, OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity,
+    OwnerSessionHandle, OwnerSessionProof, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RemoteProvider,
+    RuntimeAsset, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, SERVICE_PROTOCOL_HEADER,
+    SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot, StageRejection,
+    StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig, owner_key,
 };
 
 pub mod paths;
@@ -24,6 +24,8 @@ mod atomic_file;
 mod auth;
 #[cfg(feature = "standalone")]
 mod desired;
+#[cfg(feature = "standalone")]
+mod installation;
 #[cfg(feature = "standalone")]
 mod legacy_cleanup;
 #[cfg(feature = "standalone")]

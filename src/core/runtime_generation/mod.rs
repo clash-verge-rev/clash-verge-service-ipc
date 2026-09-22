@@ -6,6 +6,6 @@ mod assets;
 mod readback;
 mod staging;
 
-pub(crate) use assets::{PreparedRuntime, prepare_runtime, validate_core_path};
+pub(crate) use assets::{PreparedRuntime, approved_core_copy, prepare_runtime, validate_core_path};
 pub(crate) use readback::read_runtime_file;
 pub(crate) use staging::stage_runtime;
