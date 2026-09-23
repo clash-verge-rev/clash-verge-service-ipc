@@ -297,6 +297,20 @@ pub async fn reserve_sidecar() -> Result<CoreExecutionGuard> {
 #[path = "execution_windows.rs"]
 mod windows_fallback;
 
+#[cfg(all(windows, feature = "client", feature = "standalone", not(feature = "test")))]
+pub(crate) fn reserve_legacy_install_repair() -> Result<CoreExecutionGuard> {
+    anyhow::ensure!(
+        unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } != 0,
+        "legacy service directory recovery requires an elevated installer"
+    );
+    let guard = CoreExecutionGuard::acquire()?;
+    windows_fallback::require_stopped_service()
+        .context("stop the service before repairing its legacy state directory")?;
+    windows_fallback::require_no_core_process(true)
+        .context("stop remaining service and core processes before repairing legacy state")?;
+    Ok(guard)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
