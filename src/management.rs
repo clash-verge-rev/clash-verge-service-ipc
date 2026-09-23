@@ -6,7 +6,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     io::Read as _,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
 };
 
 #[cfg(any(feature = "client", test))]
@@ -16,6 +16,46 @@ use std::ffi::OsString;
 pub struct CoreSource {
     pub name: String,
     pub path: PathBuf,
+}
+
+const INSTALLATION_FAILURE_PREFIX: &str = "CLASH_VERGE_INSTALLATION_FAILURE_V1=";
+
+/// The installer's final inspection, preserved across the preparation subprocess.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct InstallationVerificationError {
+    pub status: crate::InstallationStatus,
+}
+
+impl std::fmt::Display for InstallationVerificationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "installation finished without satisfying the requested service and cores"
+        )?;
+        for core in &self.status.cores {
+            match &core.availability {
+                crate::CoreAvailability::Ready => {}
+                crate::CoreAvailability::Missing => write!(formatter, "; {}: missing", core.name)?,
+                crate::CoreAvailability::DigestMismatch => write!(formatter, "; {}: digest mismatch", core.name)?,
+                crate::CoreAvailability::Rejected { reason } => {
+                    write!(formatter, "; {}: rejected: {reason}", core.name)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for InstallationVerificationError {}
+
+#[cfg(any(feature = "client", test))]
+impl InstallationVerificationError {
+    fn write_report(&self, mut output: impl std::io::Write) -> Result<()> {
+        output.write_all(INSTALLATION_FAILURE_PREFIX.as_bytes())?;
+        serde_json::to_writer(&mut output, self)?;
+        output.write_all(b"\n")?;
+        Ok(())
+    }
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {
@@ -51,13 +91,25 @@ pub fn install(installer: &Path, cores: &[CoreSource], core_only: bool, gid: Opt
         command.arg("--core").arg(&core.name).arg(&core.path);
     }
     let output = command.output().context("failed to launch the service installer")?;
-    anyhow::ensure!(
-        output.status.success(),
+    installation_result(output)
+}
+
+fn installation_result(output: Output) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        if let Some(report) = line.strip_prefix(INSTALLATION_FAILURE_PREFIX.as_bytes())
+            && let Ok(failure) = serde_json::from_slice::<InstallationVerificationError>(report)
+        {
+            return Err(failure.into());
+        }
+    }
+    anyhow::bail!(
         "service installation failed: {} {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(())
+    )
 }
 
 #[cfg(any(feature = "client", test))]
@@ -261,10 +313,11 @@ pub fn prepare_install_if_requested() -> Result<bool> {
     let status = runtime
         .block_on(crate::client::inspect_installation_with_digest(&requirements, true))
         .context("installation finished but its approved cores could not be verified")?;
-    anyhow::ensure!(
-        verified(&status),
-        "installation finished without satisfying the requested service and cores"
-    );
+    if !verified(&status) {
+        let failure = InstallationVerificationError { status };
+        failure.write_report(std::io::stdout().lock())?;
+        return Err(failure.into());
+    }
     Ok(true)
 }
 
@@ -357,6 +410,75 @@ fn windows_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installation_refusal_survives_subprocess_output_and_error_context() -> Result<()> {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt as _;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt as _;
+
+        let reason = "path C:\\用户\\core is writable by Everyone\npermissions rejected";
+        let failure = InstallationVerificationError {
+            status: crate::InstallationStatus {
+                service_sha256: "service digest".into(),
+                protocol: crate::ProtocolInfo::current(),
+                cores: vec![crate::CoreInspection {
+                    name: "verge-mihomo.exe".into(),
+                    availability: crate::CoreAvailability::Rejected { reason: reason.into() },
+                }],
+                core_busy: true,
+            },
+        };
+        let mut stdout = b"installer diagnostics\n".to_vec();
+        failure.write_report(&mut stdout)?;
+        assert!(
+            installation_result(Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: stdout.clone(),
+                stderr: Vec::new(),
+            })
+            .is_ok()
+        );
+        let result = installation_result(Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout,
+            stderr: b"Error: installation finished without satisfying the requested service and cores".to_vec(),
+        })
+        .context("install service failed");
+        let error = result.expect_err("a rejected core must not be reported as installed");
+        let report = error
+            .downcast_ref::<InstallationVerificationError>()
+            .expect("installation must preserve its structured inspection");
+        assert_eq!(report.status.cores, failure.status.cores);
+        assert_eq!(report.status.service_sha256, failure.status.service_sha256);
+        assert!(report.status.core_busy);
+        assert!(format!("{error:#}").contains(reason));
+        Ok(())
+    }
+
+    #[test]
+    fn unstructured_installer_failures_keep_their_diagnostics() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt as _;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt as _;
+
+        for stdout in [
+            "legacy installer output".to_owned(),
+            format!("{INSTALLATION_FAILURE_PREFIX}invalid json"),
+        ] {
+            let error = installation_result(Output {
+                status: std::process::ExitStatus::from_raw(1),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: b"elevation cancelled".to_vec(),
+            })
+            .expect_err("failed installers must remain errors");
+            assert!(error.downcast_ref::<InstallationVerificationError>().is_none());
+            assert!(error.to_string().contains(&stdout));
+            assert!(error.to_string().contains("elevation cancelled"));
+        }
+    }
 
     #[test]
     fn preparation_attests_staged_bytes_before_elevation() -> Result<()> {
