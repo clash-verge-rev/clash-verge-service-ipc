@@ -132,7 +132,8 @@ mod windows_location {
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
-        FILE_WRITE_DATA, FILE_WRITE_EA, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+        FILE_WRITE_DATA, FILE_WRITE_EA, GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_GUID,
+        WRITE_DAC, WRITE_OWNER,
     };
 
     /// `NT SERVICE\TrustedInstaller`, the owner Windows leaves on `%ProgramFiles%`.
@@ -163,15 +164,36 @@ mod windows_location {
         // `ancestors` yields the core itself first, then every directory up to the volume root.
         for (index, component) in canonical.ancestors().enumerate() {
             let is_core = index == 0;
+            let handle = open_for_security_review(component, !is_core)?;
             let hijack_rights = if is_core {
                 FILE_HIJACK_RIGHTS
             } else {
-                DIRECTORY_HIJACK_RIGHTS
+                directory_hijack_rights(handle.as_raw_handle())
             };
-            let handle = open_for_security_review(component, !is_core)?;
             review_component(handle.as_raw_handle(), component, hijack_rights, &trusted)?;
         }
         Ok(())
+    }
+
+    fn directory_hijack_rights(handle: *mut c_void) -> u32 {
+        // DELETE cannot remove or rename the volume root itself. In particular,
+        // Authenticated Users may have Modify there without being able to replace
+        // a protected child. FILE_DELETE_CHILD and permission-changing rights
+        // must still be rejected, as must DELETE on every other directory.
+        // Resolve the opened handle to a volume GUID path: a drive-letter root
+        // alone could be a SUBST directory or a mapped network share.
+        // A volume GUID root is exactly 49 UTF-16 code units plus the terminator.
+        let mut path = [0u16; 50];
+        let length =
+            unsafe { GetFinalPathNameByHandleW(handle, path.as_mut_ptr(), path.len() as u32, VOLUME_NAME_GUID) };
+        if length == 49 {
+            let path = String::from_utf16_lossy(&path[..49]);
+            if path.starts_with(r"\\?\Volume{") && path.ends_with("}\\") {
+                return DIRECTORY_HIJACK_RIGHTS & !DELETE;
+            }
+        }
+        // Failed, unsupported or truncated queries keep the stricter policy.
+        DIRECTORY_HIJACK_RIGHTS
     }
 
     fn review_component(
@@ -377,6 +399,109 @@ mod windows_location {
             if !self.0.is_null() {
                 unsafe { LocalFree(self.0) };
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, GetSecurityDescriptorOwner};
+
+        fn security_from_sddl(value: &str) -> SecurityInfo {
+            let wide: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+            let mut descriptor = std::ptr::null_mut();
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        wide.as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut descriptor,
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            let descriptor = LocalSecurityDescriptor(descriptor);
+            let mut owner = std::ptr::null_mut();
+            let mut dacl = std::ptr::null_mut();
+            let mut present = 0;
+            let mut defaulted = 0;
+            assert_ne!(
+                unsafe { GetSecurityDescriptorOwner(descriptor.0, &mut owner, &mut defaulted) },
+                0
+            );
+            assert_ne!(
+                unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted) },
+                0
+            );
+            SecurityInfo {
+                owner,
+                dacl,
+                _descriptor: descriptor,
+            }
+        }
+
+        fn volume_root() -> std::fs::File {
+            let path = std::env::current_exe().unwrap().canonicalize().unwrap();
+            open_for_security_review(path.ancestors().last().unwrap(), true).unwrap()
+        }
+
+        fn accepts(sddl: &str, rights: u32) -> bool {
+            review_security(
+                &security_from_sddl(sddl),
+                rights,
+                &TrustedSids::new().unwrap(),
+                "test path",
+            )
+            .is_ok()
+        }
+
+        #[test]
+        fn accepts_authenticated_users_modify_on_the_volume_root() {
+            let root = volume_root();
+            let rights = directory_hijack_rights(root.as_raw_handle());
+            assert_eq!(rights, DIRECTORY_HIJACK_RIGHTS & !DELETE);
+            // Reproduces #8023 without changing any real filesystem permissions.
+            let sddl = "O:SYD:(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;AU)(A;OICIIO;GA;;;AU)";
+            assert!(accepts(sddl, rights));
+            assert!(!accepts(sddl, DIRECTORY_HIJACK_RIGHTS));
+            assert!(!accepts(sddl, FILE_HIJACK_RIGHTS));
+        }
+
+        #[test]
+        fn volume_root_still_rejects_child_deletion_and_permission_changes() {
+            let root = volume_root();
+            let rights = directory_hijack_rights(root.as_raw_handle());
+            for mask in [FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER, GENERIC_ALL] {
+                let sddl = format!("O:SYD:(A;;FA;;;SY)(A;;0x{mask:x};;;AU)");
+                assert!(!accepts(&sddl, rights), "accepted dangerous root mask {mask:#x}");
+            }
+        }
+
+        #[test]
+        fn volume_root_still_requires_a_trusted_owner_and_a_dacl() {
+            let root = volume_root();
+            let rights = directory_hijack_rights(root.as_raw_handle());
+            assert!(!accepts("O:AUD:(A;;FA;;;SY)", rights));
+            assert!(!accepts("O:SYD:NO_ACCESS_CONTROL", rights));
+        }
+
+        #[test]
+        fn ordinary_directory_keeps_delete_protection() {
+            let path = std::env::current_exe().unwrap().canonicalize().unwrap();
+            let directory = open_for_security_review(path.parent().unwrap(), true).unwrap();
+            let rights = directory_hijack_rights(directory.as_raw_handle());
+            assert_eq!(rights, DIRECTORY_HIJACK_RIGHTS);
+            assert!(!accepts("O:SYD:(A;;SD;;;AU)", rights));
+            assert!(!accepts("O:SYD:(A;;SD;;;AU)", FILE_HIJACK_RIGHTS));
+        }
+
+        #[test]
+        fn failed_volume_query_keeps_delete_protection() {
+            assert_eq!(directory_hijack_rights(INVALID_HANDLE_VALUE), DIRECTORY_HIJACK_RIGHTS);
         }
     }
 }
