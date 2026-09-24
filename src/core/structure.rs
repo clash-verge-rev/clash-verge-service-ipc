@@ -225,6 +225,7 @@ pub enum ServiceErrorCode {
     InvalidProxyConfig = 1009,
     ProxyClearFailed = 1010,
     ProxyApplyFailed = 1011,
+    AppDataRootNotOwned = 1012,
 }
 
 pub fn owner_key(identity: &OwnerIdentity) -> String {

@@ -140,14 +140,30 @@ pub fn authenticate_owner(
             .map_err(|_| ServiceError::unauthorized("application data root is unavailable"))?;
         let metadata = std::fs::metadata(&app_data_root)
             .map_err(|_| ServiceError::unauthorized("application data root metadata is unavailable"))?;
-        let OwnerIdentity::Unix { uid, .. } = credentials.identity else {
+        let OwnerIdentity::Unix { uid, gid } = credentials.identity else {
             return Err(ServiceError::unauthorized(
                 "owner identity does not match the Unix transport",
             ));
         };
-        if !metadata.is_dir() || metadata.uid() != uid {
-            return Err(ServiceError::unauthorized(
-                "application data root is not an owner-controlled directory",
+        let path = &credentials.app_data_dir;
+        if !metadata.is_dir() {
+            return Err(ServiceError::unauthorized(format!(
+                "application data root {path:?} is not a directory"
+            )));
+        }
+        let owner = metadata.uid();
+        if owner != uid {
+            // Non-root callers see uid 99 as themselves, so `ls -l` in the app's session cannot show this.
+            let cause = if cfg!(target_os = "macos") && owner == 99 {
+                " (macOS assigns uid 99 to files created while their volume ignored ownership)"
+            } else {
+                ""
+            };
+            return Err(ServiceError::new(
+                ServiceErrorCode::AppDataRootNotOwned,
+                format!(
+                    "application data root {path:?} is owned by uid {owner}, not {uid}{cause}; run `sudo chown -R {uid}:{gid}` on it"
+                ),
             ));
         }
 

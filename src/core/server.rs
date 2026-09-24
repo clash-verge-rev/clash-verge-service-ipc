@@ -886,7 +886,9 @@ fn bad_request(message: impl Into<String>) -> Result<HttpResponse> {
 
 fn service_error(error: ServiceError) -> Result<HttpResponse> {
     let status = match error.code {
-        crate::ServiceErrorCode::UnauthorizedOwner => StatusCode::UNAUTHORIZED,
+        crate::ServiceErrorCode::UnauthorizedOwner | crate::ServiceErrorCode::AppDataRootNotOwned => {
+            StatusCode::UNAUTHORIZED
+        }
         crate::ServiceErrorCode::NotActive => StatusCode::CONFLICT,
         _ => StatusCode::UNPROCESSABLE_ENTITY,
     };
