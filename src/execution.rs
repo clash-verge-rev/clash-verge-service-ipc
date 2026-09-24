@@ -321,6 +321,8 @@ fn require_no_unix_core_processes(processes: &str, include_service: bool) -> Res
             "clash-verge-service-dev"
         })
         .join("bin/clash-verge-service");
+    // A residual helper outranks a core so the refusal stays repairable in any ps order.
+    let mut remaining_core = None;
     for process in processes.lines() {
         #[cfg(target_os = "linux")]
         let (process, arguments) = process
@@ -329,22 +331,47 @@ fn require_no_unix_core_processes(processes: &str, include_service: bool) -> Res
             .unwrap_or((process.trim(), ""));
         let executable = Path::new(process.trim());
         let name = executable.file_name().and_then(|name| name.to_str()).unwrap_or("");
-        anyhow::ensure!(
-            !["verge-mihomo", "verge-mihomo-alpha", "verge-mihomo-al"].contains(&name),
-            "process {name} remains after IPC failure; refusing a second core"
-        );
+        if ["verge-mihomo", "verge-mihomo-alpha", "verge-mihomo-al"].contains(&name) {
+            remaining_core.get_or_insert(name);
+        }
         if include_service && ["clash-verge-service", "clash-verge-ser"].contains(&name) {
             // Linux comm is truncated; argv[0] retains the installed helper's channel path.
             #[cfg(target_os = "linux")]
             let executable = Path::new(arguments.split_whitespace().next().unwrap_or(""));
-            anyhow::ensure!(
-                executable == other_helper,
-                "process {name} remains after IPC failure; refusing a second core"
-            );
+            if executable != other_helper {
+                return Err(ResidualServiceError {
+                    process: executable.to_path_buf(),
+                }
+                .into());
+            }
         }
+    }
+    if let Some(name) = remaining_core {
+        bail!("process {name} remains after IPC failure; refusing a second core");
     }
     Ok(())
 }
+
+/// A Service helper still runs without answering IPC; only reinstalling the Service replaces it.
+#[cfg(feature = "client")]
+#[derive(Debug)]
+pub struct ResidualServiceError {
+    process: PathBuf,
+}
+
+#[cfg(feature = "client")]
+impl std::fmt::Display for ResidualServiceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "service process {} is running without IPC; reinstall the service to replace it",
+            self.process.display()
+        )
+    }
+}
+
+#[cfg(feature = "client")]
+impl std::error::Error for ResidualServiceError {}
 
 #[cfg(feature = "client")]
 pub async fn reserve_sidecar() -> Result<CoreExecutionGuard> {
@@ -653,6 +680,17 @@ mod tests {
             assert!(
                 require_no_unix_core_processes(&residual, true).is_err(),
                 "unconfirmed idle state must remain blocked: {residual}"
+            );
+        }
+        for residual in [
+            current.to_owned(),
+            format!("/tmp/verge-mihomo\n{current}"),
+            format!("{current}\n/tmp/verge-mihomo"),
+        ] {
+            let refusal = require_no_unix_core_processes(&residual, true).expect_err("residual helper must block");
+            assert!(
+                refusal.downcast_ref::<ResidualServiceError>().is_some(),
+                "a residual helper must stay repairable: {residual}"
             );
         }
         Ok(())

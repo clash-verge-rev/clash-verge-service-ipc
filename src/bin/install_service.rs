@@ -761,7 +761,8 @@ fn main() -> Result<(), Error> {
     let plist_path = plist_file.to_string_lossy().into_owned();
 
     if launchd_install_plan == LaunchdInstallPlan::Bootout {
-        run_command("launchctl", &["bootout", "system", &plist_path], debug)?;
+        // A loaded job may have lost its plist; only the label still reaches it.
+        run_command("launchctl", &["bootout", &launchd_service_target()], debug)?;
     }
     shared::repair_active_owner_state()?;
     // Staged where the service is already down, so a core it was running no longer holds its file.

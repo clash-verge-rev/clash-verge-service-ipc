@@ -129,7 +129,7 @@ fn main() -> Result<(), Error> {
 
     let _ = run_command("launchctl", &["stop", service_id], debug);
     let _ = run_command("launchctl", &["disable", &format!("system/{}", service_id)], debug);
-    let _ = run_command("launchctl", &["bootout", "system", &plist_file], debug);
+    let _ = run_command("launchctl", &["bootout", &format!("system/{}", service_id)], debug);
 
     if Path::new(&plist_file).exists() {
         std::fs::remove_file(&plist_file).map_err(|e| anyhow::anyhow!("Failed to remove plist file: {}", e))?;
