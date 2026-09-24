@@ -656,30 +656,58 @@ fn env_u32(key: &str) -> Option<u32> {
     std::env::var(key).ok()?.parse().ok()
 }
 
+// nix's `Group::from_gid` detects ERANGE through errno, but getgrgid_r reports it only in its
+// return value, so a group record larger than nix's first buffer fails to resolve.
+#[cfg(unix)]
+fn lookup_group_name(gid: u32, mut buffer_size: usize) -> std::io::Result<Option<String>> {
+    const MAX_BUFFER_SIZE: usize = 1024 * 1024;
+    loop {
+        let mut group = unsafe { std::mem::zeroed::<platform_lib::group>() };
+        let mut buffer = vec![0 as platform_lib::c_char; buffer_size];
+        let mut result = std::ptr::null_mut();
+        let status =
+            unsafe { platform_lib::getgrgid_r(gid, &mut group, buffer.as_mut_ptr(), buffer.len(), &mut result) };
+        match status {
+            0 if result.is_null() => return Ok(None),
+            0 => {
+                let name = unsafe { std::ffi::CStr::from_ptr(group.gr_name) };
+                return Ok(Some(name.to_string_lossy().into_owned()));
+            }
+            platform_lib::ERANGE if buffer_size < MAX_BUFFER_SIZE => {
+                buffer_size = (buffer_size * 2).min(MAX_BUFFER_SIZE);
+            }
+            error => return Err(std::io::Error::from_raw_os_error(error)),
+        }
+    }
+}
+
 #[cfg(unix)]
 fn resolve_service_group_name() -> Result<String, Error> {
-    use nix::unistd::{Gid, Group, Uid, User};
+    use nix::unistd::{Uid, User};
 
-    if let Some(gid) = env_u32("CLASH_VERGE_SERVICE_GID")
-        && let Ok(Some(group)) = Group::from_gid(Gid::from_raw(gid))
+    let invoking_user_gid = || {
+        env_u32("SUDO_UID")
+            .or_else(|| env_u32("PKEXEC_UID"))
+            .and_then(|uid| User::from_uid(Uid::from_raw(uid)).ok().flatten())
+            .map(|user| user.gid.as_raw())
+    };
+    let mut failure = None;
+    for gid in env_u32("CLASH_VERGE_SERVICE_GID")
+        .into_iter()
+        .chain(std::iter::once_with(invoking_user_gid).flatten())
+        .chain(env_u32("SUDO_GID"))
     {
-        return Ok(group.name);
+        match lookup_group_name(gid, 4096) {
+            Ok(Some(name)) => return Ok(name),
+            Ok(None) => failure.get_or_insert_with(|| anyhow::anyhow!("no group record exists for gid {gid}")),
+            Err(error) => failure.get_or_insert_with(|| {
+                Error::new(error).context(format!("failed to look up the group record for gid {gid}"))
+            }),
+        };
     }
-
-    if let Some(uid) = env_u32("SUDO_UID").or_else(|| env_u32("PKEXEC_UID"))
-        && let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid))
-        && let Ok(Some(group)) = Group::from_gid(user.gid)
-    {
-        return Ok(group.name);
-    }
-
-    if let Some(gid) = env_u32("SUDO_GID")
-        && let Ok(Some(group)) = Group::from_gid(Gid::from_raw(gid))
-    {
-        return Ok(group.name);
-    }
-
-    bail!("unable to resolve the invoking user's service group; use sudo or pkexec")
+    Err(failure
+        .unwrap_or_else(|| anyhow::anyhow!("the invoking user's group id is unavailable; use sudo or pkexec"))
+        .context("unable to resolve the invoking user's service group"))
 }
 
 #[cfg(target_os = "macos")]
@@ -723,6 +751,7 @@ fn main() -> Result<(), Error> {
     if !options.install_service {
         return install_service_cores(&options.cores);
     }
+    let group_name = resolve_service_group_name()?;
     let debug = options.debug;
     let launchd_install_plan = probe_launchd_service(debug)?;
     let service_binary_path = bundled_service_binary()?;
@@ -748,7 +777,7 @@ fn main() -> Result<(), Error> {
 
     let launchd_plist_content = format!(
         include_str!("../../resources/launchd.plist.tmpl"),
-        group_name = resolve_service_group_name()?,
+        group_name = group_name,
         service_id = clash_verge_service_ipc::MACOS_SERVICE_ID,
         app_bundle_id = clash_verge_service_ipc::MACOS_APP_BUNDLE_ID,
         service_binary = target_binary_path.to_string_lossy(),
@@ -810,6 +839,7 @@ fn main() -> Result<(), Error> {
     if !options.install_service {
         return install_service_cores(&options.cores);
     }
+    let group = resolve_service_group_name()?;
     let debug = options.debug;
     let source = bundled_service_binary()?;
     let install_dir = clash_verge_service_ipc::prepare_service_install_directory()?;
@@ -827,7 +857,7 @@ fn main() -> Result<(), Error> {
     let unit_file_content = format!(
         include_str!("../../resources/systemd_service_unit.tmpl"),
         exec_start = target.to_string_lossy(),
-        group = resolve_service_group_name()?,
+        group = group,
         runtime_directory = clash_verge_service_ipc::SERVICE_SLUG,
     );
 
@@ -1356,5 +1386,17 @@ mod tests {
         let result = classify_launchd_service_probe(Some(113), "Operation not permitted");
 
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_lookup_grows_a_buffer_too_small_for_the_record() {
+        let (gid, name) = if cfg!(target_os = "macos") {
+            (20, "staff")
+        } else {
+            (0, "root")
+        };
+
+        assert_eq!(lookup_group_name(gid, 8).unwrap().as_deref(), Some(name));
     }
 }
