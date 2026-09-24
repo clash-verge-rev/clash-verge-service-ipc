@@ -120,24 +120,26 @@ mod windows_location {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-    use std::path::Path;
+    use std::path::{Component, Path, Prefix};
     use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT, SE_OBJECT_TYPE,
+        ConvertSidToStringSidW, ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT, SE_OBJECT_TYPE,
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, IsValidSid, IsWellKnownSid,
         OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
-        FILE_WRITE_DATA, FILE_WRITE_EA, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
+        CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_DELETE_CHILD,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
 
     /// `NT SERVICE\TrustedInstaller`, the owner Windows leaves on `%ProgramFiles%`.
     const TRUSTED_INSTALLER_SID: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const VOLUME_ROOT_MINIMAL_CAPABILITY_SID: &str =
+        "S-1-15-3-65536-1888954469-739942743-1668119174-2468466756-4239452838-1296943325-355587736-700089176";
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
     const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
     const ACCESS_DENIED_CALLBACK_ACE_TYPE: u8 = 10;
@@ -182,7 +184,20 @@ mod windows_location {
     ) -> Result<(), ServiceError> {
         let label = format!("core path {component:?}");
         let security = SecurityInfo::read(handle, SE_FILE_OBJECT, &label)?;
-        review_security(&security, hijack_rights, trusted, &label)
+        review_security(
+            &security,
+            hijack_rights,
+            trusted,
+            &label,
+            is_local_volume_root(component),
+        )
+    }
+
+    fn is_local_volume_root(path: &Path) -> bool {
+        let mut components = path.components();
+        matches!(components.next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
+            && matches!(components.next(), Some(Component::RootDir))
+            && components.next().is_none()
     }
 
     #[cfg(not(feature = "test"))]
@@ -197,7 +212,7 @@ mod windows_location {
             | WRITE_OWNER
             | GENERIC_WRITE
             | GENERIC_ALL;
-        review_security(&security, rights, &TrustedSids::new()?, &label)
+        review_security(&security, rights, &TrustedSids::new()?, &label, false)
     }
 
     fn review_security(
@@ -205,6 +220,7 @@ mod windows_location {
         hijack_rights: u32,
         trusted: &TrustedSids,
         label: &str,
+        volume_root: bool,
     ) -> Result<(), ServiceError> {
         if !trusted.contains(security.owner) {
             return Err(untrusted(format!(
@@ -243,12 +259,48 @@ mod windows_location {
             }
             let sid = std::ptr::addr_of!(allowed.SidStart).cast_mut().cast::<c_void>();
             if !trusted.contains(sid) {
+                // AppContainer capabilities intersect with user/group access. This stock
+                // isolatedWin32-volumeRootMinimal ACE cannot independently authorize a write.
+                // Keep the exception at the volume root; other principals and children
+                // must still pass the ordinary checks.
+                if volume_root
+                    && hijack_rights == DIRECTORY_HIJACK_RIGHTS
+                    && header.AceType == ACCESS_ALLOWED_ACE_TYPE
+                    && header.AceFlags == 0x03
+                    && allowed.Mask == FILE_ALL_ACCESS
+                    && unsafe { IsValidSid(sid) } != 0
+                    && unsafe { EqualSid(sid, LocalSid::from_string(VOLUME_ROOT_MINIMAL_CAPABILITY_SID)?.as_ptr()) }
+                        != 0
+                {
+                    continue;
+                }
                 return Err(untrusted(format!(
-                    "{label} is writable by an account other than SYSTEM, Administrators or TrustedInstaller"
+                    "{label} has an untrusted write ACE: ace_index={index}, sid={}, type={}, flags=0x{:02X}, mask=0x{:08X}, dangerous=0x{:08X}",
+                    sid_string(sid),
+                    header.AceType,
+                    header.AceFlags,
+                    allowed.Mask,
+                    allowed.Mask & hijack_rights
                 )));
             }
         }
         Ok(())
+    }
+
+    fn sid_string(sid: PSID) -> String {
+        let mut wide = std::ptr::null_mut();
+        if unsafe { IsValidSid(sid) } == 0 || unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 {
+            return "<invalid SID>".to_owned();
+        }
+        let mut len = 0;
+        unsafe {
+            while *wide.add(len) != 0 {
+                len += 1;
+            }
+            let value = String::from_utf16_lossy(std::slice::from_raw_parts(wide, len));
+            LocalFree(wide.cast());
+            value
+        }
     }
 
     fn open_for_security_review(path: &Path, directory: bool) -> Result<std::fs::File, ServiceError> {
@@ -316,7 +368,7 @@ mod windows_location {
             wide.push(0);
             let mut sid = std::ptr::null_mut();
             if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) } == 0 || unsafe { IsValidSid(sid) } == 0 {
-                return Err(untrusted("the TrustedInstaller SID could not be built"));
+                return Err(untrusted(format!("SID {value} could not be built")));
             }
             Ok(Self(sid))
         }
@@ -376,6 +428,124 @@ mod windows_location {
         fn drop(&mut self) {
             if !self.0.is_null() {
                 unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, GetSecurityDescriptorOwner};
+
+        const REPORTED_CAPABILITY: &str =
+            "S-1-15-3-65536-1888954469-739942743-1668119174-2468466756-4239452838-1296943325-355587736-700089176";
+
+        fn reported_root() -> String {
+            format!(
+                "O:{TRUSTED_INSTALLER_SID}G:{TRUSTED_INSTALLER_SID}D:\
+                 (A;OICIIO;0x1301bf;;;AU)(A;;0x100004;;;AU)(A;OICI;FA;;;SY)\
+                 (A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)\
+                 (A;OICI;FA;;;{REPORTED_CAPABILITY})(A;;0x1000a1;;;{REPORTED_CAPABILITY})"
+            )
+        }
+
+        fn review(sddl: &str, path: Option<&Path>, rights: u32) -> Result<(), ServiceError> {
+            let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+            let mut descriptor = std::ptr::null_mut();
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        wide.as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut descriptor,
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            let descriptor = LocalSecurityDescriptor(descriptor);
+            let mut owner = std::ptr::null_mut();
+            let mut defaulted = 0;
+            assert_ne!(
+                unsafe { GetSecurityDescriptorOwner(descriptor.0, &mut owner, &mut defaulted) },
+                0
+            );
+            let mut dacl = std::ptr::null_mut();
+            let mut present = 0;
+            assert_ne!(
+                unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted) },
+                0
+            );
+            let security = SecurityInfo {
+                owner,
+                dacl,
+                _descriptor: descriptor,
+            };
+            review_security(
+                &security,
+                rights,
+                &TrustedSids::new()?,
+                "reported path",
+                path.is_some_and(is_local_volume_root),
+            )
+        }
+
+        #[test]
+        fn accepts_reported_volume_root_capability_without_relaxing_other_aces() {
+            let sddl = reported_root();
+            for root in [r"C:\", r"\\?\C:\", r"D:\"] {
+                review(&sddl, Some(Path::new(root)), DIRECTORY_HIJACK_RIGHTS).unwrap();
+            }
+            for sid in ["WD", "AU", "BU", "S-1-5-21-1-2-3-1001"] {
+                for mask in ["FA", "0x10000", "0x40", "0x40000", "0x80000"] {
+                    let unsafe_sddl = format!("{sddl}(A;;{mask};;;{sid})");
+                    assert!(review(&unsafe_sddl, Some(Path::new(r"C:\")), DIRECTORY_HIJACK_RIGHTS).is_err());
+                }
+            }
+        }
+
+        #[test]
+        fn capability_exception_cannot_authorize_other_locations_or_owners() {
+            let sddl = reported_root();
+            for path in [
+                r"C:\ProgramData",
+                r"C:\cores\verge-mihomo.exe",
+                r"\\server\share\",
+                r"C:",
+                r"\",
+                r"C:\folder\..",
+            ] {
+                assert!(
+                    review(&sddl, Some(Path::new(path)), DIRECTORY_HIJACK_RIGHTS).is_err(),
+                    "{path}"
+                );
+            }
+            assert!(review(&sddl, None, DIRECTORY_HIJACK_RIGHTS).is_err());
+            assert!(review(&sddl, Some(Path::new(r"C:\")), FILE_HIJACK_RIGHTS).is_err());
+            let owner = format!("O:{REPORTED_CAPABILITY}G:SYD:(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+            assert!(review(&owner, Some(Path::new(r"C:\")), DIRECTORY_HIJACK_RIGHTS).is_err());
+            let unknown = sddl.replace(REPORTED_CAPABILITY, "S-1-15-3-65536-1-2-3-4-5-6-7-8");
+            assert!(review(&unknown, Some(Path::new(r"C:\")), DIRECTORY_HIJACK_RIGHTS).is_err());
+            let different_flags = sddl.replace("(A;OICI;FA;;;S-1-15", "(A;;FA;;;S-1-15");
+            assert!(review(&different_flags, Some(Path::new(r"C:\")), DIRECTORY_HIJACK_RIGHTS).is_err());
+        }
+
+        #[test]
+        fn rejection_identifies_the_untrusted_ace() {
+            let sddl = format!("{}(A;;0x40000;;;AU)", reported_root());
+            let error = review(&sddl, Some(Path::new(r"C:\")), DIRECTORY_HIJACK_RIGHTS).unwrap_err();
+            let message = error.to_string();
+            for detail in [
+                "ace_index=7",
+                "sid=S-1-5-11",
+                "mask=0x00040000",
+                "flags=0x00",
+                "dangerous=0x00040000",
+            ] {
+                assert!(message.contains(detail), "missing {detail}: {message}");
             }
         }
     }
