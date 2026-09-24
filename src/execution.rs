@@ -1,5 +1,7 @@
 //! Cooperative exclusion between Service supervision and local Sidecar execution.
-use anyhow::{Context as _, Result, bail};
+#[cfg(unix)]
+use anyhow::bail;
+use anyhow::{Context as _, Result};
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::{
@@ -9,9 +11,13 @@ use std::{
 
 #[derive(Debug)]
 pub struct CoreExecutionGuard {
+    #[cfg(unix)]
     _file: File,
+    #[cfg(windows)]
+    _reservation: windows_lock::Reservation,
 }
 
+#[cfg(unix)]
 impl Drop for CoreExecutionGuard {
     fn drop(&mut self) {
         // fork can briefly inherit this open file description before exec closes it.
@@ -21,15 +27,51 @@ impl Drop for CoreExecutionGuard {
 
 impl CoreExecutionGuard {
     pub fn acquire() -> Result<Self> {
-        Self::acquire_at(&coordination_path()?)
+        #[cfg(unix)]
+        return Self::acquire_at(&coordination_path()?);
+        #[cfg(windows)]
+        {
+            Self::acquire_windows_at(
+                windows_lock::NAME,
+                &coordination_path()?,
+                windows_fallback::require_no_registered_services,
+                || windows_fallback::require_no_core_process(false),
+            )
+        }
     }
 
+    #[cfg(windows)]
+    fn acquire_windows_at(
+        name: &str,
+        path: &Path,
+        require_services_absent: impl FnOnce() -> Result<()>,
+        require_cores_absent: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
+        let reservation = windows_lock::Reservation::try_acquire(name, path)?
+            .context("another Service or Sidecar owns core execution")?;
+        if !reservation.has_legacy_lock() {
+            require_services_absent()?;
+        }
+        require_cores_absent()?;
+        Ok(Self {
+            _reservation: reservation,
+        })
+    }
+
+    #[cfg(any(unix, test))]
     fn acquire_at(path: &Path) -> Result<Self> {
-        let file = open_coordination_file(path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(std::fs::TryLockError::WouldBlock) => bail!("another Service or Sidecar owns core execution"),
-            Err(std::fs::TryLockError::Error(error)) => Err(error).context("could not reserve core execution"),
+        #[cfg(windows)]
+        {
+            Self::acquire_windows_at(&test_coordination_name(path), path, || Ok(()), || Ok(()))
+        }
+        #[cfg(unix)]
+        {
+            let file = open_coordination_file(path)?;
+            match file.try_lock() {
+                Ok(()) => Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => bail!("another Service or Sidecar owns core execution"),
+                Err(std::fs::TryLockError::Error(error)) => Err(error).context("could not reserve core execution"),
+            }
         }
     }
 
@@ -55,16 +97,33 @@ impl CoreExecutionGuard {
     }
 
     pub fn is_held() -> Result<bool> {
-        let file = open_coordination_file(&coordination_path()?)?;
-        match file.try_lock() {
-            Ok(()) => {
-                file.unlock()?;
-                Ok(false)
+        #[cfg(windows)]
+        {
+            Ok(windows_lock::Reservation::try_acquire(windows_lock::NAME, &coordination_path()?)?.is_none())
+        }
+        #[cfg(unix)]
+        {
+            let file = open_coordination_file(&coordination_path()?)?;
+            match file.try_lock() {
+                Ok(()) => {
+                    file.unlock()?;
+                    Ok(false)
+                }
+                Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+                Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
             }
-            Err(std::fs::TryLockError::WouldBlock) => Ok(true),
-            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
         }
     }
+}
+
+#[cfg(all(windows, test))]
+fn test_coordination_name(path: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest: String = Sha256::digest(path.as_os_str().as_encoded_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!(r"Global\clash-verge-execution-test-{digest}")
 }
 
 #[cfg(unix)]
@@ -186,7 +245,7 @@ fn open_coordination_file(path: &Path) -> Result<File> {
         LocalFree(descriptor);
     }
     if handle == INVALID_HANDLE_VALUE {
-        return Err(error.into());
+        return Err(error).with_context(|| format!("could not open or create legacy core execution lock {path:?}"));
     }
     let file = unsafe { File::from_raw_handle(handle) };
     anyhow::ensure!(
@@ -293,9 +352,13 @@ pub async fn reserve_sidecar() -> Result<CoreExecutionGuard> {
     CoreExecutionGuard::acquire()
 }
 
-#[cfg(all(windows, feature = "client"))]
+#[cfg(windows)]
 #[path = "execution_windows.rs"]
 mod windows_fallback;
+
+#[cfg(windows)]
+#[path = "execution_windows_lock.rs"]
+mod windows_lock;
 
 #[cfg(all(windows, feature = "client", feature = "standalone", not(feature = "test")))]
 pub(crate) fn reserve_legacy_install_repair() -> Result<CoreExecutionGuard> {
@@ -314,6 +377,174 @@ pub(crate) fn reserve_legacy_install_repair() -> Result<CoreExecutionGuard> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    fn set_test_dacl(path: &Path, sddl: &str) {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::{
+                Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
+                DACL_SECURITY_INFORMATION, SetFileSecurityW,
+            },
+        };
+        let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor = std::ptr::null_mut();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(converted, 0);
+        let secured = unsafe { SetFileSecurityW(wide.as_ptr(), DACL_SECURITY_INFORMATION, descriptor) };
+        unsafe {
+            LocalFree(descriptor);
+        }
+        assert_ne!(secured, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_legacy_lock_does_not_require_parent_write_access() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("execution-readonly-parent-{}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let path = root.join("core.lock");
+        set_test_dacl(&root, "D:P(D;;0x2;;;WD)(A;;FA;;;AU)(A;;FA;;;SY)");
+        let result = (|| -> Result<()> {
+            let name = test_coordination_name(&path);
+            for service_absent in [false, true] {
+                let refused = CoreExecutionGuard::acquire_windows_at(
+                    &name,
+                    &path,
+                    || {
+                        assert!(CoreExecutionGuard::acquire_at(&path).is_err());
+                        anyhow::ensure!(service_absent, "registered stopped service");
+                        Ok(())
+                    },
+                    || {
+                        assert!(service_absent);
+                        assert!(CoreExecutionGuard::acquire_at(&path).is_err());
+                        anyhow::bail!("surviving core after owner exit")
+                    },
+                );
+                let message = refused.unwrap_err().to_string();
+                assert!(message.contains(if service_absent {
+                    "surviving core"
+                } else {
+                    "registered stopped service"
+                }));
+            }
+            let first = CoreExecutionGuard::acquire_at(&path)?;
+            assert!(CoreExecutionGuard::acquire_at(&path).is_err());
+            drop(first);
+            drop(CoreExecutionGuard::acquire_at(&path)?);
+            Ok(())
+        })();
+        assert!(!path.exists());
+        std::fs::remove_dir(&root)?;
+        result
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_legacy_file_fails_closed_without_leaking_the_mutex() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("execution-unreadable-{}", std::process::id()));
+        std::fs::write(&path, b"")?;
+        set_test_dacl(&path, "D:P(D;;GR;;;WD)(A;;FA;;;AU)(A;;FA;;;SY)");
+        let refused = CoreExecutionGuard::acquire_at(&path);
+        set_test_dacl(&path, "D:P(A;;FA;;;AU)(A;;FA;;;SY)");
+        let message = refused.unwrap_err().to_string();
+        assert!(message.contains("legacy core execution lock"));
+        assert!(message.contains(path.file_name().unwrap().to_str().unwrap()));
+        drop(CoreExecutionGuard::acquire_at(&path)?);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_and_global_reservations_exclude_each_other() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("execution-legacy-bridge-{}", std::process::id()));
+        let legacy = open_coordination_file(&path)?;
+        legacy.try_lock()?;
+        assert!(CoreExecutionGuard::acquire_at(&path).is_err());
+        legacy.unlock()?;
+        let modern = CoreExecutionGuard::acquire_at(&path)?;
+        assert!(matches!(legacy.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        drop(modern);
+        legacy.try_lock()?;
+        drop(legacy);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_reservation_holder() -> Result<()> {
+        if let Some(path) = std::env::var_os("CLASH_VERGE_TEST_HOLD_LOCK") {
+            let path = Path::new(&path);
+            let _guard = CoreExecutionGuard::acquire_at(path)?;
+            std::fs::write(path.with_extension("ready"), b"ready")?;
+            loop {
+                std::thread::park();
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminated_process_releases_both_reservations() -> Result<()> {
+        use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
+        use windows_sys::Win32::System::Threading::OpenMutexW;
+        let path = std::env::temp_dir().join(format!("execution-crash-{}", std::process::id()));
+        let ready = path.with_extension("ready");
+        let mut keep_mutex_alive = None;
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "execution::tests::child_reservation_holder"])
+            .env("CLASH_VERGE_TEST_HOLD_LOCK", &path)
+            .spawn()?;
+        let result = (|| -> Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ready.exists() {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline && child.try_wait()?.is_none(),
+                    "child did not reserve execution"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(CoreExecutionGuard::acquire_at(&path).is_err());
+            let wide: Vec<u16> = test_coordination_name(&path).encode_utf16().chain(Some(0)).collect();
+            let handle = unsafe { OpenMutexW(0x00100000, 0, wide.as_ptr()) };
+            anyhow::ensure!(!handle.is_null(), "could not retain mutex for abandonment test");
+            keep_mutex_alive = Some(unsafe { OwnedHandle::from_raw_handle(handle) });
+            Ok(())
+        })();
+        let _ = child.kill();
+        child.wait()?;
+        result?;
+        let checked = std::cell::Cell::new(false);
+        let refused = CoreExecutionGuard::acquire_windows_at(
+            &test_coordination_name(&path),
+            &path,
+            || panic!("the legacy lock exists"),
+            || {
+                checked.set(true);
+                anyhow::bail!("residual core is still running");
+            },
+        );
+        assert!(checked.get());
+        assert!(refused.unwrap_err().to_string().contains("residual core"));
+        drop(CoreExecutionGuard::acquire_at(&path)?);
+        drop(keep_mutex_alive);
+        std::fs::remove_file(path)?;
+        std::fs::remove_file(ready)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn termination_event_releases_reservation_even_when_pid_still_exists() -> Result<()> {
         let path = std::env::temp_dir().join(format!("execution-reused-pid-test-{}", std::process::id()));
