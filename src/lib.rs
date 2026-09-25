@@ -21,6 +21,7 @@ pub use core::{
     StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig, mihomo_ipc_path, owner_key,
 };
 pub use core::{CORE_DISPLACED_EXTENSION, CORE_STAGING_EXTENSION, OwnerPaths, ServicePaths, service_paths};
+pub use core::{MobileHotspotCompatibilityOutcome, MobileHotspotCompatibilityRequest};
 
 #[cfg(feature = "standalone")]
 pub use core::{
@@ -76,7 +77,7 @@ pub static IPC_AUTH_EXPECT: &str =
 
 pub static VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_EPOCH: u16 = 2;
-pub const PROTOCOL_REVISION: u16 = 5;
+pub const PROTOCOL_REVISION: u16 = 6;
 pub const MIN_SUPPORTED_CLIENT_REVISION: u16 = 5;
 pub const MIN_REQUIRED_SERVICE_REVISION: u16 = 5;
 /// Revision that introduced `/clash/stage-runtime`.
@@ -84,3 +85,5 @@ pub const MIN_REQUIRED_SERVICE_REVISION: u16 = 5;
 pub const MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING: u16 = 2;
 /// Capability revision for `/clash/runtime-file`.
 pub const MIN_SERVICE_REVISION_FOR_RUNTIME_FILE_READ: u16 = 3;
+/// Revision that introduced Windows Mobile Hotspot ICS public-side switching.
+pub const MIN_SERVICE_REVISION_FOR_MOBILE_HOTSPOT_COMPATIBILITY: u16 = 6;
