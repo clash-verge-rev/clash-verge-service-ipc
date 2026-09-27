@@ -231,6 +231,8 @@ mod windows_location {
         if security.dacl.is_null() {
             return Err(untrusted(format!("{label} has no DACL")));
         }
+        // A volume root cannot be deleted or renamed, so DELETE on it cannot move the core path.
+        let inert_rights = if volume_root { DELETE } else { 0 };
 
         for index in 0..u32::from(unsafe { (*security.dacl).AceCount }) {
             let mut ace = std::ptr::null_mut();
@@ -254,7 +256,8 @@ mod windows_location {
                 }
             }
             let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
-            if allowed.Mask & hijack_rights == 0 {
+            let dangerous = allowed.Mask & hijack_rights & !inert_rights;
+            if dangerous == 0 {
                 continue;
             }
             let sid = std::ptr::addr_of!(allowed.SidStart).cast_mut().cast::<c_void>();
@@ -280,7 +283,7 @@ mod windows_location {
                     header.AceType,
                     header.AceFlags,
                     allowed.Mask,
-                    allowed.Mask & hijack_rights
+                    dangerous
                 )));
             }
         }
@@ -500,7 +503,7 @@ mod windows_location {
                 review(&sddl, Some(Path::new(root)), DIRECTORY_HIJACK_RIGHTS).unwrap();
             }
             for sid in ["WD", "AU", "BU", "S-1-5-21-1-2-3-1001"] {
-                for mask in ["FA", "0x10000", "0x40", "0x40000", "0x80000"] {
+                for mask in ["FA", "0x40", "0x40000", "0x80000"] {
                     let unsafe_sddl = format!("{sddl}(A;;{mask};;;{sid})");
                     assert!(review(&unsafe_sddl, Some(Path::new(r"C:\")), DIRECTORY_HIJACK_RIGHTS).is_err());
                 }
@@ -531,6 +534,14 @@ mod windows_location {
             assert!(review(&unknown, Some(Path::new(r"C:\")), DIRECTORY_HIJACK_RIGHTS).is_err());
             let different_flags = sddl.replace("(A;OICI;FA;;;S-1-15", "(A;;FA;;;S-1-15");
             assert!(review(&different_flags, Some(Path::new(r"C:\")), DIRECTORY_HIJACK_RIGHTS).is_err());
+        }
+
+        #[test]
+        fn delete_is_inert_only_on_the_volume_root() {
+            // A reported C:\ ACL: Authenticated Users with Modify on the root itself.
+            let sddl = "O:SYG:SYD:(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1301bf;;;AU)";
+            review(sddl, Some(Path::new(r"\\?\C:\")), DIRECTORY_HIJACK_RIGHTS).unwrap();
+            assert!(review(sddl, Some(Path::new(r"C:\ProgramData")), DIRECTORY_HIJACK_RIGHTS).is_err());
         }
 
         #[test]
