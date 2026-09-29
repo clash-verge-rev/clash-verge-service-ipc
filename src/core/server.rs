@@ -13,7 +13,9 @@ use crate::core::runtime_generation::{PreparedRuntime, prepare_runtime, read_run
 use crate::core::state::{set_core_lifecycle_state, set_service_lifecycle_state};
 use crate::core::status::service_status_snapshot;
 use crate::core::structure::{OwnerSessionProof, Response, ServiceLifecycleState};
-use crate::core::{apply_proxy, apply_proxy_or_direct, clear_proxy, validate_proxy_config};
+use crate::core::{
+    apply_proxy, apply_proxy_or_direct, clear_proxy, clear_proxy_waiting_for_network, validate_proxy_config,
+};
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IpcCommand, MIN_SUPPORTED_CLIENT_REVISION, MacosProxyConfig,
     OwnerSessionHandle, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, RuntimeFileRequest,
@@ -95,7 +97,7 @@ struct StartOwnerTransition<'a> {
 
 impl OwnerProxyTransition for StartOwnerTransition<'_> {
     async fn clear_previous_proxy(&mut self) -> AnyResult<()> {
-        clear_service_proxy().await
+        clear_previous_owner_proxy().await
     }
 
     async fn compensate_direct(&mut self) -> AnyResult<()> {
@@ -187,6 +189,20 @@ const SERVICE_PROXY_IS_LIVE: bool = cfg!(all(target_os = "macos", not(feature = 
 async fn clear_service_proxy() -> AnyResult<()> {
     if SERVICE_PROXY_IS_LIVE {
         clear_proxy().await
+    } else {
+        Ok(())
+    }
+}
+
+/// Clears the previous owner's proxy before a takeover.
+///
+/// A takeover runs when the GUI starts the core, which on macOS happens during the login window
+/// before DHCP completes. Waiting briefly for a resolvable network service keeps that race from
+/// failing core startup. The stop path keeps the immediate [`clear_proxy`], so shutting down is
+/// not delayed by the retry budget.
+async fn clear_previous_owner_proxy() -> AnyResult<()> {
+    if SERVICE_PROXY_IS_LIVE {
+        clear_proxy_waiting_for_network().await
     } else {
         Ok(())
     }

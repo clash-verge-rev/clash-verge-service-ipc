@@ -80,7 +80,9 @@ pub use manager::{CoreWatchdogTestConfig, set_core_watchdog_config_for_tests};
 #[cfg(feature = "standalone")]
 pub use owner::{ServiceOwnerGuard, acquire_service_owner};
 #[cfg(feature = "standalone")]
-pub use proxy::{apply_proxy, apply_proxy_or_direct, clear_proxy, validate_proxy_config};
+pub use proxy::{
+    apply_proxy, apply_proxy_or_direct, clear_proxy, clear_proxy_waiting_for_network, validate_proxy_config,
+};
 #[cfg(feature = "standalone")]
 pub use reconcile::reconcile_service_startup;
 #[cfg(feature = "standalone")]
