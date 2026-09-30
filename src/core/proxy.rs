@@ -13,8 +13,8 @@ const MAX_BYPASS_LEN: usize = 8192;
 const MAX_PAC_URL_LEN: usize = 256;
 const PAC_PATH: &str = "/commands/pac";
 
-/// Waits for a network service to clear a previous owner's proxy on; about 8 s in total, well
-/// below the IPC handler timeout.
+/// Sleeps between attempts to clear a previous owner's proxy while no network service exists.
+/// They add up to 7.75 s; the attempts themselves take extra time.
 const CLEAR_PROXY_RETRY_DELAYS: &[Duration] = &[
     Duration::from_millis(250),
     Duration::from_millis(500),

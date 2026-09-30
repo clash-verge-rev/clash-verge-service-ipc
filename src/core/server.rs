@@ -97,8 +97,8 @@ struct StartOwnerTransition<'a> {
 
 impl OwnerProxyTransition for StartOwnerTransition<'_> {
     async fn clear_previous_proxy(&mut self) -> AnyResult<()> {
-        // Every path that clears the active owner clears its proxy first, so without one there
-        // is no proxy of ours to wait for.
+        // A recorded owner may not have stopped cleanly, so its proxy is worth waiting for.
+        // Without one, clear at once as before rather than delay every offline or VPN start.
         if self.previous_owner.is_some() {
             clear_previous_owner_proxy().await
         } else {
