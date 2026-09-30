@@ -13,8 +13,8 @@ const MAX_BYPASS_LEN: usize = 8192;
 const MAX_PAC_URL_LEN: usize = 256;
 const PAC_PATH: &str = "/commands/pac";
 
-/// Bounded wait for macOS to publish a resolvable primary network service while clearing a proxy.
-/// The total stays far below the IPC handler timeout, so a takeover can still answer its caller.
+/// Waits for a network service to clear a previous owner's proxy on; about 8 s in total, well
+/// below the IPC handler timeout.
 const CLEAR_PROXY_RETRY_DELAYS: &[Duration] = &[
     Duration::from_millis(250),
     Duration::from_millis(500),
@@ -22,11 +22,6 @@ const CLEAR_PROXY_RETRY_DELAYS: &[Duration] = &[
     Duration::from_secs(2),
     Duration::from_secs(4),
 ];
-
-/// Diagnostic sysproxy reports when the primary service named by `State:/Network/Global/IPv4`
-/// cannot be resolved in the preferences store.
-#[cfg(target_os = "macos")]
-const RESOLVE_ACTIVE_NETWORK_SERVICE: &str = "resolve active network service";
 
 pub fn validate_proxy_config(config: &MacosProxyConfig) -> anyhow::Result<()> {
     match config {
@@ -136,10 +131,10 @@ fn apply_proxy_or_direct_with(
         Ok(()) => Ok(ProxyApplyOutcome::Applied),
         Err(apply_error) => {
             // A lookup failure means no write of ours failed midway, so there is nothing to undo.
-            let nothing_to_undo = is_network_service_unavailable(&apply_error);
+            let nothing_to_undo = is_no_active_network_service(&apply_error);
             match apply(&MacosProxyConfig::Disabled) {
                 Ok(()) => {}
-                Err(compensation_error) if nothing_to_undo && is_network_service_unavailable(&compensation_error) => {}
+                Err(compensation_error) if nothing_to_undo && is_no_active_network_service(&compensation_error) => {}
                 Err(compensation_error) => {
                     return Err(compensation_error).with_context(|| {
                         format!("failed to compensate proxy apply failure ({apply_error}) with direct mode")
@@ -171,7 +166,7 @@ pub async fn apply_proxy(_config: &MacosProxyConfig) -> anyhow::Result<()> {
 /// "no proxy" state already holds, and failing would block callers that clear before stopping.
 pub async fn clear_proxy() -> anyhow::Result<()> {
     match apply_proxy(&MacosProxyConfig::Disabled).await {
-        Err(error) if is_network_service_unavailable(&error) => {
+        Err(error) if is_no_active_network_service(&error) => {
             warn!("no active network service, nothing to clear: {error:#}");
             Ok(())
         }
@@ -179,14 +174,8 @@ pub async fn clear_proxy() -> anyhow::Result<()> {
     }
 }
 
-/// Clears the proxy, waiting briefly for macOS to publish a resolvable primary network service.
-///
-/// `State:/Network/Global/IPv4` starts naming a primary service before that service can be
-/// resolved in the preferences store, so a takeover that lands in that window (login items run
-/// before DHCP completes, or a network switch is in progress) cannot rewrite the previous owner's
-/// proxy yet. Failing the whole takeover there leaves the user with no core at all, while the
-/// proxy settings are replaced or cleared as soon as the network settles, so wait instead of
-/// aborting. Real write failures still surface as errors.
+/// [`clear_proxy`], but a missing network service is first waited for, since at login the network
+/// can come up after the core starts.
 pub async fn clear_proxy_waiting_for_network() -> anyhow::Result<()> {
     clear_proxy_waiting_with(|| apply_proxy(&MacosProxyConfig::Disabled), CLEAR_PROXY_RETRY_DELAYS).await
 }
@@ -200,12 +189,12 @@ where
     loop {
         match apply().await {
             Ok(()) => return Ok(()),
-            Err(error) if is_network_service_unavailable(&error) => {
+            Err(error) if is_no_active_network_service(&error) => {
                 let Some(delay) = delays.get(retries) else {
-                    warn!("no resolvable network service after {retries} retries, nothing to clear: {error:#}");
+                    warn!("no active network service after {retries} retries, nothing to clear: {error:#}");
                     return Ok(());
                 };
-                warn!("network service is not resolvable yet, retrying proxy clear in {delay:?}: {error:#}");
+                warn!("no active network service yet, retrying proxy clear in {delay:?}: {error:#}");
                 tokio::time::sleep(*delay).await;
                 retries += 1;
             }
@@ -214,29 +203,18 @@ where
     }
 }
 
-/// Whether macOS could not resolve an active network service to read or write.
-///
-/// `State:/Network/Global/IPv4` can name a primary service that `SCNetworkServiceCopy` cannot
-/// resolve from the preferences store: during the login window (a login item starts before DHCP
-/// completes) and while a network switch or VPN handoff is in progress. sysproxy reports that as
-/// `SystemConfiguration("resolve active network service")`, which means the same as
-/// `NoActiveNetworkService`: there is no active service, so nothing was applied.
 #[cfg(target_os = "macos")]
-fn is_network_service_unavailable(error: &anyhow::Error) -> bool {
+fn is_no_active_network_service(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<sysproxy::Error>(),
-            Some(
-                sysproxy::Error::NoActiveNetworkService
-                    | sysproxy::Error::NetworkInterface
-                    | sysproxy::Error::SystemConfiguration(RESOLVE_ACTIVE_NETWORK_SERVICE)
-            )
+            Some(sysproxy::Error::NoActiveNetworkService)
         )
     })
 }
 
 #[cfg(not(target_os = "macos"))]
-const fn is_network_service_unavailable(_error: &anyhow::Error) -> bool {
+const fn is_no_active_network_service(_error: &anyhow::Error) -> bool {
     false
 }
 
@@ -258,13 +236,8 @@ pub async fn apply_proxy_or_direct(config: Option<&MacosProxyConfig>) -> anyhow:
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
-    use super::RESOLVE_ACTIVE_NETWORK_SERVICE;
-    use super::{
-        apply_proxy_or_direct_with, clear_proxy_waiting_with, is_network_service_unavailable, validate_proxy_config,
-    };
+    use super::{apply_proxy_or_direct_with, validate_proxy_config};
     use crate::{MacosProxyConfig, ProxyApplyOutcome};
-    use std::time::Duration;
 
     #[test]
     fn proxy_contract_accepts_only_loopback_targets() {
@@ -449,39 +422,18 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
-    fn an_unresolvable_network_service_reads_as_unavailable() {
-        let unavailable = [
-            anyhow::Error::new(sysproxy::Error::NoActiveNetworkService),
-            anyhow::Error::new(sysproxy::Error::NetworkInterface),
-            anyhow::Error::new(sysproxy::Error::SystemConfiguration(RESOLVE_ACTIVE_NETWORK_SERVICE)),
-        ];
-        for error in unavailable {
-            assert!(is_network_service_unavailable(&error), "not recognized: {error:#}");
-        }
-
-        let write_failure = anyhow::Error::new(sysproxy::Error::SystemConfiguration("commit proxy configuration"));
-        assert!(!is_network_service_unavailable(&write_failure));
-        assert!(!is_network_service_unavailable(&anyhow::anyhow!(
-            "native proxy transaction failed"
-        )));
-    }
-
-    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn clearing_waits_for_a_resolvable_network_service() -> anyhow::Result<()> {
         let attempts = std::cell::Cell::new(0);
-        let delays = [Duration::ZERO, Duration::ZERO];
+        let delays = [std::time::Duration::ZERO, std::time::Duration::ZERO];
 
-        clear_proxy_waiting_with(
+        super::clear_proxy_waiting_with(
             || {
                 let attempt = attempts.get();
                 attempts.set(attempt + 1);
                 async move {
                     if attempt < 2 {
-                        Err(anyhow::Error::new(sysproxy::Error::SystemConfiguration(
-                            RESOLVE_ACTIVE_NETWORK_SERVICE,
-                        )))
+                        Err(anyhow::Error::new(sysproxy::Error::NoActiveNetworkService))
                     } else {
                         Ok(())
                     }
@@ -503,9 +455,9 @@ mod tests {
     #[tokio::test]
     async fn clearing_tolerates_a_service_that_never_resolves() -> anyhow::Result<()> {
         let attempts = std::cell::Cell::new(0);
-        let delays = [Duration::ZERO, Duration::ZERO];
+        let delays = [std::time::Duration::ZERO, std::time::Duration::ZERO];
 
-        clear_proxy_waiting_with(
+        super::clear_proxy_waiting_with(
             || {
                 attempts.set(attempts.get() + 1);
                 async { Err(anyhow::Error::new(sysproxy::Error::NoActiveNetworkService)) }
@@ -523,12 +475,12 @@ mod tests {
     async fn clearing_reports_write_failures_without_retrying() {
         let attempts = std::cell::Cell::new(0);
 
-        let error = clear_proxy_waiting_with(
+        let error = super::clear_proxy_waiting_with(
             || {
                 attempts.set(attempts.get() + 1);
                 async { Err(anyhow::anyhow!("native proxy transaction failed")) }
             },
-            &[Duration::ZERO],
+            &[std::time::Duration::ZERO],
         )
         .await
         .expect_err("a write failure must not be treated as nothing to clear");

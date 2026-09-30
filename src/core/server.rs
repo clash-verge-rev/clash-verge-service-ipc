@@ -97,7 +97,13 @@ struct StartOwnerTransition<'a> {
 
 impl OwnerProxyTransition for StartOwnerTransition<'_> {
     async fn clear_previous_proxy(&mut self) -> AnyResult<()> {
-        clear_previous_owner_proxy().await
+        // Every path that clears the active owner clears its proxy first, so without one there
+        // is no proxy of ours to wait for.
+        if self.previous_owner.is_some() {
+            clear_previous_owner_proxy().await
+        } else {
+            clear_service_proxy().await
+        }
     }
 
     async fn compensate_direct(&mut self) -> AnyResult<()> {
@@ -194,12 +200,7 @@ async fn clear_service_proxy() -> AnyResult<()> {
     }
 }
 
-/// Clears the previous owner's proxy before a takeover.
-///
-/// A takeover runs when the GUI starts the core, which on macOS happens during the login window
-/// before DHCP completes. Waiting briefly for a resolvable network service keeps that race from
-/// failing core startup. The stop path keeps the immediate [`clear_proxy`], so shutting down is
-/// not delayed by the retry budget.
+/// Only the takeover waits for a network service; stopping keeps the immediate [`clear_proxy`].
 async fn clear_previous_owner_proxy() -> AnyResult<()> {
     if SERVICE_PROXY_IS_LIVE {
         clear_proxy_waiting_for_network().await
