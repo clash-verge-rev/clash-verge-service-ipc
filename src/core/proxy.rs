@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::net::IpAddr;
+use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use tracing::warn;
@@ -10,6 +12,16 @@ const MAX_HOST_LEN: usize = 64;
 const MAX_BYPASS_LEN: usize = 8192;
 const MAX_PAC_URL_LEN: usize = 256;
 const PAC_PATH: &str = "/commands/pac";
+
+/// Sleeps between attempts to clear a previous owner's proxy while no network service exists.
+/// They add up to 7.75 s; the attempts themselves take extra time.
+const CLEAR_PROXY_RETRY_DELAYS: &[Duration] = &[
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
 
 pub fn validate_proxy_config(config: &MacosProxyConfig) -> anyhow::Result<()> {
     match config {
@@ -159,6 +171,35 @@ pub async fn clear_proxy() -> anyhow::Result<()> {
             Ok(())
         }
         result => result,
+    }
+}
+
+/// [`clear_proxy`], but a missing network service is first waited for, since at login the network
+/// can come up after the core starts.
+pub async fn clear_proxy_waiting_for_network() -> anyhow::Result<()> {
+    clear_proxy_waiting_with(|| apply_proxy(&MacosProxyConfig::Disabled), CLEAR_PROXY_RETRY_DELAYS).await
+}
+
+async fn clear_proxy_waiting_with<F, Fut>(mut apply: F, delays: &[Duration]) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let mut retries = 0;
+    loop {
+        match apply().await {
+            Ok(()) => return Ok(()),
+            Err(error) if is_no_active_network_service(&error) => {
+                let Some(delay) = delays.get(retries) else {
+                    warn!("no active network service after {retries} retries, nothing to clear: {error:#}");
+                    return Ok(());
+                };
+                warn!("no active network service yet, retrying proxy clear in {delay:?}: {error:#}");
+                tokio::time::sleep(*delay).await;
+                retries += 1;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -378,5 +419,73 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{error:#}").contains("failed to compensate proxy apply failure"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn clearing_waits_for_a_resolvable_network_service() -> anyhow::Result<()> {
+        let attempts = std::cell::Cell::new(0);
+        let delays = [std::time::Duration::ZERO, std::time::Duration::ZERO];
+
+        super::clear_proxy_waiting_with(
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                async move {
+                    if attempt < 2 {
+                        Err(anyhow::Error::new(sysproxy::Error::NoActiveNetworkService))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            &delays,
+        )
+        .await?;
+
+        assert_eq!(
+            attempts.get(),
+            3,
+            "the clear must be retried until the service resolves"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn clearing_tolerates_a_service_that_never_resolves() -> anyhow::Result<()> {
+        let attempts = std::cell::Cell::new(0);
+        let delays = [std::time::Duration::ZERO, std::time::Duration::ZERO];
+
+        super::clear_proxy_waiting_with(
+            || {
+                attempts.set(attempts.get() + 1);
+                async { Err(anyhow::Error::new(sysproxy::Error::NoActiveNetworkService)) }
+            },
+            &delays,
+        )
+        .await?;
+
+        assert_eq!(attempts.get(), 3, "the retry budget is bounded by the delay schedule");
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn clearing_reports_write_failures_without_retrying() {
+        let attempts = std::cell::Cell::new(0);
+
+        let error = super::clear_proxy_waiting_with(
+            || {
+                attempts.set(attempts.get() + 1);
+                async { Err(anyhow::anyhow!("native proxy transaction failed")) }
+            },
+            &[std::time::Duration::ZERO],
+        )
+        .await
+        .expect_err("a write failure must not be treated as nothing to clear");
+
+        assert!(format!("{error:#}").contains("native proxy transaction failed"));
+        assert_eq!(attempts.get(), 1);
     }
 }

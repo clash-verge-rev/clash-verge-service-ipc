@@ -13,7 +13,9 @@ use crate::core::runtime_generation::{PreparedRuntime, prepare_runtime, read_run
 use crate::core::state::{set_core_lifecycle_state, set_service_lifecycle_state};
 use crate::core::status::service_status_snapshot;
 use crate::core::structure::{OwnerSessionProof, Response, ServiceLifecycleState};
-use crate::core::{apply_proxy, apply_proxy_or_direct, clear_proxy, validate_proxy_config};
+use crate::core::{
+    apply_proxy, apply_proxy_or_direct, clear_proxy, clear_proxy_waiting_for_network, validate_proxy_config,
+};
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IpcCommand, MIN_SUPPORTED_CLIENT_REVISION, MacosProxyConfig,
     OwnerSessionHandle, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, RuntimeFileRequest,
@@ -95,7 +97,13 @@ struct StartOwnerTransition<'a> {
 
 impl OwnerProxyTransition for StartOwnerTransition<'_> {
     async fn clear_previous_proxy(&mut self) -> AnyResult<()> {
-        clear_service_proxy().await
+        // A recorded owner may not have stopped cleanly, so its proxy is worth waiting for.
+        // Without one, clear at once as before rather than delay every offline or VPN start.
+        if self.previous_owner.is_some() {
+            clear_previous_owner_proxy().await
+        } else {
+            clear_service_proxy().await
+        }
     }
 
     async fn compensate_direct(&mut self) -> AnyResult<()> {
@@ -187,6 +195,15 @@ const SERVICE_PROXY_IS_LIVE: bool = cfg!(all(target_os = "macos", not(feature = 
 async fn clear_service_proxy() -> AnyResult<()> {
     if SERVICE_PROXY_IS_LIVE {
         clear_proxy().await
+    } else {
+        Ok(())
+    }
+}
+
+/// Only the takeover waits for a network service; stopping keeps the immediate [`clear_proxy`].
+async fn clear_previous_owner_proxy() -> AnyResult<()> {
+    if SERVICE_PROXY_IS_LIVE {
+        clear_proxy_waiting_for_network().await
     } else {
         Ok(())
     }
