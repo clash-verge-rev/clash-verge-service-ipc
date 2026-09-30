@@ -1021,8 +1021,8 @@ dependencies = [
 
 [[package]]
 name = "sysproxy"
-version = "0.7.0"
-source = "git+https://github.com/clash-verge-rev/sysproxy-rs.git?branch=main#62c952b3a60c39a360f7e6cecde2bef5448659eb"
+version = "0.7.1"
+source = "git+https://github.com/clash-verge-rev/sysproxy-rs.git?branch=main#760dbfd0484b0a40b64ef2388cb0d7d151414a53"
 dependencies = [
  "log",
  "system-configuration",
