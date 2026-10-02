@@ -2,9 +2,10 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-#[cfg(unix)]
 use std::time::Duration;
 use tracing::warn;
+
+const STALE_OWNER_TERM_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct ProcessIdentity {
@@ -272,7 +273,7 @@ fn open_windows_process_handle(pid: u32) -> Result<Option<OwnedHandle>> {
     }
 }
 
-async fn terminate_process_inner(pid: u32, expected_identity: Option<&ProcessIdentity>) -> Result<()> {
+async fn terminate_process_inner(pid: u32, expected_identity: Option<&ProcessIdentity>, grace: Duration) -> Result<()> {
     #[cfg(unix)]
     {
         let unix_pid = checked_unix_pid(pid).ok_or_else(|| anyhow::anyhow!("invalid Unix process ID {pid}"))?;
@@ -294,7 +295,8 @@ async fn terminate_process_inner(pid: u32, expected_identity: Option<&ProcessIde
             return Err(std::io::Error::last_os_error().into());
         }
 
-        for _ in 0..10 {
+        let deadline = tokio::time::Instant::now() + grace;
+        while tokio::time::Instant::now() < deadline {
             if !is_process_alive(pid) {
                 return Ok(());
             }
@@ -309,7 +311,7 @@ async fn terminate_process_inner(pid: u32, expected_identity: Option<&ProcessIde
                 bail!("process {pid} identity changed before SIGKILL");
             }
         }
-        warn!("Process {} did not exit, sending SIGKILL", pid);
+        warn!("Process {} did not exit within {:?}, sending SIGKILL", pid, grace);
         if unsafe { platform_lib::kill(unix_pid, platform_lib::SIGKILL) } != 0
             && std::io::Error::last_os_error().raw_os_error() != Some(platform_lib::ESRCH)
         {
@@ -326,6 +328,7 @@ async fn terminate_process_inner(pid: u32, expected_identity: Option<&ProcessIde
 
     #[cfg(windows)]
     {
+        let _ = grace;
         warn!("Terminating process {}", pid);
         if pid == 0 {
             bail!("invalid Windows process ID 0");
@@ -356,11 +359,15 @@ async fn terminate_process_inner(pid: u32, expected_identity: Option<&ProcessIde
 }
 
 pub(super) async fn terminate_process(pid: u32) -> Result<()> {
-    terminate_process_inner(pid, None).await
+    terminate_process_inner(pid, None, STALE_OWNER_TERM_GRACE).await
 }
 
-pub(super) async fn terminate_process_if_identity(pid: u32, expected_identity: &ProcessIdentity) -> Result<()> {
-    terminate_process_inner(pid, Some(expected_identity)).await
+pub(super) async fn terminate_process_if_identity(
+    pid: u32,
+    expected_identity: &ProcessIdentity,
+    grace: Duration,
+) -> Result<()> {
+    terminate_process_inner(pid, Some(expected_identity), grace).await
 }
 
 #[cfg(test)]

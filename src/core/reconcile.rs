@@ -1,3 +1,4 @@
+use crate::core::manager::CORE_TERM_GRACE;
 use crate::core::process::{process_identity, terminate_process_if_identity};
 use crate::core::runtime::{
     cleanup_core_socket, is_core_socket_reachable, read_core_runtime_record, remove_core_runtime_record,
@@ -33,7 +34,7 @@ pub async fn reconcile_service_startup() -> Result<()> {
             "Found verified previous core process {} during startup; stopping it before supervision resumes",
             record.pid
         );
-        terminate_process_if_identity(record.pid, &record.identity).await?;
+        terminate_process_if_identity(record.pid, &record.identity, CORE_TERM_GRACE).await?;
         cleanup_core_socket(&record.ipc_path).await;
         remove_core_runtime_record().await;
         STARTUP_RECONCILED.store(true, Ordering::Release);
