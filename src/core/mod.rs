@@ -4,11 +4,12 @@ pub use command::IpcCommand;
 pub mod structure;
 pub use structure::{
     AuthenticatedRequest, AuthenticatedSessionRequest, ClashConfig, CoreAvailability, CoreConfig, CoreInspection,
-    CoreRequirement, InstallationStatus, MacosProxyConfig, OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity,
-    OwnerSessionHandle, OwnerSessionProof, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RemoteProvider,
-    RuntimeAsset, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, SERVICE_PROTOCOL_HEADER,
-    SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot, StageRejection,
-    StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig, owner_key,
+    CoreRequirement, InstallationStatus, MacosProxyConfig, MobileHotspotCompatibilityOutcome,
+    MobileHotspotCompatibilityRequest, OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, OwnerSessionHandle,
+    OwnerSessionProof, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RemoteProvider, RuntimeAsset, RuntimeBundle,
+    RuntimeFileOutcome, RuntimeFileRequest, SERVICE_PROTOCOL_HEADER, SESSION_TOKEN_HEX_LEN, ServiceErrorCode,
+    ServiceLifecycleState, ServiceStatusSnapshot, StageRejection, StageRuntimeOutcome, StartClashRequest,
+    StartClashResult, WriterConfig, owner_key,
 };
 
 pub mod paths;
@@ -34,6 +35,8 @@ mod logger;
 mod maintenance;
 #[cfg(feature = "standalone")]
 mod manager;
+#[cfg(all(feature = "standalone", windows))]
+mod mobile_hotspot;
 #[cfg(feature = "standalone")]
 mod owner;
 #[cfg(feature = "standalone")]

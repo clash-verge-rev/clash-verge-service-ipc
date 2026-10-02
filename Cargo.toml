@@ -64,6 +64,7 @@ standalone = [
     "dep:platform_lib",
     "dep:nix",
     "dep:windows-sys",
+    "dep:windows",
 ]
 client = [
     "kode-bridge/client",
@@ -134,6 +135,11 @@ windows-sys = { version = "0.61.2", optional = true, features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+] }
+windows = { version = "0.62.2", optional = true, features = [
+    "Networking_Connectivity",
+    "Networking_NetworkOperators",
+    "Win32_System_WinRT",
 ] }
 
 [dev-dependencies]
