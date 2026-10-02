@@ -369,20 +369,60 @@ fn elevate(installer: &Path, arguments: &[OsString], gid: u32, prompt: &str) -> 
 
 #[cfg(all(windows, feature = "client"))]
 fn elevate(installer: &Path, arguments: &[OsString], _prompt: &str) -> Result<()> {
-    use std::os::windows::process::CommandExt as _;
+    use std::ffi::OsStr;
+    use std::os::windows::{
+        ffi::OsStrExt as _,
+        io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle},
+    };
+    use windows_sys::Win32::{
+        System::{
+            Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx},
+            Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject},
+        },
+        UI::{
+            Shell::{
+                SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+            },
+            WindowsAndMessaging::SW_HIDE,
+        },
+    };
+    let wide = |value: &OsStr| value.encode_wide().chain([0]).collect::<Vec<_>>();
     let command_line = arguments
         .iter()
         .map(|arg| windows_quote(&arg.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(" ");
-    let script = "$ErrorActionPreference = 'Stop'; $child = Start-Process -FilePath $env:CLASH_VERGE_INSTALLER -ArgumentList $env:CLASH_VERGE_INSTALL_ARGUMENTS -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $child.ExitCode";
-    let status = Command::new("powershell.exe")
-        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("CLASH_VERGE_INSTALLER", installer)
-        .env("CLASH_VERGE_INSTALL_ARGUMENTS", command_line)
-        .status()?;
-    anyhow::ensure!(status.success(), "elevated installer failed with {status}");
+    let verb = wide(OsStr::new("runas"));
+    let file = wide(installer.as_os_str());
+    let parameters = wide(OsStr::new(&command_line));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: verb.as_ptr(),
+        lpFile: file.as_ptr(),
+        lpParameters: parameters.as_ptr(),
+        nShow: SW_HIDE,
+        ..Default::default()
+    };
+    // ShellExecuteExW may delegate the verb to COM shell extensions.
+    unsafe {
+        CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        )
+    };
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to elevate the service installer");
+    }
+    let process = info.hProcess;
+    anyhow::ensure!(!process.is_null(), "elevation did not start the service installer");
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
+    let mut code = 0;
+    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("cannot read the elevated installer's exit code");
+    }
+    anyhow::ensure!(code == 0, "elevated installer failed with exit code {code}");
     Ok(())
 }
 
