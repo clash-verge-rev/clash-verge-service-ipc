@@ -6,9 +6,12 @@ use flexi_logger::{
     writers::{FileLogWriter, FileLogWriterBuilder, LogWriter as _},
 };
 use log::{Level, Record};
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::{Mutex, RwLock};
+use tracing_estuary::{Pipeline, PipelineBuilder};
 
+use crate::core::paths::{ensure_persistent_state_layout, service_paths};
+use crate::core::platform_security;
 use crate::core::structure::WriterConfig;
 
 // Buffered writes avoid flexi's one-syscall-per-line default; the background
@@ -16,7 +19,61 @@ use crate::core::structure::WriterConfig;
 const WRITE_BUFFER_CAPACITY: usize = 64 * 1024;
 const WRITE_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
+const SERVICE_LOG_MAX_SIZE: u64 = 10 * 1024 * 1024;
+const SERVICE_LOG_MAX_FILES: usize = 3;
+
 static GLOBAL_WRITER: RwLock<Option<FileLogWriter>> = RwLock::new(None);
+static SERVICE_LOG: OnceCell<Pipeline> = OnceCell::new();
+
+/// Logs to stdout and to the service log file, since launchd and the Windows SCM discard stdout.
+pub fn init_service_logging() {
+    let (pipeline, file_error) =
+        match service_log_writer().and_then(|writer| PipelineBuilder::new().file_writer(writer).init()) {
+            Ok(pipeline) => (Ok(pipeline), None),
+            Err(error) => (PipelineBuilder::new().init(), Some(error)),
+        };
+    match pipeline {
+        Ok(pipeline) => {
+            let _ = SERVICE_LOG.set(pipeline);
+        }
+        Err(error) => eprintln!("Failed to install service logging: {error:#}"),
+    }
+    if let Some(error) = file_error {
+        tracing::warn!("Service log file unavailable, logging to stdout only: {error:#}");
+    }
+}
+
+/// Writes out queued service log lines before the process exits.
+pub fn flush_service_log() {
+    if let Some(pipeline) = SERVICE_LOG.get() {
+        pipeline.flush_all();
+    }
+}
+
+fn service_log_writer() -> anyhow::Result<FileLogWriterBuilder> {
+    ensure_persistent_state_layout()?;
+    let directory = service_paths()?.logs_dir();
+    platform_security::ensure_private_service_directory(&directory)?;
+    Ok(FileLogWriter::builder(
+        FileSpec::default()
+            .directory(directory)
+            .basename(crate::SERVICE_SLUG)
+            .suppress_timestamp(),
+    )
+    .format(tracing_estuary::file_format_with_level)
+    // Unbuffered, so a killed service keeps its last lines.
+    .write_mode(WriteMode::Direct)
+    // A restart must not rotate the previous run away.
+    .append()
+    .rotate(
+        Criterion::Size(SERVICE_LOG_MAX_SIZE),
+        Naming::TimestampsCustomFormat {
+            current_infix: Some("latest"),
+            format: "%Y-%m-%d_%H-%M-%S",
+        },
+        Cleanup::KeepLogFiles(SERVICE_LOG_MAX_FILES),
+    ))
+}
 
 fn service_writer_builder(config: &WriterConfig) -> FileLogWriterBuilder {
     FileLogWriter::builder(

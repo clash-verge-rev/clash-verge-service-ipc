@@ -2,10 +2,10 @@
 
 use anyhow::Result;
 use clash_verge_service_ipc::{
-    acquire_service_owner, reconcile_service_startup, restore_desired_state, run_ipc_supervisor_until_shutdown,
+    acquire_service_owner, flush_service_log, init_service_logging, reconcile_service_startup, restore_desired_state,
+    run_ipc_supervisor_until_shutdown,
 };
-use tracing::{Level, info, warn};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{info, warn};
 
 #[cfg(windows)]
 use {
@@ -23,8 +23,13 @@ use {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     set_secure_process_umask();
-    init_logger();
-    run_standalone().await
+    init_service_logging();
+    let result = run_standalone().await;
+    if let Err(error) = &result {
+        warn!("Service exited with an error: {error:#}");
+    }
+    flush_service_log();
+    result
 }
 
 #[cfg(unix)]
@@ -37,11 +42,17 @@ fn set_secure_process_umask() {
 /// Runs as a Windows service when possible, otherwise standalone.
 #[cfg(windows)]
 fn main() -> Result<()> {
-    init_logger();
+    init_service_logging();
     if service_dispatcher::start(clash_verge_service_ipc::WINDOWS_SERVICE_NAME, ffi_service_main).is_err() {
         info!("Not running as a service, starting in standalone mode.");
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(run_standalone())?;
+        let result = tokio::runtime::Runtime::new()
+            .map_err(anyhow::Error::from)
+            .and_then(|rt| rt.block_on(run_standalone()));
+        if let Err(error) = &result {
+            warn!("Service exited with an error: {error:#}");
+        }
+        flush_service_log();
+        result?;
     }
     Ok(())
 }
@@ -54,6 +65,7 @@ fn my_service_main(_args: Vec<OsString>) {
     if let Err(e) = run_service() {
         info!("Service failed to run: {}", e);
     }
+    flush_service_log();
 }
 
 #[cfg(windows)]
@@ -126,6 +138,8 @@ fn run_service() -> platform_lib::Result<()> {
         drop(owner_guard);
         false
     });
+    // The SCM may end the process as soon as it sees `Stopped`.
+    flush_service_log();
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -142,15 +156,6 @@ fn run_service() -> platform_lib::Result<()> {
     }
 
     Ok(())
-}
-
-fn init_logger() {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_writer(std::io::stdout)
-        .with_ansi(true)
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 async fn run_standalone() -> Result<()> {

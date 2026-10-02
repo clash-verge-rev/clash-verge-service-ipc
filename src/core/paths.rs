@@ -73,6 +73,11 @@ impl ServicePaths {
         self.persistent_state_dir.join("owner-generation.json")
     }
 
+    /// The service's own log; core output goes to [`OwnerPaths::logs_dir`].
+    pub fn logs_dir(&self) -> PathBuf {
+        self.persistent_state_dir.join("logs")
+    }
+
     pub fn for_owner(&self, identity: &OwnerIdentity) -> OwnerPaths {
         self.for_owner_key(&owner_key(identity))
     }
