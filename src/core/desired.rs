@@ -144,6 +144,7 @@ pub async fn restore_desired_state() -> Result<()> {
 
     let Some(active_owner) = load_active_owner().await? else {
         info!("No active owner to restore");
+        CORE_MANAGER.lock().await.stop_core().await?;
         return Ok(());
     };
     let state = load_owner_desired_state(&active_owner.owner_key).await?;
@@ -156,11 +157,13 @@ pub async fn restore_desired_state() -> Result<()> {
 
     if !state.core_should_be_running {
         info!("Desired state does not require core restore");
+        CORE_MANAGER.lock().await.stop_core().await?;
         return Ok(());
     }
 
     let Some(config) = state.last_clash_config else {
         warn!("Desired state requests core restore but has no ClashConfig");
+        CORE_MANAGER.lock().await.stop_core().await?;
         return Ok(());
     };
 
@@ -426,6 +429,7 @@ mod owner_tests {
                 ..Default::default()
             },
             log_config: Default::default(),
+            tun_guard: None,
         };
         persist_owner_core_started(&owner, &config).await?;
         persist_active_owner(&owner).await?;
@@ -450,6 +454,7 @@ mod owner_tests {
                 ..Default::default()
             },
             log_config: Default::default(),
+            tun_guard: None,
         };
 
         persist_owner_core_started(&owner_a, &config).await?;

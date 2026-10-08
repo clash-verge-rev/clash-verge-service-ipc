@@ -19,6 +19,8 @@ pub enum IpcCommand {
     StartClash,
     #[strum(serialize = "/clash/stop")]
     StopClash,
+    #[strum(serialize = "/clash/stop-owned")]
+    StopOwnedClash,
     #[strum(serialize = "/clash/stage-runtime")]
     StageRuntime,
     #[strum(serialize = "/clash/runtime-file")]

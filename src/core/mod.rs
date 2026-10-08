@@ -8,7 +8,8 @@ pub use structure::{
     OwnerSessionHandle, OwnerSessionProof, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RemoteProvider,
     RuntimeAsset, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, SERVICE_PROTOCOL_HEADER,
     SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot, StageRejection,
-    StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig, owner_key,
+    StageRuntimeOutcome, StartClashRequest, StartClashResult, StopOwnedClashRequest, TunGuardConfig,
+    TunGuardStatusError, WriterConfig, owner_key,
 };
 
 pub mod paths;

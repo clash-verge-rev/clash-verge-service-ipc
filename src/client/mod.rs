@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use std::{path::Path, sync::Arc, time::Duration};
 
 #[cfg(windows)]
@@ -16,7 +17,7 @@ use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IPC_AUTH_EXPECT, IPC_PATH, IpcCommand,
     MIN_REQUIRED_SERVICE_REVISION, MacosProxyConfig, OwnerCredentials, OwnerSessionProof, ProtocolInfo,
     ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, ServiceStatusSnapshot,
-    StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig,
+    StageRuntimeOutcome, StartClashRequest, StartClashResult, StopOwnedClashRequest, WriterConfig,
     core::structure::{JsonConvert, Response},
 };
 
@@ -181,6 +182,16 @@ pub async fn start_clash(
     credentials: &OwnerCredentials,
     body: &StartClashRequest,
 ) -> Result<Response<StartClashResult>> {
+    if body.tun_guard.is_some() {
+        let protocol = get_version()
+            .await?
+            .data
+            .context("service omitted its protocol capabilities")?;
+        anyhow::ensure!(
+            protocol.supports_service_tun_guard(),
+            "service does not support Windows TUN forwarding protection; install the matching service"
+        );
+    }
     protected_call(
         Verb::Post,
         IpcCommand::StartClash,
@@ -207,6 +218,20 @@ pub async fn stop_clash(credentials: &OwnerCredentials, session: &OwnerSessionPr
         credentials,
         Some(session),
         (),
+        Some(LIFECYCLE_TIMEOUT),
+    )
+    .await
+}
+
+/// Stops the authenticated owner's observed generation without a retained session token.
+/// Requires [`ProtocolInfo::supports_owned_core_stop`]; a replacement generation is refused.
+pub async fn stop_owned_clash(credentials: &OwnerCredentials, request: &StopOwnedClashRequest) -> Result<Response<()>> {
+    protected_call(
+        Verb::Delete,
+        IpcCommand::StopOwnedClash,
+        credentials,
+        None,
+        request.clone(),
         Some(LIFECYCLE_TIMEOUT),
     )
     .await

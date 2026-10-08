@@ -34,6 +34,10 @@ impl PreparedRuntime {
         &self.clash_config
     }
 
+    pub(crate) fn set_tun_guard(&mut self, config: Option<crate::TunGuardConfig>) {
+        self.clash_config.tun_guard = config;
+    }
+
     /// Writes the plan after the outgoing core has stopped.
     /// Keeping this separate from planning avoids touching files still held open by that core.
     pub(crate) async fn materialize(&self) -> Result<(), ServiceError> {
@@ -224,6 +228,7 @@ pub(crate) async fn prepare_runtime(
                 config_dir: runtime.to_string_lossy().into_owned(),
             },
             log_config,
+            tun_guard: None,
         },
         runtime: runtime.clone(),
         stale_runtime_paths: Vec::new(),

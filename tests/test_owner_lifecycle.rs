@@ -5,7 +5,8 @@ mod common;
 use anyhow::{Context as _, Result};
 use clash_verge_service_ipc::{
     IpcCommand, OwnerCredentials, OwnerSessionProof, RuntimeBundle, ServiceErrorCode, StartClashRequest,
-    StartClashResult, connect, get_status, start_clash, stop_clash,
+    StartClashResult, StopOwnedClashRequest, TunGuardConfig, connect, get_status, restore_desired_state, start_clash,
+    stop_clash, stop_owned_clash,
 };
 use common::{start_server, stop_server};
 use serde::Deserialize;
@@ -32,6 +33,7 @@ async fn start(credentials: &OwnerCredentials, token: &str) -> Result<(StartClas
             runtime: runtime_bundle(),
             proposed_session_token: token.to_owned(),
             macos_proxy: None,
+            tun_guard: None,
         },
     )
     .await?;
@@ -82,6 +84,93 @@ async fn restarting_an_owner_invalidates_the_previous_session() -> Result<()> {
     stop_server(server).await
 }
 
+#[tokio::test]
+#[serial]
+async fn rejected_tun_guard_preserves_the_current_owner_core() -> Result<()> {
+    let server = start_server().await?;
+    let credentials = common::owner_credentials();
+    let (_, session) = start(&credentials, &"6a".repeat(32)).await?;
+    let before = get_status(&credentials)
+        .await?
+        .data
+        .context("status omitted its data")?;
+
+    let mut protected = runtime_bundle();
+    protected.yaml =
+        "interface-name: test-no-native-network-access\ntun: { enable: true, auto-detect-interface: false }\n".into();
+    let rejected = start_clash(
+        &credentials,
+        &StartClashRequest {
+            runtime: protected,
+            proposed_session_token: "6b".repeat(32),
+            macos_proxy: None,
+            tun_guard: Some(TunGuardConfig {
+                interface_name: "test-no-native-network-access".into(),
+            }),
+        },
+    )
+    .await?;
+    assert_eq!(rejected.code, ServiceErrorCode::TunGuardFailed as u16);
+    let after = get_status(&credentials)
+        .await?
+        .data
+        .context("status omitted its data")?;
+    assert_eq!(after.core_pid, before.core_pid);
+    assert_eq!(after.active_generation, before.active_generation);
+    assert_eq!(stop_clash(&credentials, &session).await?.code, 0);
+    stop_server(server).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn a_fresh_client_stops_its_restored_generation_without_a_session() -> Result<()> {
+    let server = start_server().await?;
+    let credentials = common::owner_credentials();
+    let (started, _) = start(&credentials, &"51".repeat(32)).await?;
+    stop_server(server).await?;
+
+    let server = start_server().await?;
+    restore_desired_state().await?;
+    let restored = get_status(&credentials).await?.data.context("status omitted data")?;
+    assert_eq!(restored.active_generation, Some(started.session.generation));
+    assert!(restored.core_pid.is_some());
+    assert_eq!(
+        stop_owned_clash(
+            &credentials,
+            &StopOwnedClashRequest {
+                expected_generation: started.session.generation + 1,
+            },
+        )
+        .await?
+        .code,
+        ServiceErrorCode::StaleOwnerSession as u16,
+    );
+    let unchanged = get_status(&credentials).await?.data.context("status omitted data")?;
+    assert_eq!(unchanged.core_pid, restored.core_pid);
+    assert_eq!(unchanged.active_generation, restored.active_generation);
+    assert_eq!(unchanged.desired_generation, restored.desired_generation);
+    assert!(unchanged.desired_core_should_be_running);
+
+    assert_eq!(
+        stop_owned_clash(
+            &credentials,
+            &StopOwnedClashRequest {
+                expected_generation: started.session.generation,
+            },
+        )
+        .await?
+        .code,
+        0,
+    );
+    let stopped = get_status(&credentials).await?.data.context("status omitted data")?;
+    assert!(!stopped.is_active);
+    assert!(stopped.core_pid.is_none());
+    assert!(!stopped.desired_core_should_be_running);
+    assert!(!clash_verge_service_ipc::inspect_installation(&[]).await?.core_busy);
+    stop_server(server).await
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
@@ -104,6 +193,23 @@ async fn a_new_owner_takes_over_and_the_previous_owner_becomes_inactive() -> Res
     assert!(clash_verge_service_ipc::inspect_installation(&[]).await?.core_busy);
     assert!(clash_verge_service_ipc::execution::reserve_sidecar().await.is_err());
     assert!(get_status(&owner_b).await?.data.context("no status")?.is_active);
+    let owned_before = get_status(&owner_b).await?.data.context("no status")?;
+    assert_eq!(
+        stop_owned_clash(
+            &owner_a,
+            &StopOwnedClashRequest {
+                expected_generation: owned_before.active_generation.context("no active generation")?,
+            },
+        )
+        .await?
+        .code,
+        ServiceErrorCode::NotActive as u16,
+    );
+    let owned_after = get_status(&owner_b).await?.data.context("no status")?;
+    assert_eq!(owned_after.core_pid, owned_before.core_pid);
+    assert_eq!(owned_after.active_generation, owned_before.active_generation);
+    assert_eq!(owned_after.desired_generation, owned_before.desired_generation);
+    assert!(owned_after.desired_core_should_be_running);
     assert_eq!(
         stop_clash(&owner_a, &session_a).await?.code,
         ServiceErrorCode::StaleOwnerSession as u16

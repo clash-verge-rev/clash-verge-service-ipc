@@ -106,6 +106,7 @@ async fn start_flow() -> anyhow::Result<()> {
             runtime: config,
             proposed_session_token: session_token()?,
             macos_proxy: None,
+            tun_guard: None,
         },
     )
     .await?;

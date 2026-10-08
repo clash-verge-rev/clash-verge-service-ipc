@@ -300,6 +300,18 @@ fn non_zero_u64(value: u64) -> Option<u64> {
     (value != 0).then_some(value)
 }
 
+fn forwarding_error(error: anyhow::Error, context: &'static str) -> anyhow::Error {
+    let code = if error
+        .downcast_ref::<crate::forwarding_guard::InterfaceUnavailable>()
+        .is_some()
+    {
+        crate::ServiceErrorCode::TunGuardInterfaceUnavailable
+    } else {
+        crate::ServiceErrorCode::TunGuardFailed
+    };
+    crate::core::auth::ServiceError::new(code, format!("{context}: {error:#}")).into()
+}
+
 async fn write_runtime_record_for_config(pid: Option<u32>, config: &ClashConfig, context: &'static str) -> Result<()> {
     let pid = pid.context("spawned core did not expose a process ID")?;
     let identity =
@@ -325,6 +337,7 @@ pub struct CoreManager {
     watchdog_handle: Mutex<Option<JoinHandle<Result<()>>>>,
     failed_child: Arc<Mutex<Option<ChildGuard>>>,
     execution: Mutex<Option<std::sync::Arc<crate::execution::CoreExecutionGuard>>>,
+    forwarding_guard: Arc<Mutex<Option<crate::forwarding_guard::GuardRuntime>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +347,7 @@ pub(super) struct CoreStatusSnapshot {
     pub(super) last_core_exit_reason: Option<String>,
     pub(super) restart_count: u32,
     pub(super) last_recovery_at: Option<u64>,
+    pub(super) tun_guard_error: Option<crate::TunGuardStatusError>,
 }
 
 impl CoreManager {
@@ -350,6 +364,7 @@ impl CoreManager {
             watchdog_handle: Mutex::new(None),
             failed_child: Arc::new(Mutex::new(None)),
             execution: Mutex::new(None),
+            forwarding_guard: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -367,6 +382,9 @@ impl CoreManager {
 
     pub async fn start_core(&self, config: ClashConfig, owner: OwnerIdentity) -> Result<()> {
         ensure_startup_reconciled()?;
+        crate::core::runtime_generation::validate_tun_guard_file(&config)
+            .await
+            .map_err(|error| forwarding_error(error, "invalid persisted TUN forwarding protection"))?;
         set_core_lifecycle_state(ServiceLifecycleState::Starting);
         if self.running_pid.load(Ordering::Relaxed) != 0 || self.execution.lock().await.is_some() {
             info!("Core is already running, stopping existing instance");
@@ -374,11 +392,86 @@ impl CoreManager {
         }
 
         let execution = std::sync::Arc::new(crate::execution::CoreExecutionGuard::acquire()?);
-        let result = self.start_reserved_core(config, owner, execution.clone()).await;
-        if result.is_ok() || self.running_pid.load(Ordering::Acquire) != 0 {
-            *self.execution.lock().await = Some(execution);
+        // A cancelled start must not release exclusion over an uncommitted network change.
+        *self.execution.lock().await = Some(execution.clone());
+        let mut guard_state = self.forwarding_guard.lock().await;
+        if guard_state.is_none() {
+            *guard_state = Some(Self::new_forwarding_guard()?);
+        }
+        let guard = guard_state
+            .as_mut()
+            .context("service TUN forwarding protection is unavailable")?;
+        guard
+            .recover()
+            .map_err(|error| forwarding_error(error, "failed to recover service TUN forwarding protection"))?;
+        let guard_id = guard
+            .prepare(config.tun_guard.as_ref().map(|guard| guard.interface_name.as_str()))
+            .map_err(|error| forwarding_error(error, "failed to prepare service TUN forwarding protection"))?;
+        // A fast core exit must not race the watchdog's restoration against guard commit.
+        let result = self.start_reserved_core(config, owner, execution).await;
+        if let Some(id) = guard_id {
+            if result.is_ok() {
+                guard
+                    .finish(id, true)
+                    .map_err(|error| forwarding_error(error, "failed to commit service TUN forwarding protection"))?;
+            } else if self.running_pid.load(Ordering::Acquire) != 0 {
+                guard
+                    .retain(id)
+                    .map_err(|error| forwarding_error(error, "failed to retain protection for the unconfirmed core"))?;
+            } else {
+                guard.finish(id, false).map_err(|error| {
+                    forwarding_error(error, "failed to roll back service TUN forwarding protection")
+                })?;
+            }
+        }
+        if result.is_err() && self.running_pid.load(Ordering::Acquire) == 0 && !guard.has_owned_guard() {
+            self.execution.lock().await.take();
         }
         result
+    }
+
+    fn new_forwarding_guard() -> Result<crate::forwarding_guard::GuardRuntime> {
+        crate::core::paths::ensure_persistent_state_layout()?;
+        let paths = crate::service_paths()?;
+        crate::core::platform_security::ensure_private_service_directory(paths.runtime_dir())?;
+        let root = paths.runtime_dir().join("tun-guard");
+        crate::core::platform_security::ensure_private_service_directory(&root)?;
+        Ok(crate::forwarding_guard::GuardRuntime::new(root))
+    }
+
+    pub(super) fn preflight_tun_guard(config: Option<&crate::TunGuardConfig>) -> Result<()> {
+        if config.is_none() {
+            return Ok(());
+        }
+        Self::new_forwarding_guard()?
+            .preflight(config.map(|guard| guard.interface_name.as_str()))
+            .map_err(|error| forwarding_error(error, "invalid TUN forwarding protection"))
+    }
+
+    async fn restore_forwarding_guard(&self) -> Result<()> {
+        let mut guard = self.forwarding_guard.lock().await;
+        if guard.is_none() {
+            let journal = crate::service_paths()?
+                .runtime_dir()
+                .join("tun-guard/tun-compatibility-guard.json");
+            if !journal.try_exists()? {
+                return Ok(());
+            }
+            *guard = Some(Self::new_forwarding_guard()?);
+        }
+        let guard = guard
+            .as_mut()
+            .context("service TUN forwarding protection is unavailable")?;
+        if guard
+            .prepare_recovery()
+            .map_err(|error| forwarding_error(error, "failed to read service TUN forwarding protection"))?
+            && self.execution.lock().await.is_none()
+        {
+            *self.execution.lock().await = Some(Arc::new(crate::execution::CoreExecutionGuard::acquire()?));
+        }
+        guard
+            .restore()
+            .map_err(|error| forwarding_error(error, "failed to restore service TUN forwarding protection"))
     }
 
     async fn start_reserved_core(
@@ -476,6 +569,11 @@ impl CoreManager {
         *self.core_start_time.lock().await = None;
         self.core_started_at.store(0, Ordering::Relaxed);
 
+        if let Err(error) = self.restore_forwarding_guard().await {
+            set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+            return Err(error);
+        }
+
         let start_clash = self.running_config.lock().await.take();
         let core_ipc_path = start_clash
             .as_ref()
@@ -507,6 +605,7 @@ impl CoreManager {
         let restart_count_arc = Arc::clone(&self.restart_count);
         let last_recovery_at_arc = Arc::clone(&self.last_recovery_at);
         let failed_child_arc = Arc::clone(&self.failed_child);
+        let forwarding_guard_arc = Arc::clone(&self.forwarding_guard);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let watchdog_config = watchdog_config();
 
@@ -549,8 +648,9 @@ impl CoreManager {
                     Ok(status) => status,
                     Err(error) => {
                         warn!("Failed to wait for core process: {}", error);
-                        recovery_exhausted = true;
-                        break;
+                        *failed_child_arc.lock().await = Some(current_guard);
+                        set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                        return Err(error).context("could not confirm supervised core exit");
                     }
                 };
 
@@ -606,6 +706,18 @@ impl CoreManager {
                             .retain(|timestamp| now.duration_since(*timestamp) < watchdog_config.restart_window);
                         restart_timestamps.push(now);
                         continue;
+                    }
+                    if let Some(guard) = forwarding_guard_arc.lock().await.as_mut()
+                        && let Err(error) = guard.check()
+                    {
+                        error!("TUN forwarding protection is not ready for core restart: {error:#}");
+                        recovery_exhausted = true;
+                        break 'watchdog;
+                    }
+                    if let Err(error) = crate::core::runtime_generation::validate_tun_guard_file(&config).await {
+                        error!("Persisted TUN configuration is not valid for core restart: {error:#}");
+                        recovery_exhausted = true;
+                        break 'watchdog;
                     }
                     let args = core_args(&config);
                     match run_with_logging(&config.core_config.core_path, &args, &config.log_config, &owner).await {
@@ -689,6 +801,15 @@ impl CoreManager {
             *start_time_arc.lock().await = None;
             started_at_arc.store(0, Ordering::Relaxed);
             remove_core_runtime_record().await;
+            if let Some(guard) = forwarding_guard_arc.lock().await.as_mut() {
+                if let Err(error) = guard.restore() {
+                    set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                    return Err(forwarding_error(
+                        error,
+                        "failed to restore TUN forwarding protection after core exit",
+                    ));
+                }
+            }
             if recovery_exhausted {
                 set_core_lifecycle_state(ServiceLifecycleState::Fatal);
             }
@@ -713,12 +834,19 @@ impl CoreManager {
     }
 
     pub(super) async fn status(&self) -> CoreStatusSnapshot {
+        let tun_guard_error = self.forwarding_guard.lock().await.as_mut().and_then(|guard| {
+            guard.check().err().map(|error| crate::TunGuardStatusError {
+                code: crate::ServiceErrorCode::TunGuardFailed,
+                message: format!("{error:#}"),
+            })
+        });
         CoreStatusSnapshot {
             core_pid: non_zero_u32(self.running_pid.load(Ordering::Relaxed)),
             core_started_at: non_zero_u64(self.core_started_at.load(Ordering::Relaxed)),
             last_core_exit_reason: self.last_core_exit_reason.lock().await.clone(),
             restart_count: self.restart_count.load(Ordering::Relaxed),
             last_recovery_at: non_zero_u64(self.last_recovery_at.load(Ordering::Relaxed)),
+            tun_guard_error,
         }
     }
 

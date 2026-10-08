@@ -19,7 +19,7 @@ use crate::core::{
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IpcCommand, MIN_SUPPORTED_CLIENT_REVISION, MacosProxyConfig,
     OwnerSessionHandle, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, RuntimeFileRequest,
-    SERVICE_PROTOCOL_HEADER, StartClashRequest, StartClashResult, WriterConfig,
+    SERVICE_PROTOCOL_HEADER, StartClashRequest, StartClashResult, StopOwnedClashRequest, WriterConfig,
 };
 use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
@@ -72,14 +72,15 @@ async fn owner_proxy_transition(
     }
 
     if let Err(stop_error) = transition.stop_previous_core().await {
-        return Err(ServiceError::owner_switch_failed(format!(
-            "Failed to stop the previous owner core: {stop_error:#}"
-        )));
+        return Err(owner_transition_error(
+            stop_error,
+            "Failed to stop the previous owner core",
+        ));
     }
     transition
         .start_new_core()
         .await
-        .map_err(|error| ServiceError::owner_switch_failed(format!("Failed to start owner core: {error:#}")))?;
+        .map_err(|error| owner_transition_error(error, "Failed to start owner core"))?;
     let active = transition
         .commit_new_owner()
         .await
@@ -89,6 +90,31 @@ async fn owner_proxy_transition(
         .await
         .map_err(|error| ServiceError::proxy_apply_failed(format!("Failed to apply owner proxy: {error:#}")))?;
     Ok((active, proxy_outcome))
+}
+
+fn owner_transition_error(error: anyhow::Error, context: &'static str) -> ServiceError {
+    if let Some(guard_error) = error.chain().find_map(|cause| cause.downcast_ref::<ServiceError>())
+        && matches!(
+            guard_error.code,
+            crate::ServiceErrorCode::TunGuardFailed | crate::ServiceErrorCode::TunGuardInterfaceUnavailable
+        )
+    {
+        return ServiceError::new(guard_error.code, format!("{context}: {error:#}"));
+    }
+    ServiceError::owner_switch_failed(format!("{context}: {error:#}"))
+}
+
+fn validate_tun_guard_bundle(request: &StartClashRequest) -> std::result::Result<(), ServiceError> {
+    crate::core::runtime_generation::validate_tun_guard(&request.runtime.yaml, request.tun_guard.as_ref())
+}
+
+async fn complete_lifecycle(
+    operation: impl Future<Output = Result<HttpResponse>> + Send + 'static,
+) -> Result<HttpResponse> {
+    // The IPC transport cancels timed-out handlers; the lifecycle must finish independently.
+    tokio::spawn(operation)
+        .await
+        .map_err(|error| kode_bridge::KodeBridgeError::custom(format!("Owner lifecycle worker failed: {error}")))?
 }
 
 /// When a handler's stop must reach SIGKILL so `reserve` still fits before the handler timeout.
@@ -151,9 +177,21 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
         if let Err(error) = start_result {
             let kill_by = sigkill_deadline(self.handler_deadline, STOP_RESERVE);
             if let Err(stop_error) = CORE_MANAGER.lock().await.stop_core_by(kill_by).await {
-                return Err(anyhow!(
-                    "{error:#}; failed to confirm termination of the rejected core: {stop_error:#}"
-                ));
+                let start_error = owner_transition_error(error, "Failed to start owner core");
+                if matches!(
+                    start_error.code,
+                    crate::ServiceErrorCode::TunGuardFailed | crate::ServiceErrorCode::TunGuardInterfaceUnavailable
+                ) {
+                    return Err(ServiceError::new(
+                        start_error.code,
+                        format!(
+                            "{}; failed to confirm termination of the rejected core: {stop_error:#}",
+                            start_error.message
+                        ),
+                    )
+                    .into());
+                }
+                return Err(stop_error.context(start_error.message));
             }
             let _ = persist_owner_core_stopped(self.owner).await;
             // Keep the owner's durable generation and core-managed state for a retry.
@@ -605,6 +643,8 @@ enum OwnerLifecycleGate<'a> {
     Unchecked,
     /// The authenticated owner must be active.
     ActiveOwner,
+    /// The authenticated owner and observed generation must still be active.
+    ActiveGeneration(u64),
     /// The request must prove the current active session.
     ActiveSession(&'a OwnerSessionProof),
 }
@@ -618,11 +658,25 @@ async fn enter_owner_lifecycle(
     let gated = match gate {
         OwnerLifecycleGate::Unchecked => Ok(()),
         OwnerLifecycleGate::ActiveOwner => require_active_owner(owner).await,
+        OwnerLifecycleGate::ActiveGeneration(generation) => require_active_generation(owner, generation).await,
         OwnerLifecycleGate::ActiveSession(proof) => require_active_session(owner, proof).await.map(|_| ()),
     };
     match gated {
         Ok(()) => ControlFlow::Continue(lifecycle_guard),
         Err(error) => ControlFlow::Break(service_error(error)),
+    }
+}
+
+async fn enter_owner_lifecycle_before(
+    owner: &AuthenticatedOwner,
+    gate: OwnerLifecycleGate<'_>,
+    deadline: Instant,
+) -> ControlFlow<Result<HttpResponse>, MutexGuard<'static, ()>> {
+    match tokio::time::timeout_at(deadline.into(), enter_owner_lifecycle(owner, gate)).await {
+        Ok(result) => result,
+        Err(_) => ControlFlow::Break(service_unavailable(
+            "Owner lifecycle queue timed out before applying changes",
+        )),
     }
 }
 
@@ -670,57 +724,70 @@ fn create_ipc_router() -> Result<Router> {
             }
         })
         .post(IpcCommand::StartClash.as_ref(), |ctx| async move {
-            let handler_deadline = Instant::now() + IPC_HANDLER_TIMEOUT;
-            trace!("Received StartClash command");
-            let (request, owner) = match authenticate_request::<AuthenticatedRequest<StartClashRequest>>(&ctx) {
-                ControlFlow::Continue(authenticated) => authenticated,
-                ControlFlow::Break(response) => return response,
-            };
-            let start_request = request.payload;
-            if hash_session_token(&start_request.proposed_session_token).is_err() {
-                return bad_request("Invalid proposed owner session token");
-            }
-            if let Some(proxy) = start_request.macos_proxy.as_ref()
-                && let Err(error) = validate_proxy_config(proxy)
-            {
-                return service_error(ServiceError::invalid_proxy_config(error.to_string()));
-            }
-            let _lifecycle_guard = match enter_owner_lifecycle(&owner, OwnerLifecycleGate::Unchecked).await {
-                ControlFlow::Continue(guard) => guard,
-                ControlFlow::Break(response) => return response,
-            };
-            let previous_owner = match load_active_owner().await {
-                Ok(owner) => owner,
-                Err(error) => {
-                    return service_unavailable(format!("Failed to load active owner: {error:#}"));
+            complete_lifecycle(async move {
+                let handler_deadline = Instant::now() + IPC_HANDLER_TIMEOUT;
+                trace!("Received StartClash command");
+                let (request, owner) = match authenticate_request::<AuthenticatedRequest<StartClashRequest>>(&ctx) {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
+                let start_request = request.payload;
+                if hash_session_token(&start_request.proposed_session_token).is_err() {
+                    return bad_request("Invalid proposed owner session token");
                 }
-            };
-            let prepared_runtime = match prepare_runtime(&owner, &start_request.runtime).await {
-                Ok(prepared) => prepared,
-                Err(error) => return service_error(error),
-            };
-            let mut transition = StartOwnerTransition {
-                handler_deadline,
-                previous_owner,
-                owner: &owner,
-                prepared_runtime: Some(prepared_runtime),
-                proposed_session_token: &start_request.proposed_session_token,
-                macos_proxy: start_request.macos_proxy.as_ref(),
-            };
-            let (active, proxy_outcome) = match owner_proxy_transition(&mut transition).await {
-                Ok(result) => result,
-                Err(error) => return service_error(error),
-            };
-            if let Err(error) = cleanup_legacy_owner_files(&owner).await {
-                warn!("Core start committed, but legacy owner cleanup will be retried later: {error}");
-            }
-            info!("Core started successfully");
-            ok_json(StartClashResult {
-                session: OwnerSessionHandle {
-                    generation: active.generation,
-                },
-                proxy_outcome,
+                if let Some(proxy) = start_request.macos_proxy.as_ref()
+                    && let Err(error) = validate_proxy_config(proxy)
+                {
+                    return service_error(ServiceError::invalid_proxy_config(error.to_string()));
+                }
+                if let Err(error) = validate_tun_guard_bundle(&start_request) {
+                    return service_error(error);
+                }
+                if let Err(error) =
+                    crate::core::manager::CoreManager::preflight_tun_guard(start_request.tun_guard.as_ref())
+                {
+                    return service_error(owner_transition_error(error, "Invalid TUN forwarding protection"));
+                }
+                let _lifecycle_guard =
+                    match enter_owner_lifecycle_before(&owner, OwnerLifecycleGate::Unchecked, handler_deadline).await {
+                        ControlFlow::Continue(guard) => guard,
+                        ControlFlow::Break(response) => return response,
+                    };
+                let previous_owner = match load_active_owner().await {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        return service_unavailable(format!("Failed to load active owner: {error:#}"));
+                    }
+                };
+                let mut prepared_runtime = match prepare_runtime(&owner, &start_request.runtime).await {
+                    Ok(prepared) => prepared,
+                    Err(error) => return service_error(error),
+                };
+                prepared_runtime.set_tun_guard(start_request.tun_guard);
+                let mut transition = StartOwnerTransition {
+                    handler_deadline,
+                    previous_owner,
+                    owner: &owner,
+                    prepared_runtime: Some(prepared_runtime),
+                    proposed_session_token: &start_request.proposed_session_token,
+                    macos_proxy: start_request.macos_proxy.as_ref(),
+                };
+                let (active, proxy_outcome) = match owner_proxy_transition(&mut transition).await {
+                    Ok(result) => result,
+                    Err(error) => return service_error(error),
+                };
+                if let Err(error) = cleanup_legacy_owner_files(&owner).await {
+                    warn!("Core start committed, but legacy owner cleanup will be retried later: {error}");
+                }
+                info!("Core started successfully");
+                ok_json(StartClashResult {
+                    session: OwnerSessionHandle {
+                        generation: active.generation,
+                    },
+                    proxy_outcome,
+                })
             })
+            .await
         })
         .get(IpcCommand::GetClashLogs.as_ref(), |ctx| async move {
             trace!("Received GetClashLogs command");
@@ -755,36 +822,48 @@ fn create_ipc_router() -> Result<Router> {
             }
         })
         .delete(IpcCommand::StopClash.as_ref(), |ctx| async move {
-            let handler_deadline = Instant::now() + IPC_HANDLER_TIMEOUT;
-            trace!("Received StopClash command");
-            let (request, owner) = match authenticate_request::<AuthenticatedSessionRequest<()>>(&ctx) {
-                ControlFlow::Continue(authenticated) => authenticated,
-                ControlFlow::Break(response) => return response,
-            };
-            let _lifecycle_guard =
-                match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveSession(&request.session)).await {
+            complete_lifecycle(async move {
+                let handler_deadline = Instant::now() + IPC_HANDLER_TIMEOUT;
+                trace!("Received StopClash command");
+                let (request, owner) = match authenticate_request::<AuthenticatedSessionRequest<()>>(&ctx) {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
+                let _lifecycle_guard = match enter_owner_lifecycle_before(
+                    &owner,
+                    OwnerLifecycleGate::ActiveSession(&request.session),
+                    handler_deadline,
+                )
+                .await
+                {
                     ControlFlow::Continue(guard) => guard,
                     ControlFlow::Break(response) => return response,
                 };
-            if let Err(error) = clear_proxy_with_direct_compensation().await {
-                return service_error(error);
-            }
-            let kill_by = sigkill_deadline(handler_deadline, STOP_RESERVE);
-            match CORE_MANAGER.lock().await.stop_core_by(kill_by).await {
-                Ok(_) => info!("Core stopped successfully"),
-                Err(e) => {
-                    return service_unavailable(format!("Failed to stop core: {}", e));
-                }
-            }
-            if let Err(e) = persist_owner_core_stopped(&owner).await {
-                set_core_lifecycle_state(ServiceLifecycleState::Fatal);
-                return service_unavailable(format!("Failed to persist desired state: {}", e));
-            }
-            if let Err(e) = clear_active_owner().await {
-                set_core_lifecycle_state(ServiceLifecycleState::Fatal);
-                return service_unavailable(format!("Failed to clear active owner: {}", e));
-            }
-            ok_empty("Core stopped successfully")
+                stop_active_owner_core(&owner, handler_deadline).await
+            })
+            .await
+        })
+        .delete(IpcCommand::StopOwnedClash.as_ref(), |ctx| async move {
+            complete_lifecycle(async move {
+                let handler_deadline = Instant::now() + IPC_HANDLER_TIMEOUT;
+                trace!("Received StopOwnedClash command");
+                let (request, owner) = match authenticate_request::<AuthenticatedRequest<StopOwnedClashRequest>>(&ctx) {
+                    ControlFlow::Continue(authenticated) => authenticated,
+                    ControlFlow::Break(response) => return response,
+                };
+                let _lifecycle_guard = match enter_owner_lifecycle_before(
+                    &owner,
+                    OwnerLifecycleGate::ActiveGeneration(request.payload.expected_generation),
+                    handler_deadline,
+                )
+                .await
+                {
+                    ControlFlow::Continue(guard) => guard,
+                    ControlFlow::Break(response) => return response,
+                };
+                stop_active_owner_core(&owner, handler_deadline).await
+            })
+            .await
         })
         .put(IpcCommand::StageRuntime.as_ref(), |ctx| async move {
             trace!("Received StageRuntime command");
@@ -941,6 +1020,42 @@ async fn require_active_owner(owner: &crate::core::auth::AuthenticatedOwner) -> 
     }
 }
 
+async fn require_active_generation(
+    owner: &AuthenticatedOwner,
+    expected_generation: u64,
+) -> std::result::Result<(), ServiceError> {
+    let active = load_active_owner()
+        .await
+        .map_err(|_| ServiceError::not_active())?
+        .filter(|active| active.owner_key == owner.key)
+        .ok_or_else(ServiceError::not_active)?;
+    if active.generation != expected_generation {
+        return Err(ServiceError::stale_owner_session());
+    }
+    Ok(())
+}
+
+// The caller must retain OWNER_LIFECYCLE_LOCK after validating the owner and session or generation.
+async fn stop_active_owner_core(owner: &AuthenticatedOwner, handler_deadline: Instant) -> Result<HttpResponse> {
+    if let Err(error) = clear_proxy_with_direct_compensation().await {
+        return service_error(error);
+    }
+    let kill_by = sigkill_deadline(handler_deadline, STOP_RESERVE);
+    match CORE_MANAGER.lock().await.stop_core_by(kill_by).await {
+        Ok(_) => info!("Core stopped successfully"),
+        Err(error) => return service_error(owner_transition_error(error, "Failed to stop core")),
+    }
+    if let Err(e) = persist_owner_core_stopped(owner).await {
+        set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+        return service_unavailable(format!("Failed to persist desired state: {}", e));
+    }
+    if let Err(e) = clear_active_owner().await {
+        set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+        return service_unavailable(format!("Failed to clear active owner: {}", e));
+    }
+    ok_empty("Core stopped successfully")
+}
+
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -987,9 +1102,11 @@ static OWNER_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[cfg(test)]
 mod owner_lifecycle_tests {
+    #[cfg(feature = "test")]
+    use super::{OwnerLifecycleGate, enter_owner_lifecycle};
     use super::{
-        OwnerProxyTransition, WINDOWS_CONTROL_PIPE_SDDL, owner_proxy_transition, require_active_owner,
-        require_active_session,
+        OwnerProxyTransition, WINDOWS_CONTROL_PIPE_SDDL, complete_lifecycle, owner_proxy_transition,
+        require_active_owner, require_active_session, validate_tun_guard_bundle,
     };
     use crate::ServiceErrorCode;
     use crate::core::auth::AuthenticatedOwner;
@@ -998,6 +1115,63 @@ mod owner_lifecycle_tests {
     };
     use crate::{OwnerIdentity, OwnerSessionProof, ProxyApplyOutcome};
     use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn timed_out_handler_does_not_cancel_the_owned_lifecycle() -> anyhow::Result<()> {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let handler = tokio::spawn(complete_lifecycle(async move {
+            let _owner = super::OWNER_LIFECYCLE_LOCK.lock().await;
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+            let _ = finished_tx.send(());
+            super::ok_empty("Finished")
+        }));
+        started_rx.await?;
+        handler.abort();
+        let _ = handler.await;
+        assert!(super::OWNER_LIFECYCLE_LOCK.try_lock().is_err());
+        release_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("lifecycle was cancelled with its handler"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), finished_rx).await??;
+        let _owner = super::OWNER_LIFECYCLE_LOCK.lock().await;
+        Ok(())
+    }
+
+    #[test]
+    fn protected_start_rejects_mismatched_runtime_policy() {
+        let mut request = crate::StartClashRequest {
+            runtime: crate::RuntimeBundle {
+                yaml: "interface-name: WLAN\ntun:\n  enable: true\n  auto-detect-interface: false\n".into(),
+                assets: Vec::new(),
+                remote_providers: Vec::new(),
+                core_path: "unused-policy-test".into(),
+            },
+            proposed_session_token: "ab".repeat(32),
+            macos_proxy: None,
+            tun_guard: Some(crate::TunGuardConfig {
+                interface_name: "WLAN".into(),
+            }),
+        };
+        assert!(validate_tun_guard_bundle(&request).is_ok());
+        for invalid in [
+            "interface-name: USB\ntun: { enable: true, auto-detect-interface: false }",
+            "interface-name: WLAN\ntun: { enable: false, auto-detect-interface: false }",
+            "interface-name: WLAN\ntun: { enable: true, auto-detect-interface: true }",
+            "interface-name: WLAN\ntun: { enable: true }",
+        ] {
+            request.runtime.yaml = invalid.into();
+            assert_eq!(
+                validate_tun_guard_bundle(&request).unwrap_err().code,
+                crate::ServiceErrorCode::TunGuardFailed
+            );
+        }
+        request.tun_guard = None;
+        assert!(validate_tun_guard_bundle(&request).is_ok());
+    }
 
     fn owner(uid: u32) -> AuthenticatedOwner {
         AuthenticatedOwner {
@@ -1162,6 +1336,33 @@ mod owner_lifecycle_tests {
             .expect_err("non-active owner must be rejected");
 
         assert_eq!(error.code, ServiceErrorCode::NotActive);
+        clear_active_owner().await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "test")]
+    #[tokio::test]
+    #[serial]
+    async fn owned_stop_gate_refuses_foreign_and_replaced_generations_without_mutation() -> anyhow::Result<()> {
+        let active = owner(92_003);
+        let first = commit_active_owner_session(&active, &"31".repeat(32)).await?;
+        let current = commit_active_owner_session(&active, &"32".repeat(32)).await?;
+        let path = crate::service_paths()?.active_owner_path();
+        let before = tokio::fs::read(&path).await?;
+
+        assert!(matches!(
+            enter_owner_lifecycle(&owner(92_004), OwnerLifecycleGate::ActiveGeneration(current.generation)).await,
+            std::ops::ControlFlow::Break(_),
+        ));
+        assert_eq!(tokio::fs::read(&path).await?, before);
+        assert!(matches!(
+            enter_owner_lifecycle(&active, OwnerLifecycleGate::ActiveGeneration(first.generation)).await,
+            std::ops::ControlFlow::Break(_),
+        ));
+        assert_eq!(tokio::fs::read(&path).await?, before);
+        let accepted = enter_owner_lifecycle(&active, OwnerLifecycleGate::ActiveGeneration(current.generation)).await;
+        assert!(matches!(accepted, std::ops::ControlFlow::Continue(_)));
+        drop(accepted);
         clear_active_owner().await?;
         Ok(())
     }

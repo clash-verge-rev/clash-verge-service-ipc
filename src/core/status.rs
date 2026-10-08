@@ -42,6 +42,7 @@ pub async fn service_status_snapshot(owner: &AuthenticatedOwner) -> Result<Servi
         desired_core_should_be_running: desired.core_should_be_running,
         desired_generation: desired.generation,
         desired_updated_at: desired.updated_at,
+        tun_guard_error: core.as_ref().and_then(|core| core.tun_guard_error.clone()),
     })
 }
 
@@ -132,6 +133,7 @@ mod tests {
         assert_eq!(status.last_core_exit_reason, None);
         assert_eq!(status.restart_count, 0);
         assert_eq!(status.last_recovery_at, None);
+        assert!(status.tun_guard_error.is_none());
         assert_eq!(
             service_status_snapshot(&active).await?.active_generation,
             Some(active_session.generation)
