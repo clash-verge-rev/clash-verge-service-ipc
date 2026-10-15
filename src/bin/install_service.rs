@@ -23,6 +23,20 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Checks the bundled service binary against the digest the caller vouches for.
+///
+/// Mirrors [`validate_core_candidate`]: a core named with `--sha256` is verified before it is
+/// published, while the service binary itself was only checked for being an ordinary file.
+fn validate_service_binary(source: &Path, expected_sha256: Option<&[u8; 32]>) -> Result<[u8; 32], Error> {
+    let source_hash = sha256(source)?;
+    if let Some(expected) = expected_sha256
+        && source_hash != *expected
+    {
+        bail!("service binary {source:?} does not match the attested sha256; refusing to publish it");
+    }
+    Ok(source_hash)
+}
+
 fn bundled_service_binary() -> Result<PathBuf, Error> {
     let source = std::env::current_exe()?.with_file_name(if cfg!(windows) {
         "clash-verge-service.exe"
@@ -243,6 +257,8 @@ struct InstallOptions {
     #[cfg(windows)]
     ensure_service: bool,
     cores: Vec<CoreInstallRequest>,
+    /// Digest the caller vouches for the bundled service binary, mirroring `--sha256` for cores.
+    service_sha256: Option<[u8; 32]>,
     debug: bool,
 }
 
@@ -251,6 +267,7 @@ fn parse_install_arguments(arguments: impl Iterator<Item = std::ffi::OsString>) 
     let mut install_service = false;
     #[cfg(windows)]
     let mut ensure_service = false;
+    let mut service_sha256: Option<[u8; 32]> = None;
     let mut debug = false;
     let mut arguments = arguments;
     while let Some(argument) = arguments.next() {
@@ -276,6 +293,13 @@ fn parse_install_arguments(arguments: impl Iterator<Item = std::ffi::OsString>) 
                 bail!("--sha256 was given twice for {:?}", request.source);
             }
             request.sha256 = Some(parse_sha256_hex(value)?);
+        } else if argument == "--service-sha256" {
+            let value = arguments.next().context("--service-sha256 requires a hex digest")?;
+            let value = value.to_str().context("--service-sha256 digest is not valid UTF-8")?;
+            if service_sha256.is_some() {
+                bail!("--service-sha256 was given twice");
+            }
+            service_sha256 = Some(parse_sha256_hex(value)?);
         } else if argument == "--install-service" {
             install_service = true;
         } else if argument == "--ensure-service" {
@@ -297,6 +321,7 @@ fn parse_install_arguments(arguments: impl Iterator<Item = std::ffi::OsString>) 
         #[cfg(windows)]
         ensure_service,
         cores: requested,
+        service_sha256,
         debug,
     })
 }
@@ -907,6 +932,7 @@ fn main() -> anyhow::Result<()> {
         );
     }
     let source = bundled_service_binary()?;
+    validate_service_binary(&source, options.service_sha256.as_ref())?;
     let install_dir = clash_verge_service_ipc::prepare_service_install_directory()?;
     let target = install_dir.join("clash-verge-service.exe");
     let staged = stage_binary(&source, &target)?;
