@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+
+description="Clash Verge Service helps to launch Clash Core."
+supervisor="supervise-daemon"
+command="{exec_start}"
+command_user="root:{group}"
+respawn_delay=5
+respawn_max=0
+
+depend() {{
+	need net
+	use nftables iptables
+}}
