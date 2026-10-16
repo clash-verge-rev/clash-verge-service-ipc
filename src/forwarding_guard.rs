@@ -36,6 +36,7 @@ mod tests {
         saves: usize,
         fail_save: Option<usize>,
         fail_archive: bool,
+        permission_denied: bool,
         next_change: NextChange,
         writes: usize,
     }
@@ -69,9 +70,13 @@ mod tests {
             Ok(self.session.as_deref() == Some(session))
         }
         fn can_change(&mut self) -> Result<()> {
+            if self.permission_denied {
+                bail!("administrator permission required");
+            }
             Ok(())
         }
         fn change(&mut self, target: &Target, expected: bool, value: bool) -> Result<bool> {
+            self.can_change()?;
             let current = self
                 .forwarding
                 .get_mut(&target.guid)
@@ -309,6 +314,30 @@ mod tests {
         state.restore(&mut backend)?;
         assert!(backend.forwarding[&target("A").guid]);
         assert!(state.idle());
+        Ok(())
+    }
+
+    #[test]
+    fn permission_denied_recovery_preserves_applied_proof_for_an_elevated_retry() -> Result<()> {
+        let (mut state, mut backend) = setup();
+        let id = state.prepare(&mut backend, Some("A"))?;
+        state.commit(&mut backend, id)?;
+        let mut restart = restarted(&backend);
+        backend.permission_denied = true;
+        assert!(restart.recover(&mut backend).is_err());
+        assert_eq!(restart.records[0].phase, Phase::Applied);
+        assert_eq!(backend.journal[0].phase, Phase::Applied);
+        assert_eq!(backend.saves, 2);
+        assert_eq!(backend.writes, 1);
+        assert!(!backend.forwarding[&target("A").guid]);
+
+        let mut elevated = restarted(&backend);
+        backend.permission_denied = false;
+        elevated.recover(&mut backend)?;
+        assert!(elevated.idle());
+        assert!(backend.journal.is_empty());
+        assert!(backend.forwarding[&target("A").guid]);
+        assert_eq!(backend.writes, 2);
         Ok(())
     }
 }
@@ -590,6 +619,7 @@ mod state {
                     target.name
                 );
             }
+            backend.can_change()?;
             // Write this phase before restoring. A restart must not replay an old applied
             // record after a successful restore whose journal cleanup failed.
             let mut records = self.records.clone();

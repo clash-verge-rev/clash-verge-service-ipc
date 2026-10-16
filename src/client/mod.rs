@@ -28,6 +28,18 @@ const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
 // Large cache chunks need a longer timeout than control messages.
 const RUNTIME_FILE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Confirms that the StartClash POST was never attempted.
+#[derive(Debug)]
+pub struct StartClashNotSent;
+
+impl std::fmt::Display for StartClashNotSent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the service start request was not sent")
+    }
+}
+
+impl std::error::Error for StartClashNotSent {}
+
 fn protected<'a>(request: kode_bridge::HttpRequestBuilder<'a>) -> kode_bridge::HttpRequestBuilder<'a> {
     request.header(
         crate::SERVICE_PROTOCOL_HEADER,
@@ -57,20 +69,31 @@ where
     P: serde::Serialize + for<'de> serde::Deserialize<'de>,
     R: for<'de> serde::Deserialize<'de>,
 {
-    let client = connect().await?;
-    let body = match session {
-        None => AuthenticatedRequest {
-            credentials: credentials.clone(),
-            payload,
+    let (client, body) = async {
+        let client = connect_for_command(Some(&command)).await?;
+        let body = match session {
+            None => AuthenticatedRequest {
+                credentials: credentials.clone(),
+                payload,
+            }
+            .to_json_value()?,
+            Some(session) => AuthenticatedSessionRequest {
+                credentials: credentials.clone(),
+                session: session.clone(),
+                payload,
+            }
+            .to_json_value()?,
+        };
+        Ok::<_, anyhow::Error>((client, body))
+    }
+    .await
+    .map_err(|error| {
+        if matches!(command, IpcCommand::StartClash) {
+            error.context(StartClashNotSent)
+        } else {
+            error
         }
-        .to_json_value()?,
-        Some(session) => AuthenticatedSessionRequest {
-            credentials: credentials.clone(),
-            session: session.clone(),
-            payload,
-        }
-        .to_json_value()?,
-    };
+    })?;
     let path = command.as_ref();
     let request = protected(match verb {
         Verb::Get => client.get(path),
@@ -109,6 +132,33 @@ pub async fn set_config(config: Option<IpcConfig>) {
 }
 
 pub async fn connect() -> Result<IpcHttpClient> {
+    connect_for_command(None).await
+}
+
+fn client_for_command(path: &Path, c: IpcConfig, command: Option<&IpcCommand>) -> Result<IpcHttpClient> {
+    Ok(kode_bridge::IpcHttpClient::with_config(
+        path,
+        ClientConfig {
+            default_timeout: c.default_timeout,
+            // Only the lifecycle owner can preserve uncertainty across repeated Start requests.
+            max_retries: if matches!(command, Some(IpcCommand::StartClash)) {
+                1
+            } else {
+                c.max_retries
+            },
+            retry_delay: c.retry_delay,
+            enable_pooling: true,
+            require_windows_server_system: false,
+            #[cfg(all(windows, not(feature = "test")))]
+            windows_server_pid_verifier: Some(windows_identity::verify_registered_service_process_id),
+            #[cfg(all(windows, feature = "test"))]
+            windows_server_pid_verifier: None,
+            ..Default::default()
+        },
+    )?)
+}
+
+async fn connect_for_command(command: Option<&IpcCommand>) -> Result<IpcHttpClient> {
     debug!("Connecting to IPC at {}", IPC_PATH);
 
     #[cfg(unix)]
@@ -120,21 +170,7 @@ pub async fn connect() -> Result<IpcHttpClient> {
 
     let c = { CLIENT_CONFIG.read().await.clone() }.unwrap_or_default();
     debug!("Using config: {:?}", c);
-    let client = kode_bridge::IpcHttpClient::with_config(
-        IPC_PATH,
-        ClientConfig {
-            default_timeout: c.default_timeout,
-            max_retries: c.max_retries,
-            retry_delay: c.retry_delay,
-            enable_pooling: true,
-            require_windows_server_system: false,
-            #[cfg(all(windows, not(feature = "test")))]
-            windows_server_pid_verifier: Some(windows_identity::verify_registered_service_process_id),
-            #[cfg(all(windows, feature = "test"))]
-            windows_server_pid_verifier: None,
-            ..Default::default()
-        },
-    )?;
+    let client = client_for_command(Path::new(IPC_PATH), c, command)?;
 
     if let Err(e) = client
         .get(IpcCommand::Magic.as_ref())
@@ -183,14 +219,19 @@ pub async fn start_clash(
     body: &StartClashRequest,
 ) -> Result<Response<StartClashResult>> {
     if body.tun_guard.is_some() {
-        let protocol = get_version()
-            .await?
-            .data
-            .context("service omitted its protocol capabilities")?;
-        anyhow::ensure!(
-            protocol.supports_service_tun_guard(),
-            "service does not support Windows TUN forwarding protection; install the matching service"
-        );
+        async {
+            let protocol = get_version()
+                .await?
+                .data
+                .context("service omitted its protocol capabilities")?;
+            anyhow::ensure!(
+                protocol.supports_service_tun_guard(),
+                "service does not support Windows TUN forwarding protection; install the matching service"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        .context(StartClashNotSent)?;
     }
     protected_call(
         Verb::Post,
@@ -335,4 +376,84 @@ pub(crate) async fn inspect_installation_with_digest(
     response
         .data
         .ok_or_else(|| anyhow::anyhow!("service omitted installation status"))
+}
+
+#[cfg(all(test, feature = "test"))]
+mod tests {
+    use super::{IpcConfig, client_for_command};
+    use crate::IpcCommand;
+    use kode_bridge::ipc_http_server::{HttpResponse, IpcHttpServer, Router};
+    use std::{
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    #[tokio::test]
+    async fn start_timeout_is_not_hidden_by_a_wire_retry() -> anyhow::Result<()> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        #[cfg(windows)]
+        let endpoint = format!(r"\\.\pipe\verge-start-retry-test-{}-{nonce}", std::process::id());
+        #[cfg(unix)]
+        let endpoint = std::env::temp_dir().join(format!("verge-start-retry-test-{}-{nonce}.sock", std::process::id()));
+        let start_count = Arc::new(AtomicUsize::new(0));
+        let status_count = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::clone(&start_count);
+        let statuses = Arc::clone(&status_count);
+        let router = Router::new()
+            .get("/ready", |_| async { HttpResponse::json(&serde_json::json!({})) })
+            .post(IpcCommand::StartClash.as_ref(), move |_| {
+                let first = starts.fetch_add(1, Ordering::Relaxed) == 0;
+                async move {
+                    if first {
+                        std::future::pending::<()>().await;
+                    }
+                    HttpResponse::json(&serde_json::json!({"code": 1, "message": "late refusal"}))
+                }
+            })
+            .get(IpcCommand::Status.as_ref(), move |_| {
+                let first = statuses.fetch_add(1, Ordering::Relaxed) == 0;
+                async move {
+                    if first {
+                        std::future::pending::<()>().await;
+                    }
+                    HttpResponse::json(&serde_json::json!({"code": 0}))
+                }
+            });
+        let mut server = IpcHttpServer::new(&endpoint)?.router(router);
+        let server = tokio::spawn(async move { server.serve().await });
+        let outcome = async {
+            let config = IpcConfig {
+                default_timeout: Duration::from_millis(100),
+                max_retries: 2,
+                retry_delay: Duration::ZERO,
+            };
+            let start = client_for_command(Path::new(&endpoint), config.clone(), Some(&IpcCommand::StartClash))?;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if start.get("/ready").send().await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+
+            assert!(start.post(IpcCommand::StartClash.as_ref()).send().await.is_err());
+            assert_eq!(start_count.load(Ordering::Relaxed), 1);
+            let status = client_for_command(Path::new(&endpoint), config, Some(&IpcCommand::Status))?;
+            assert!(status.get(IpcCommand::Status.as_ref()).send().await.is_ok());
+            assert_eq!(status_count.load(Ordering::Relaxed), 2);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        server.abort();
+        let _ = server.await;
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&endpoint);
+        outcome
+    }
 }
