@@ -6,9 +6,15 @@ use platform_lib::{
 };
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use windows_sys::Win32::{
-    Foundation::{ERROR_NO_MORE_FILES, ERROR_SERVICE_DOES_NOT_EXIST, INVALID_HANDLE_VALUE},
-    System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    Foundation::{
+        ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, ERROR_SERVICE_DOES_NOT_EXIST, INVALID_HANDLE_VALUE,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
+    },
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+        },
+        Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject},
     },
 };
 
@@ -57,6 +63,38 @@ pub(super) fn require_stopped_service() -> Result<()> {
     }
 }
 
+/// Whether a process that appears in a snapshot is actually alive.
+///
+/// A Toolhelp snapshot can still list a process whose exit has already
+/// completed but whose entry lingers until the last handle is closed. Such
+/// a residual entry must not block a fresh core, so the caller probes
+/// liveness instead of trusting the snapshot alone.
+enum ProcessLiveness {
+    Alive,
+    Exited,
+    Unknown,
+}
+
+fn core_process_liveness(pid: u32) -> ProcessLiveness {
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZATION_SYNCHRONIZE, 0, pid) };
+    if raw.is_null() {
+        // ERROR_INVALID_PARAMETER means the pid no longer names a process.
+        // Anything else (for example access denied for an elevated process)
+        // leaves us unable to tell; stay conservative and refuse.
+        return if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            ProcessLiveness::Exited
+        } else {
+            ProcessLiveness::Unknown
+        };
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    match unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } {
+        WAIT_OBJECT_0 => ProcessLiveness::Exited,
+        WAIT_TIMEOUT => ProcessLiveness::Alive,
+        _ => ProcessLiveness::Unknown,
+    }
+}
+
 pub(super) fn require_no_core_process(include_service: bool) -> Result<()> {
     #[cfg(not(feature = "test"))]
     const CORE_NAMES: &[&str] = &["verge-mihomo.exe", "verge-mihomo-alpha.exe"];
@@ -80,9 +118,25 @@ pub(super) fn require_no_core_process(include_service: bool) -> Result<()> {
             .unwrap_or(entry.szExeFile.len());
         let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
         // SCM can be stopped while a core from an earlier service process remains alive.
-        if CORE_NAMES.iter().any(|core| name.eq_ignore_ascii_case(core))
-            || (include_service && name.eq_ignore_ascii_case("clash-verge-service.exe"))
-        {
+        if CORE_NAMES.iter().any(|core| name.eq_ignore_ascii_case(core)) {
+            // A snapshot entry whose process has already exited must not block
+            // startup; the user reported cores that taskkill reports as gone
+            // while the entry still enumerates. Refuse only when the probe
+            // confirms the process is alive, and refuse when it cannot tell.
+            match core_process_liveness(entry.th32ProcessID) {
+                ProcessLiveness::Alive => bail!(
+                    "process {name} (PID {}) is still running; refusing a second core",
+                    entry.th32ProcessID
+                ),
+                ProcessLiveness::Exited => {
+                    // The entry is residual; let the new core take over.
+                }
+                ProcessLiveness::Unknown => bail!(
+                    "process {name} (PID {}) could not be probed; refusing a second core",
+                    entry.th32ProcessID
+                ),
+            }
+        } else if include_service && name.eq_ignore_ascii_case("clash-verge-service.exe") {
             bail!(
                 "process {name} (PID {}) is still running; refusing a second core",
                 entry.th32ProcessID
@@ -116,5 +170,15 @@ mod tests {
                 .as_nanos()
         );
         super::require_services_absent(&[&name]).unwrap();
+    }
+
+    #[test]
+    fn an_unused_pid_is_reported_as_exited() {
+        // A pid that never existed cannot be opened (ERROR_INVALID_PARAMETER),
+        // which is exactly the state a lingering snapshot entry reports.
+        assert!(matches!(
+            super::core_process_liveness(u32::MAX),
+            super::ProcessLiveness::Exited
+        ));
     }
 }
