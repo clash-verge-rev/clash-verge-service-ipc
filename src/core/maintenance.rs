@@ -4,6 +4,35 @@ use crate::{OwnerIdentity, owner_key};
 use anyhow::{Context as _, Result};
 use std::fs::{File, OpenOptions};
 
+/// Excludes service ownership until Windows uninstall finishes removing its files.
+#[cfg(windows)]
+pub struct ServiceUninstallGuard {
+    _owner: StoppedServiceGuard,
+}
+
+/// Refuse deletion while the service still owns a forwarding restoration record.
+/// This check never restores network settings or discards current-boot recovery state.
+#[cfg(windows)]
+pub fn prepare_service_uninstall() -> Result<ServiceUninstallGuard> {
+    crate::prepare_service_install_directory()?;
+    let owner = acquire_stopped_service_guard()?;
+    let paths = service_paths()?;
+    // A concurrent start must not mistake a stale PID for this maintenance owner.
+    owner.clear_owner_metadata(paths.pid_file_path())?;
+    let root = paths.runtime_dir().join("tun-guard");
+    crate::core::windows_security::ensure_private_installer_directory(&root)?;
+    let mut guard = crate::forwarding_guard::GuardRuntime::new(root);
+    let pending = guard
+        .prepare_recovery()
+        .context("cannot verify TUN forwarding restoration; uninstall cancelled before deleting service files")?;
+    anyhow::ensure!(
+        !pending,
+        "TUN IPv4 forwarding restoration is still pending; uninstall cancelled before deleting service files. \
+         Start the service to complete recovery, then retry uninstall"
+    );
+    Ok(ServiceUninstallGuard { _owner: owner })
+}
+
 /// Only privileged installation/repair may discard unreadable authorization state.
 pub fn repair_active_owner_state() -> Result<Option<std::path::PathBuf>> {
     crate::prepare_service_install_directory()?;
@@ -92,6 +121,23 @@ pub(crate) async fn persist_owner_identity(identity: &OwnerIdentity, owner_root:
 
 struct StoppedServiceGuard {
     _file: File,
+}
+
+#[cfg(windows)]
+impl StoppedServiceGuard {
+    fn clear_owner_metadata(&self, pid_file: &std::path::Path) -> Result<()> {
+        self._file
+            .set_len(0)
+            .context("failed to clear stopped service owner metadata")?;
+        self._file
+            .sync_data()
+            .context("failed to sync cleared service owner metadata")?;
+        match std::fs::remove_file(pid_file) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("failed to clear stopped service PID file"),
+        }
+    }
 }
 
 fn acquire_stopped_service_guard() -> Result<StoppedServiceGuard> {
@@ -220,5 +266,40 @@ struct LocalSid(*mut std::ffi::c_void);
 impl Drop for LocalSid {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::Foundation::LocalFree(self.0) };
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::StoppedServiceGuard;
+    use std::fs::{self, OpenOptions};
+
+    #[test]
+    fn uninstall_clears_stale_owner_metadata_without_publishing_its_pid() -> anyhow::Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("uninstall-owner-{}-{unique}", std::process::id()));
+        fs::create_dir(&root)?;
+        let lock_path = root.join("owner.lock");
+        let pid_file = root.join("owner.pid");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)?;
+        fs::write(&lock_path, "pid=1234\nversion=2.7.6\n")?;
+        fs::write(&pid_file, "1234")?;
+        let guard = StoppedServiceGuard { _file: file };
+
+        guard.clear_owner_metadata(&pid_file)?;
+        assert!(fs::read(&lock_path)?.is_empty());
+        assert!(!pid_file.try_exists()?);
+        guard.clear_owner_metadata(&pid_file)?;
+
+        drop(guard);
+        fs::remove_file(lock_path)?;
+        fs::remove_dir(root)?;
+        Ok(())
     }
 }

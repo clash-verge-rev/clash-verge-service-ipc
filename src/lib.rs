@@ -34,6 +34,8 @@ pub use core::{
     require_trusted_core_source, restore_desired_state, run_ipc_server, run_ipc_supervisor_until_shutdown,
     service_lifecycle_state, set_service_lifecycle_state, stop_ipc_server,
 };
+#[cfg(all(feature = "standalone", windows))]
+pub use core::{ServiceUninstallGuard, prepare_service_uninstall};
 
 #[cfg(feature = "test")]
 pub use core::test_owner_credentials;
