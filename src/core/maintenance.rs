@@ -144,6 +144,7 @@ fn acquire_stopped_service_guard() -> Result<StoppedServiceGuard> {
     let paths = service_paths()?;
     #[cfg(unix)]
     {
+        #[cfg(not(target_os = "macos"))]
         use std::os::fd::AsRawFd as _;
 
         crate::core::unix_security::ensure_service_directory(paths.runtime_dir(), 0o755)?;
@@ -153,6 +154,10 @@ fn acquire_stopped_service_guard() -> Result<StoppedServiceGuard> {
             .create(true)
             .truncate(false)
             .open(paths.owner_lock_path())?;
+        #[cfg(target_os = "macos")]
+        // Core startup may hold the manager lock for 15s before shutdown grace and output draining.
+        lock_stopped_service(&file, std::time::Duration::from_secs(25))?;
+        #[cfg(not(target_os = "macos"))]
         if unsafe { platform_lib::flock(file.as_raw_fd(), platform_lib::LOCK_EX | platform_lib::LOCK_NB) } != 0 {
             return Err(std::io::Error::last_os_error())
                 .context("service owner lock is held; stop the service before stale-owner maintenance");
@@ -301,5 +306,30 @@ mod tests {
         fs::remove_file(lock_path)?;
         fs::remove_dir(root)?;
         Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn lock_stopped_service(file: &File, timeout: std::time::Duration) -> Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::time::{Duration, Instant};
+
+    // launchctl bootout can return before the daemon finishes SIGTERM cleanup and releases its lock.
+    let deadline = Instant::now() + timeout;
+    loop {
+        if unsafe { platform_lib::flock(file.as_raw_fd(), platform_lib::LOCK_EX | platform_lib::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error).context("failed to acquire service owner lock for stale-owner maintenance");
+        }
+        if remaining.is_zero() {
+            return Err(error).with_context(|| {
+                format!("service owner lock is still held after {timeout:?}; stop the service before stale-owner maintenance")
+            });
+        }
+        std::thread::sleep(Duration::from_millis(100).min(remaining));
     }
 }

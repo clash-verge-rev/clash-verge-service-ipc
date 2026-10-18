@@ -1099,7 +1099,8 @@ mod native {
                 },
                 "read Windows boot-session token",
             )?;
-            if kind != REG_SZ || size == 0 || size % 2 != 0 || size as usize > std::mem::size_of_val(&buffer) {
+            if kind != REG_SZ || size == 0 || !size.is_multiple_of(2) || size as usize > std::mem::size_of_val(&buffer)
+            {
                 bail!("The Windows boot-session token is invalid");
             }
             let length = size as usize / 2;

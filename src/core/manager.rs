@@ -801,14 +801,14 @@ impl CoreManager {
             *start_time_arc.lock().await = None;
             started_at_arc.store(0, Ordering::Relaxed);
             remove_core_runtime_record().await;
-            if let Some(guard) = forwarding_guard_arc.lock().await.as_mut() {
-                if let Err(error) = guard.restore() {
-                    set_core_lifecycle_state(ServiceLifecycleState::Fatal);
-                    return Err(forwarding_error(
-                        error,
-                        "failed to restore TUN forwarding protection after core exit",
-                    ));
-                }
+            if let Some(guard) = forwarding_guard_arc.lock().await.as_mut()
+                && let Err(error) = guard.restore()
+            {
+                set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                return Err(forwarding_error(
+                    error,
+                    "failed to restore TUN forwarding protection after core exit",
+                ));
             }
             if recovery_exhausted {
                 set_core_lifecycle_state(ServiceLifecycleState::Fatal);
