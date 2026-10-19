@@ -847,12 +847,23 @@ fn main() -> Result<(), Error> {
     let staged = stage_binary(&source, &target)?;
     let unit_name = format!("{}.service", clash_verge_service_ipc::SERVICE_SLUG);
     let unit_path = PathBuf::from("/etc/systemd/system").join(&unit_name);
+    let openrc = shared::openrc_booted();
 
-    let _ = run_command("systemctl", &["stop", &unit_name], debug);
+    if openrc {
+        let _ = run_command("rc-service", &[clash_verge_service_ipc::SERVICE_SLUG, "stop"], debug);
+    } else {
+        let _ = run_command("systemctl", &["stop", &unit_name], debug);
+    }
     shared::repair_active_owner_state()?;
     // Staged where the service is already down, so a core it was running no longer holds its file.
     install_service_cores(&options.cores)?;
     publish_staged_binary(&staged, &target)?;
+
+    if openrc {
+        install_openrc_service(&target, &group, debug)?;
+        wait_for_service_ready()?;
+        return Ok(());
+    }
 
     let unit_file_content = format!(
         include_str!("../../resources/systemd_service_unit.tmpl"),
@@ -876,6 +887,40 @@ fn main() -> Result<(), Error> {
     wait_for_service_ready()?;
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_openrc_service(target: &Path, group: &str, debug: bool) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let script_path = shared::openrc_script_path();
+    let script = format!(
+        include_str!("../../resources/openrc_service.tmpl"),
+        exec_start = target.to_string_lossy(),
+        group = group,
+    );
+    let mut file =
+        File::create(&script_path).with_context(|| format!("failed to create OpenRC script {script_path:?}"))?;
+    file.write_all(script.as_bytes())
+        .with_context(|| format!("failed to write OpenRC script {script_path:?}"))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("failed to make OpenRC script {script_path:?} executable"))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync OpenRC script {script_path:?}"))?;
+    // An executable still open for writing cannot be run (ETXTBSY).
+    drop(file);
+
+    if !Path::new("/etc/runlevels/default")
+        .join(clash_verge_service_ipc::SERVICE_SLUG)
+        .exists()
+    {
+        run_command(
+            "rc-update",
+            &["add", clash_verge_service_ipc::SERVICE_SLUG, "default"],
+            debug,
+        )?;
+    }
+    run_command("rc-service", &[clash_verge_service_ipc::SERVICE_SLUG, "restart"], debug)
 }
 
 #[cfg(windows)]
