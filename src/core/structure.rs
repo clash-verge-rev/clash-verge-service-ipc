@@ -67,6 +67,16 @@ impl ProtocolInfo {
         self.protocol.epoch == ProtocolVersion::current().epoch
             && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_RUNTIME_FILE_READ
     }
+
+    pub const fn supports_owned_core_stop(&self) -> bool {
+        self.protocol.epoch == ProtocolVersion::current().epoch
+            && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_OWNED_CORE_STOP
+    }
+
+    pub const fn supports_service_tun_guard(&self) -> bool {
+        self.protocol.epoch == ProtocolVersion::current().epoch
+            && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_TUN_GUARD
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,10 +153,17 @@ pub enum ProxyApplyOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunGuardConfig {
+    pub interface_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartClashRequest {
     pub runtime: RuntimeBundle,
     pub proposed_session_token: String,
     pub macos_proxy: Option<MacosProxyConfig>,
+    #[serde(default)]
+    pub tun_guard: Option<TunGuardConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +175,11 @@ pub struct OwnerSessionHandle {
 pub struct StartClashResult {
     pub session: OwnerSessionHandle,
     pub proxy_outcome: ProxyApplyOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopOwnedClashRequest {
+    pub expected_generation: u64,
 }
 
 /// Result of staging a bundle into the running core's generation.
@@ -179,6 +201,7 @@ pub enum StageRuntimeOutcome {
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum StageRejection {
     CoreNotRunning,
+    TunGuardRequiresRestart,
     /// The requested core binary differs from the running one.
     CorePathChanged,
     /// A required file replacement or removal failed.
@@ -226,6 +249,8 @@ pub enum ServiceErrorCode {
     ProxyClearFailed = 1010,
     ProxyApplyFailed = 1011,
     AppDataRootNotOwned = 1012,
+    TunGuardFailed = 1013,
+    TunGuardInterfaceUnavailable = 1014,
 }
 
 pub fn owner_key(identity: &OwnerIdentity) -> String {
@@ -242,6 +267,8 @@ pub fn owner_key(identity: &OwnerIdentity) -> String {
 pub struct ClashConfig {
     pub core_config: CoreConfig,
     pub log_config: WriterConfig,
+    #[serde(default)]
+    pub tun_guard: Option<TunGuardConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +309,12 @@ impl ServiceLifecycleState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunGuardStatusError {
+    pub code: ServiceErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceStatusSnapshot {
     pub is_active: bool,
     pub active_generation: Option<u64>,
@@ -294,6 +327,8 @@ pub struct ServiceStatusSnapshot {
     pub desired_core_should_be_running: bool,
     pub desired_generation: u64,
     pub desired_updated_at: u64,
+    #[serde(default)]
+    pub tun_guard_error: Option<TunGuardStatusError>,
 }
 
 #[cfg(feature = "response")]
@@ -347,7 +382,7 @@ impl<T> JsonConvert for T where T: Serialize + for<'de> Deserialize<'de> {}
 mod tests {
     use super::{
         MacosProxyConfig, OwnerIdentity, ProtocolInfo, ProtocolVersion, RuntimeBundle, ServiceErrorCode,
-        StartClashRequest, owner_key,
+        StartClashRequest, StopOwnedClashRequest, TunGuardConfig, owner_key,
     };
 
     #[test]
@@ -365,6 +400,7 @@ mod tests {
                 port: 7897,
                 bypass: "localhost".to_owned(),
             }),
+            tun_guard: None,
         };
         let encoded = serde_json::to_vec(&request).expect("request should serialize");
         let decoded: StartClashRequest = serde_json::from_slice(&encoded).expect("request should deserialize");
@@ -385,6 +421,50 @@ mod tests {
         let current = ProtocolVersion::current();
         assert_eq!(ProtocolVersion::parse_header(&current.header_value()), Some(current));
         assert!(ProtocolVersion::parse_header(crate::VERSION).is_none());
+    }
+
+    #[test]
+    fn tun_guard_intent_survives_restart_and_is_capability_gated() {
+        let legacy: super::ClashConfig = serde_json::from_value(serde_json::json!({
+            "core_config": super::CoreConfig::default(),
+            "log_config": super::WriterConfig::default(),
+        }))
+        .expect("older desired state should remain readable");
+        assert!(legacy.tun_guard.is_none());
+        let mut protected = legacy;
+        protected.tun_guard = Some(TunGuardConfig {
+            interface_name: "WLAN".into(),
+        });
+        let restored: super::ClashConfig = serde_json::from_slice(&serde_json::to_vec(&protected).unwrap()).unwrap();
+        assert_eq!(restored.tun_guard, protected.tun_guard);
+
+        let mut protocol = ProtocolInfo::current();
+        assert!(protocol.supports_service_tun_guard());
+        protocol.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_TUN_GUARD - 1;
+        assert!(!protocol.supports_service_tun_guard());
+        assert!(protocol.supports_client(ProtocolVersion::current(), crate::MIN_REQUIRED_SERVICE_REVISION));
+        protocol.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_TUN_GUARD;
+        protocol.protocol.epoch += 1;
+        assert!(!protocol.supports_service_tun_guard());
+    }
+
+    #[test]
+    fn older_status_without_guard_audit_remains_readable() {
+        let status: super::ServiceStatusSnapshot = serde_json::from_value(serde_json::json!({
+            "is_active": true,
+            "active_generation": 1,
+            "service_state": "Running",
+            "core_pid": 123,
+            "core_started_at": null,
+            "last_core_exit_reason": null,
+            "restart_count": 0,
+            "last_recovery_at": null,
+            "desired_core_should_be_running": true,
+            "desired_generation": 1,
+            "desired_updated_at": 0,
+        }))
+        .expect("older status remains compatible");
+        assert!(status.tun_guard_error.is_none());
     }
 
     #[test]
@@ -435,6 +515,32 @@ mod tests {
             },
             crate::MIN_REQUIRED_SERVICE_REVISION,
         ));
+    }
+
+    #[test]
+    fn owned_core_stop_preserves_revision_five_compatibility() {
+        let mut info = ProtocolInfo::current();
+        assert!(info.supports_owned_core_stop());
+        assert!(info.supports_client(
+            ProtocolVersion {
+                epoch: info.protocol.epoch,
+                revision: 5,
+            },
+            crate::MIN_REQUIRED_SERVICE_REVISION,
+        ));
+        info.protocol.revision = 5;
+        assert!(info.supports_client(ProtocolVersion::current(), crate::MIN_REQUIRED_SERVICE_REVISION));
+        assert!(!info.supports_owned_core_stop());
+        info.protocol.revision = crate::MIN_SERVICE_REVISION_FOR_OWNED_CORE_STOP;
+        info.protocol.epoch += 1;
+        assert!(!info.supports_owned_core_stop());
+
+        let request = StopOwnedClashRequest {
+            expected_generation: 42,
+        };
+        let encoded = serde_json::to_vec(&request).expect("request should serialize");
+        let decoded: StopOwnedClashRequest = serde_json::from_slice(&encoded).expect("request should deserialize");
+        assert_eq!(decoded, request);
     }
 
     #[test]

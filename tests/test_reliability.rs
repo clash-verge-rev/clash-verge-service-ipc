@@ -112,6 +112,7 @@ async fn core_watchdog_stops_a_bounded_crash_loop() -> Result<()> {
             },
             proposed_session_token: token.clone(),
             macos_proxy: None,
+            tun_guard: None,
         },
     )
     .await?;

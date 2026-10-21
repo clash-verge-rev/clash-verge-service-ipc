@@ -212,7 +212,8 @@ fn main() -> anyhow::Result<()> {
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
     let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
-    match service_manager.open_service(clash_verge_service_ipc::WINDOWS_SERVICE_NAME, service_access) {
+    let service_result = service_manager.open_service(clash_verge_service_ipc::WINDOWS_SERVICE_NAME, service_access);
+    let uninstall_guard = match service_result {
         Ok(service) => {
             let service_status = service.query_status()?;
             if service_status.current_state != ServiceState::Stopped {
@@ -232,6 +233,8 @@ fn main() -> anyhow::Result<()> {
                 )?;
             }
 
+            // Stopped alone does not prove that forwarding restoration succeeded.
+            let guard = clash_verge_service_ipc::prepare_service_uninstall()?;
             service.delete()?;
             drop(service);
             poll_until(
@@ -250,11 +253,14 @@ fn main() -> anyhow::Result<()> {
                 || thread::sleep(POLL_INTERVAL),
                 "timed out waiting for service deletion",
             )?;
+            guard
         }
         // A retry must finish file cleanup even if the service was already deleted.
-        Err(error) if has_raw_error(&error, ERROR_SERVICE_DOES_NOT_EXIST) => {}
+        Err(error) if has_raw_error(&error, ERROR_SERVICE_DOES_NOT_EXIST) => {
+            clash_verge_service_ipc::prepare_service_uninstall()?
+        }
         Err(error) => return Err(error.into()),
-    }
+    };
     let target = clash_verge_service_ipc::prepare_service_install_directory()?.join("clash-verge-service.exe");
     if target.exists() {
         std::fs::remove_file(&target)
@@ -262,6 +268,8 @@ fn main() -> anyhow::Result<()> {
     }
     // A fallback publish may have displaced a locked service image aside; best-effort.
     let _ = std::fs::remove_file(target.with_extension(clash_verge_service_ipc::CORE_DISPLACED_EXTENSION));
+    // Owner-state repair acquires the same nonblocking stopped-owner lock.
+    drop(uninstall_guard);
     shared::repair_active_owner_state()?;
     remove_installed_cores();
     println!("Service uninstalled successfully. Resource cleanup warnings can be ignored.");

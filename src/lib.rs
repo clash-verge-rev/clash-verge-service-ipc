@@ -2,6 +2,8 @@ mod channel;
 mod core;
 #[cfg(any(feature = "client", feature = "standalone"))]
 pub mod execution;
+#[cfg(feature = "forwarding-guard")]
+pub mod forwarding_guard;
 #[cfg(any(feature = "client", feature = "standalone"))]
 pub mod management;
 
@@ -18,7 +20,8 @@ pub use core::{
     OwnerIdentity, OwnerSessionHandle, OwnerSessionProof, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome,
     RemoteProvider, RuntimeAsset, RuntimeBundle, RuntimeFileOutcome, RuntimeFileRequest, SERVICE_PROTOCOL_HEADER,
     SESSION_TOKEN_HEX_LEN, ServiceErrorCode, ServiceLifecycleState, ServiceStatusSnapshot, StageRejection,
-    StageRuntimeOutcome, StartClashRequest, StartClashResult, WriterConfig, mihomo_ipc_path, owner_key,
+    StageRuntimeOutcome, StartClashRequest, StartClashResult, StopOwnedClashRequest, TunGuardConfig,
+    TunGuardStatusError, WriterConfig, mihomo_ipc_path, owner_key,
 };
 pub use core::{CORE_DISPLACED_EXTENSION, CORE_STAGING_EXTENSION, OwnerPaths, ServicePaths, service_paths};
 
@@ -31,6 +34,8 @@ pub use core::{
     require_trusted_core_source, restore_desired_state, run_ipc_server, run_ipc_supervisor_until_shutdown,
     service_lifecycle_state, set_service_lifecycle_state, stop_ipc_server,
 };
+#[cfg(all(feature = "standalone", windows))]
+pub use core::{ServiceUninstallGuard, prepare_service_uninstall};
 
 #[cfg(feature = "test")]
 pub use core::test_owner_credentials;
@@ -76,7 +81,7 @@ pub static IPC_AUTH_EXPECT: &str =
 
 pub static VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_EPOCH: u16 = 2;
-pub const PROTOCOL_REVISION: u16 = 5;
+pub const PROTOCOL_REVISION: u16 = 7;
 pub const MIN_SUPPORTED_CLIENT_REVISION: u16 = 5;
 pub const MIN_REQUIRED_SERVICE_REVISION: u16 = 5;
 /// Revision that introduced `/clash/stage-runtime`.
@@ -84,3 +89,7 @@ pub const MIN_REQUIRED_SERVICE_REVISION: u16 = 5;
 pub const MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING: u16 = 2;
 /// Capability revision for `/clash/runtime-file`.
 pub const MIN_SERVICE_REVISION_FOR_RUNTIME_FILE_READ: u16 = 3;
+/// Capability revision for `/clash/stop-owned`.
+pub const MIN_SERVICE_REVISION_FOR_OWNED_CORE_STOP: u16 = 6;
+/// Capability revision for service-owned Windows TUN forwarding protection.
+pub const MIN_SERVICE_REVISION_FOR_TUN_GUARD: u16 = 7;

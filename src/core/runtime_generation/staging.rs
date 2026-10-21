@@ -162,6 +162,11 @@ pub(crate) async fn stage_runtime(
             reason: StageRejection::CoreNotRunning,
         });
     };
+    if running.tun_guard.is_some() {
+        return Ok(StageRuntimeOutcome::RestartRequired {
+            reason: StageRejection::TunGuardRequiresRestart,
+        });
+    }
 
     let core = validate_core_path(&bundle.core_path)?;
     if Path::new(&running.core_config.core_path) != core.executable() {

@@ -49,6 +49,7 @@ impl RunningCore {
                 runtime: bundle(&app_root, "mode: rule\n"),
                 proposed_session_token: token.clone(),
                 macos_proxy: None,
+                tun_guard: None,
             },
         )
         .await?;
