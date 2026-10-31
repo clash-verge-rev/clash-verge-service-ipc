@@ -1,10 +1,10 @@
-//! Reads manifest-declared provider caches from the private runtime directory.
+//! Reads manifest-declared provider caches and geo databases from the private runtime directory.
 //! Undeclared paths are rejected before target lookup.
 
 use super::assets::{
     RUNTIME_CONFIG_FILE_NAME, destination_key, invalid_asset, resolve_in_generation, validate_destination,
 };
-use super::staging::{MANIFEST_FILE_NAME, modified_nanos, read_manifest};
+use super::staging::{CORE_UPDATED_ASSETS, MANIFEST_FILE_NAME, SourceIdentity, modified_nanos, read_manifest};
 use crate::RuntimeFileOutcome;
 use crate::core::auth::{AuthenticatedOwner, ServiceError};
 use crate::core::paths::service_paths;
@@ -24,15 +24,30 @@ pub(crate) async fn read_runtime_file(
         .runtime_dir();
     let key = destination_key(&validate_destination(destination)?)?;
     let manifest = read_manifest(&generation).await.map_err(invalid_asset)?;
-    if !manifest.remote_providers.contains_key(&key) {
+    let copied_from = manifest
+        .assets
+        .get(&key)
+        .filter(|_| CORE_UPDATED_ASSETS.contains(&key.as_str()));
+    if copied_from.is_none() && !manifest.remote_providers.contains_key(&key) {
         return Err(invalid_asset(format!(
-            "runtime file {key:?} is not a declared provider cache"
+            "runtime file {key:?} is not a declared provider cache or geo database"
         )));
     }
-    read_chunk(&generation, &resolve_in_generation(&generation, destination)?, offset).await
+    read_chunk(
+        &generation,
+        &resolve_in_generation(&generation, destination)?,
+        offset,
+        copied_from,
+    )
+    .await
 }
 
-async fn read_chunk(generation: &Path, path: &Path, offset: u64) -> Result<RuntimeFileOutcome, ServiceError> {
+async fn read_chunk(
+    generation: &Path,
+    path: &Path,
+    offset: u64,
+    copied_from: Option<&SourceIdentity>,
+) -> Result<RuntimeFileOutcome, ServiceError> {
     use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
     let unreadable = |error: std::io::Error| invalid_asset(format!("runtime file {path:?} cannot be read: {error}"));
@@ -62,6 +77,10 @@ async fn read_chunk(generation: &Path, path: &Path, offset: u64) -> Result<Runti
     let mut file = tokio::fs::File::open(path).await.map_err(unreadable)?;
     let metadata = file.metadata().await.map_err(unreadable)?;
     let len = metadata.len();
+    // The service read a copied asset with its own rights, so an unchanged copy is not the owner's to read.
+    if copied_from.is_some_and(|source| source.len == len && source.mtime_ns == modified_nanos(&metadata)) {
+        return Ok(RuntimeFileOutcome::Absent);
+    }
     let mut content = Vec::new();
     if offset < len {
         file.seek(std::io::SeekFrom::Start(offset)).await.map_err(unreadable)?;

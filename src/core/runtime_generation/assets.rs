@@ -242,7 +242,7 @@ async fn plan_runtime_refresh(
     core: &ResolvedCore,
     runtime: &Path,
 ) -> Result<super::staging::StagePlan, ServiceError> {
-    let gathered = gather_bundle(owner, bundle, core).await?;
+    let gathered = gather_bundle(owner, bundle, core, runtime).await?;
     // A corrupt manifest must not prevent the restart that staging uses as its fallback.
     // Treat it as untrusted: copy everything and sweep nothing.
     let previous = super::staging::read_manifest(runtime).await.unwrap_or_else(|detail| {
@@ -347,6 +347,7 @@ pub(super) async fn gather_bundle(
     owner: &AuthenticatedOwner,
     bundle: &RuntimeBundle,
     core: &ResolvedCore,
+    generation: &Path,
 ) -> Result<GatheredBundle, ServiceError> {
     let app_bundle_root = core.trusted_asset_bundle_root();
     let mut sources = Vec::with_capacity(bundle.assets.len());
@@ -362,6 +363,11 @@ pub(super) async fn gather_bundle(
                 "runtime destination {destination:?} is declared as a copied asset twice"
             )));
         }
+        let runtime_copy = tokio::fs::symlink_metadata(generation.join(&destination))
+            .await
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map(|copy| (copy.len(), super::staging::modified_nanos(&copy)));
         sources.push(super::staging::AssetSource {
             asset: crate::RuntimeAsset {
                 source: source.to_string_lossy().into_owned(),
@@ -369,6 +375,7 @@ pub(super) async fn gather_bundle(
             },
             len: metadata.len(),
             mtime_ns: super::staging::modified_nanos(&metadata),
+            runtime_copy,
         });
     }
     let remote = super::staging::declared_remote_providers(&bundle.remote_providers, &asset_keys)?;

@@ -16,6 +16,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) const MANIFEST_FILE_NAME: &str = ".runtime-manifest.json";
 
+/// Copied assets the core rewrites in place; other copied assets stay write-only.
+pub(super) const CORE_UPDATED_ASSETS: [&str; 6] = [
+    "Country.mmdb",
+    "ASN.mmdb",
+    "geoip.dat",
+    "geosite.dat",
+    "geoip.metadb",
+    "GeoSite.dat",
+];
+
 /// Source metadata recorded after a copy, avoiding content hashing on later staging.
 /// An unknown modification time never matches because length alone is not a safe identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +77,8 @@ pub(super) struct AssetSource {
     pub asset: RuntimeAsset,
     pub len: u64,
     pub mtime_ns: Option<u128>,
+    /// Length and modification time of the file already at the destination.
+    pub runtime_copy: Option<(u64, Option<u128>)>,
 }
 
 /// Builds a pure staging plan from pre-read metadata.
@@ -80,11 +92,14 @@ pub(super) fn plan_stage(previous: &RuntimeManifest, sources: &[AssetSource], re
             mtime_ns: source.mtime_ns,
         };
         let destination = source.asset.destination.clone();
-        if previous
-            .assets
-            .get(&destination)
-            .is_some_and(|recorded| recorded.still_matches(&identity))
-        {
+        let recorded = previous.assets.get(&destination);
+        // A client syncing a core update back stamps its file like the runtime copy; rewriting
+        // the same bytes would fail on a database the running core holds mapped.
+        let synced_back = CORE_UPDATED_ASSETS.contains(&destination.as_str())
+            && recorded.is_some_and(|recorded| recorded.source == identity.source)
+            && source.mtime_ns.is_some()
+            && source.runtime_copy == Some((source.len, source.mtime_ns));
+        if synced_back || recorded.is_some_and(|recorded| recorded.still_matches(&identity)) {
             plan.skipped.push(destination.clone());
         } else {
             plan.copies.push(PlannedCopy {
@@ -171,7 +186,8 @@ pub(crate) async fn stage_runtime(
     }
 
     let generation = PathBuf::from(&running.core_config.config_dir);
-    let super::assets::GatheredBundle { sources, remote } = super::assets::gather_bundle(owner, bundle, &core).await?;
+    let super::assets::GatheredBundle { sources, remote } =
+        super::assets::gather_bundle(owner, bundle, &core, &generation).await?;
 
     let previous = match read_manifest(&generation).await {
         Ok(previous) => previous,
@@ -351,7 +367,19 @@ pub(super) async fn copy_staged_file(source: &str, destination: &Path) -> std::i
         let _ = tokio::fs::remove_file(&staged).await;
         return Err(error);
     }
+    // Only Windows and macOS copies keep the source time, which mihomo's geo updater reads.
+    if cfg!(target_os = "linux")
+        && let Err(error) = keep_source_modified_time(source, &staged).await
+    {
+        tracing::warn!(destination = ?destination, error = %error, "Failed to keep a runtime asset's modification time");
+    }
     replace_staged_file(&staged, destination).await
+}
+
+async fn keep_source_modified_time(source: &str, staged: &Path) -> std::io::Result<()> {
+    let modified = tokio::fs::metadata(source).await?.modified()?;
+    let staged = tokio::fs::OpenOptions::new().write(true).open(staged).await?;
+    staged.into_std().await.set_modified(modified)
 }
 
 pub(super) async fn commit_staged_config(
@@ -417,6 +445,7 @@ mod tests {
             },
             len,
             mtime_ns: Some(mtime_ns),
+            runtime_copy: None,
         }
     }
 
@@ -602,6 +631,7 @@ mod tests {
             },
             len: 10,
             mtime_ns: None,
+            runtime_copy: None,
         }];
 
         let plan = plan_stage(&previous, &sources, &[]);

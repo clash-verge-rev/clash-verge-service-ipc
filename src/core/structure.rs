@@ -67,6 +67,11 @@ impl ProtocolInfo {
         self.protocol.epoch == ProtocolVersion::current().epoch
             && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_RUNTIME_FILE_READ
     }
+
+    pub const fn supports_runtime_geo_read(&self) -> bool {
+        self.protocol.epoch == ProtocolVersion::current().epoch
+            && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_RUNTIME_GEO_READ
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

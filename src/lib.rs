@@ -76,7 +76,7 @@ pub static IPC_AUTH_EXPECT: &str =
 
 pub static VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_EPOCH: u16 = 2;
-pub const PROTOCOL_REVISION: u16 = 5;
+pub const PROTOCOL_REVISION: u16 = 6;
 pub const MIN_SUPPORTED_CLIENT_REVISION: u16 = 5;
 pub const MIN_REQUIRED_SERVICE_REVISION: u16 = 5;
 /// Revision that introduced `/clash/stage-runtime`.
@@ -84,3 +84,5 @@ pub const MIN_REQUIRED_SERVICE_REVISION: u16 = 5;
 pub const MIN_SERVICE_REVISION_FOR_RUNTIME_STAGING: u16 = 2;
 /// Capability revision for `/clash/runtime-file`.
 pub const MIN_SERVICE_REVISION_FOR_RUNTIME_FILE_READ: u16 = 3;
+/// Capability revision for reading core-updated geo databases through `/clash/runtime-file`.
+pub const MIN_SERVICE_REVISION_FOR_RUNTIME_GEO_READ: u16 = 6;
