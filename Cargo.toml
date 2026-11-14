@@ -117,7 +117,7 @@ sysproxy = { git = "https://github.com/clash-verge-rev/sysproxy-rs.git", branch 
 
 [target.'cfg(unix)'.dependencies]
 platform_lib = { package = "libc", version = "0.2", optional = true }
-nix = { version = "0.31", features = ["user"], optional = true }
+nix = { version = "0.32", features = ["user"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 platform_lib = { package = "windows-service", version = "0.8", optional = true }
