@@ -555,8 +555,7 @@ dependencies = [
 [[package]]
 name = "kode-bridge"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdb14ea1ba42eebb57b46bcdd67a20f11a3f076d846ddf772c68d7439f6c6eca"
+source = "git+https://github.com/clash-verge-rev/kode-bridge.git?rev=9379a82f149c1c8f71eb1419f4957c961f778195#9379a82f149c1c8f71eb1419f4957c961f778195"
 dependencies = [
  "bytes",
  "futures",
