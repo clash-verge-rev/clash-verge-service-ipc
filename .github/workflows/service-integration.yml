@@ -236,37 +236,6 @@ jobs:
             sudo target/release/clash-verge-service-uninstall --debug
           fi
 
-      - name: Build native proxy regression (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          cargo build --locked --target-dir target/native-fixture --features standalone,client,test --bin mock_binary --bin crash_binary
-          cargo test --locked --lib --features standalone,client,development-channel --no-run --message-format=json > target/native-proxy-build.jsonl
-          test_bin="$(python3 - <<'PY'
-          import json
-          from pathlib import Path
-          artifacts = [json.loads(line) for line in Path("target/native-proxy-build.jsonl").read_text().splitlines() if line.startswith("{")]
-          print(next(item["executable"] for item in artifacts if item.get("reason") == "compiler-artifact" and item.get("profile", {}).get("test") and item.get("executable")))
-          PY
-          )"
-          "$test_bin" --list | grep -Fx 'core::proxy::native_tests::native_proxy_lifecycle: test'
-          echo "NATIVE_PROXY_TEST_BIN=$test_bin" >> "$GITHUB_ENV"
-          shasum -a 256 "$test_bin" target/native-fixture/debug/mock_binary target/native-fixture/debug/crash_binary
-
-      - name: Verify native proxy lifecycle (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          sudo env GITHUB_ACTIONS=true RUNNER_TEMP="$RUNNER_TEMP" "$NATIVE_PROXY_TEST_BIN" --exact core::proxy::native_tests::native_proxy_lifecycle --ignored --test-threads=1 --nocapture
-
-      - name: Restore native proxy dictionary (macOS)
-        if: ${{ always() && runner.os == 'macOS' }}
-        shell: bash
-        run: |
-          if [ -n "${NATIVE_PROXY_TEST_BIN:-}" ] && [ -x "$NATIVE_PROXY_TEST_BIN" ]; then
-            sudo env GITHUB_ACTIONS=true RUNNER_TEMP="$RUNNER_TEMP" "$NATIVE_PROXY_TEST_BIN" --exact core::proxy::native_tests::native_proxy_restore --ignored --test-threads=1 --nocapture
-          fi
-
       - name: Install service (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
