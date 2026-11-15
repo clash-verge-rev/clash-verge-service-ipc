@@ -86,7 +86,7 @@ default = []
 
 
 [dependencies]
-kode-bridge = { version = "0.5.2", features = ["server"], optional = true }
+kode-bridge = { git = "https://github.com/clash-verge-rev/kode-bridge.git", rev = "9379a82f149c1c8f71eb1419f4957c961f778195", version = "0.5.2", features = ["server"], optional = true }
 once_cell = { version = "1.21", features = ["parking_lot"], optional = true }
 anyhow = { version = "1.0", optional = true }
 http = { version = "1.3", optional = true }
@@ -143,7 +143,7 @@ windows-sys = { version = "0.61.2", optional = true, features = [
 ] }
 
 [dev-dependencies]
-kode-bridge = { version = "0.5.2", default-features = false, features = [
+kode-bridge = { git = "https://github.com/clash-verge-rev/kode-bridge.git", rev = "9379a82f149c1c8f71eb1419f4957c961f778195", version = "0.5.2", default-features = false, features = [
     "server",
     "client",
 ] }
