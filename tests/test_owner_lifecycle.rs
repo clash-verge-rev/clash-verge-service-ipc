@@ -160,3 +160,123 @@ async fn installation_query_reports_global_occupancy_and_guards_handoff() -> Res
     assert_eq!(stop_clash(&credentials, &session).await?.code, 0);
     stop_server(server).await
 }
+
+#[tokio::test]
+#[serial]
+async fn retrying_start_keeps_the_session_and_rejects_conflicting_token_reuse() -> Result<()> {
+    let server = start_server().await?;
+    let credentials = common::owner_credentials();
+    let token = "71".repeat(32);
+    let (first, session) = start(&credentials, &token).await?;
+    let before = get_status(&credentials).await?.data.context("no status")?;
+    let (replayed, _) = start(&credentials, &token).await?;
+    assert_eq!(first, replayed);
+    assert_eq!(
+        get_status(&credentials).await?.data.context("no status")?.core_pid,
+        before.core_pid
+    );
+    let mut changed = runtime_bundle();
+    changed.yaml = "mode: direct\n".into();
+    assert_eq!(
+        start_clash(
+            &credentials,
+            &StartClashRequest {
+                runtime: changed,
+                proposed_session_token: token,
+                macos_proxy: None,
+            }
+        )
+        .await?
+        .code,
+        400
+    );
+    assert_eq!(
+        get_status(&credentials)
+            .await?
+            .data
+            .context("no status")?
+            .active_generation,
+        before.active_generation
+    );
+    assert_eq!(stop_clash(&credentials, &session).await?.code, 0);
+    stop_server(server).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn start_replay_after_client_disconnect_does_not_replace_the_committed_core() -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    let server = start_server().await?;
+    let credentials = common::owner_credentials();
+    let token = "72".repeat(32);
+    let request = StartClashRequest {
+        runtime: runtime_bundle(),
+        proposed_session_token: token.clone(),
+        macos_proxy: None,
+    };
+    let body = serde_json::to_vec(&clash_verge_service_ipc::AuthenticatedRequest {
+        credentials: credentials.clone(),
+        payload: request.clone(),
+    })?;
+    let mut stream = tokio::net::UnixStream::connect(clash_verge_service_ipc::IPC_PATH).await?;
+    let headers = format!(
+        "POST /clash/start HTTP/1.1\r\nHost: localhost\r\nX-IPC-Magic: {}\r\n{}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        clash_verge_service_ipc::IPC_AUTH_EXPECT,
+        clash_verge_service_ipc::SERVICE_PROTOCOL_HEADER,
+        clash_verge_service_ipc::ProtocolVersion::current().header_value(),
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).await?;
+    stream.write_all(&body).await?;
+    common::wait_until("disconnected Start commit", async || {
+        get_status(&credentials)
+            .await
+            .ok()
+            .and_then(|reply| reply.data)
+            .is_some_and(|status| status.core_pid.is_some())
+    })
+    .await?;
+    drop(stream);
+    let before = get_status(&credentials).await?.data.context("no status")?;
+    let response = start_clash(&credentials, &request).await?;
+    anyhow::ensure!(response.code == 0, "{}", response.message);
+    let generation = response.data.context("no start result")?.session.generation;
+    assert_eq!(before.active_generation, Some(generation));
+    assert_eq!(
+        get_status(&credentials).await?.data.context("no status")?.core_pid,
+        before.core_pid
+    );
+    assert_eq!(
+        stop_clash(&credentials, &OwnerSessionProof { generation, token })
+            .await?
+            .code,
+        0
+    );
+    stop_server(server).await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn failed_recovery_persistence_keeps_live_running_intent_visible() -> Result<()> {
+    let server = start_server().await?;
+    let app_root = std::env::temp_dir().join(format!("service-live-intent-{}", std::process::id()));
+    let credentials = clash_verge_service_ipc::test_owner_credentials_for_uid(&app_root, 93_001)?;
+    let path = clash_verge_service_ipc::service_paths()?
+        .for_owner(&credentials.identity)
+        .desired_state_path();
+    if path.is_file() {
+        std::fs::remove_file(&path)?;
+    }
+    std::fs::create_dir_all(&path)?;
+    let (_, session) = start(&credentials, &"73".repeat(32)).await?;
+    let status = get_status(&credentials).await?.data.context("no status")?;
+    assert!(status.core_pid.is_some());
+    assert!(status.desired_core_should_be_running);
+    assert!(status.desired_persistence_error.is_some());
+    assert_eq!(stop_clash(&credentials, &session).await?.code, 0);
+    std::fs::remove_dir(&path)?;
+    std::fs::remove_dir_all(&app_root)?;
+    stop_server(server).await
+}

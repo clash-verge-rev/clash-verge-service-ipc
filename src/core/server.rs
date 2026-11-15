@@ -2,8 +2,8 @@ use crate::core::auth::{
     AuthenticatedOwner, ServiceError, authenticate_owner, hash_session_token, ipc_request_context_to_auth_context,
 };
 use crate::core::desired::{
-    ActiveOwnerState, clear_active_owner, commit_active_owner_session, load_active_owner, persist_owner_core_started,
-    persist_owner_core_stopped, persist_owner_core_stopped_by_key, persist_owner_writer_config,
+    ActiveOwnerState, clear_active_owner, commit_active_owner_start, load_active_owner, persist_owner_core_started,
+    persist_owner_core_stopped, persist_owner_core_stopped_by_key, persist_owner_writer_config, persist_start_result,
 };
 use crate::core::legacy_cleanup::cleanup_legacy_owner_files;
 use crate::core::logger::{LOG_RING, flush_writer, set_or_update_writer};
@@ -102,6 +102,7 @@ struct StartOwnerTransition<'a> {
     owner: &'a AuthenticatedOwner,
     prepared_runtime: Option<PreparedRuntime>,
     proposed_session_token: &'a str,
+    request_hash: String,
     macos_proxy: Option<&'a MacosProxyConfig>,
 }
 
@@ -171,7 +172,8 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
         if let Err(error) = persist_owner_core_started(self.owner, clash_config).await {
             return self.rollback_commit_failure(error).await;
         }
-        match commit_active_owner_session(self.owner, self.proposed_session_token).await {
+        match commit_active_owner_start(self.owner, self.proposed_session_token, Some(self.request_hash.clone())).await
+        {
             Ok(active) => {
                 self.prepared_runtime
                     .take()
@@ -739,9 +741,10 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Break(response) => return response,
             };
             let start_request = request.payload;
-            if hash_session_token(&start_request.proposed_session_token).is_err() {
-                return bad_request("Invalid proposed owner session token");
-            }
+            let proposed_session_hash = match hash_session_token(&start_request.proposed_session_token) {
+                Ok(hash) => hash,
+                Err(_) => return bad_request("Invalid proposed owner session token"),
+            };
             if let Some(proxy) = start_request.macos_proxy.as_ref()
                 && let Err(error) = validate_proxy_config(proxy)
             {
@@ -755,6 +758,35 @@ fn create_ipc_router() -> Result<Router> {
                         return service_unavailable(format!("Failed to load active owner: {error:#}"));
                     }
                 };
+                use sha2::{Digest as _, Sha256};
+                let request_hash: String = Sha256::digest(
+                    serde_json::to_vec(&start_request)
+                        .map_err(|error| kode_bridge::KodeBridgeError::custom(error.to_string()))?,
+                )
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+                if let Some(active) = previous_owner.as_ref()
+                    && active.owner_key == owner.key
+                    && constant_time_eq(active.session_token_hash.as_bytes(), proposed_session_hash.as_bytes())
+                {
+                    if active.start_request_hash.as_ref() != Some(&request_hash) {
+                        return bad_request(
+                            "Owner session token was already used for a different or unrecorded Start request",
+                        );
+                    }
+                    return match &active.start_proxy_outcome {
+                        Some(outcome) => ok_json(StartClashResult {
+                            session: OwnerSessionHandle {
+                                generation: active.generation,
+                            },
+                            proxy_outcome: outcome.clone(),
+                        }),
+                        None => {
+                            service_unavailable("The previous Start committed ownership but did not record its result")
+                        }
+                    };
+                }
                 let prepared_runtime = match prepare_runtime(&owner, &start_request.runtime).await {
                     Ok(prepared) => prepared,
                     Err(error) => return service_error(error),
@@ -765,9 +797,10 @@ fn create_ipc_router() -> Result<Router> {
                     owner: &owner,
                     prepared_runtime: Some(prepared_runtime),
                     proposed_session_token: &start_request.proposed_session_token,
+                    request_hash,
                     macos_proxy: start_request.macos_proxy.as_ref(),
                 };
-                let (active, proxy_outcome) = match owner_proxy_transition(&mut transition).await {
+                let (mut active, proxy_outcome) = match owner_proxy_transition(&mut transition).await {
                     Ok(result) => result,
                     Err(error) => return service_error(error),
                 };
@@ -775,12 +808,16 @@ fn create_ipc_router() -> Result<Router> {
                     warn!("Core start committed, but legacy owner cleanup will be retried later: {error}");
                 }
                 info!("Core started successfully");
-                ok_json(StartClashResult {
+                let result = StartClashResult {
                     session: OwnerSessionHandle {
                         generation: active.generation,
                     },
                     proxy_outcome,
-                })
+                };
+                if let Err(error) = persist_start_result(&mut active, result.proxy_outcome.clone()).await {
+                    return service_unavailable(format!("Failed to record Start result: {error:#}"));
+                }
+                ok_json(result)
             })
             .await
         })

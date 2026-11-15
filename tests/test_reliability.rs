@@ -170,6 +170,12 @@ async fn desired_restore_recreates_the_volatile_owner_ipc_directory() -> Result<
     let generation = response.data.context("no start result")?.session.generation;
     let before = get_status(&credentials).await?.data.context("no status")?.core_pid;
     stop_server(server).await?;
+    let desired_path = clash_verge_service_ipc::service_paths()?
+        .for_owner(&credentials.identity)
+        .desired_state_path();
+    let mut durable: clash_verge_service_ipc::DesiredState = serde_json::from_slice(&std::fs::read(&desired_path)?)?;
+    durable.generation += 100;
+    std::fs::write(&desired_path, serde_json::to_vec(&durable)?)?;
     let socket = std::path::PathBuf::from(mihomo_ipc_path(&credentials.identity));
     std::fs::remove_dir(socket.parent().context("no parent")?)?;
     std::fs::write(socket.parent().context("no parent")?, b"not a directory")?;
@@ -187,6 +193,17 @@ async fn desired_restore_recreates_the_volatile_owner_ipc_directory() -> Result<
     assert_ne!(status.core_pid, before);
     assert_eq!(status.active_generation, Some(generation));
     assert!(status.desired_core_should_be_running);
+    assert_eq!(status.desired_generation, durable.generation);
+    std::fs::remove_file(&desired_path)?;
+    std::fs::create_dir(&desired_path)?;
+    assert!(
+        get_status(&credentials)
+            .await?
+            .data
+            .context("no live restored status")?
+            .desired_core_should_be_running
+    );
+    std::fs::remove_dir(&desired_path)?;
     let metadata = std::fs::symlink_metadata(&socket)?;
     assert!(metadata.file_type().is_socket());
     if let clash_verge_service_ipc::OwnerIdentity::Unix { uid, .. } = credentials.identity {

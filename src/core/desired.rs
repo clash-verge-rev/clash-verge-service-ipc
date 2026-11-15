@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 static DESIRED_STATE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static LIVE_DESIRED_STATE: parking_lot::RwLock<Option<(String, DesiredState)>> = parking_lot::RwLock::new(None);
 static STATE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -23,6 +24,8 @@ pub struct DesiredState {
     pub last_writer_config: Option<WriterConfig>,
     pub generation: u64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub persistence_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,6 +37,10 @@ pub struct ActiveOwnerState {
     pub generation: u64,
     #[serde(default)]
     pub session_token_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_request_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_proxy_outcome: Option<crate::ProxyApplyOutcome>,
 }
 
 #[cfg(test)]
@@ -45,6 +52,8 @@ impl From<&AuthenticatedOwner> for ActiveOwnerState {
             app_data_root: owner.app_data_root.to_string_lossy().into_owned(),
             generation: 0,
             session_token_hash: String::new(),
+            start_request_hash: None,
+            start_proxy_outcome: None,
         }
     }
 }
@@ -55,6 +64,11 @@ struct OwnerGenerationState {
 }
 
 pub async fn load_owner_desired_state(owner_key: &str) -> Result<DesiredState> {
+    if let Some((key, state)) = LIVE_DESIRED_STATE.read().as_ref()
+        && key == owner_key
+    {
+        return Ok(state.clone());
+    }
     let path = service_paths()?.for_owner_key(owner_key).desired_state_path();
     Ok(read_owner_desired_state_resilient(&path).await)
 }
@@ -109,7 +123,16 @@ pub async fn persist_active_owner(owner: &AuthenticatedOwner) -> Result<ActiveOw
     Ok(state)
 }
 
+#[cfg(test)]
 pub async fn commit_active_owner_session(owner: &AuthenticatedOwner, session_token: &str) -> Result<ActiveOwnerState> {
+    commit_active_owner_start(owner, session_token, None).await
+}
+
+pub(super) async fn commit_active_owner_start(
+    owner: &AuthenticatedOwner,
+    session_token: &str,
+    start_request_hash: Option<String>,
+) -> Result<ActiveOwnerState> {
     let session_token_hash = hash_session_token(session_token)?;
     let _guard = DESIRED_STATE_LOCK.lock().await;
     let paths = service_paths()?;
@@ -124,9 +147,20 @@ pub async fn commit_active_owner_session(owner: &AuthenticatedOwner, session_tok
         app_data_root: owner.app_data_root.to_string_lossy().into_owned(),
         generation: generation_state.generation,
         session_token_hash,
+        start_request_hash,
+        start_proxy_outcome: None,
     };
     write_json_atomic(&paths.active_owner_path(), &state).await?;
     Ok(state)
+}
+
+pub(super) async fn persist_start_result(
+    active: &mut ActiveOwnerState,
+    outcome: crate::ProxyApplyOutcome,
+) -> Result<()> {
+    let _guard = DESIRED_STATE_LOCK.lock().await;
+    active.start_proxy_outcome = Some(outcome);
+    write_json_atomic(&service_paths()?.active_owner_path(), active).await
 }
 
 pub async fn clear_active_owner() -> Result<()> {
@@ -146,7 +180,11 @@ pub async fn restore_desired_state() -> Result<()> {
         info!("No active owner to restore");
         return Ok(());
     };
-    let state = load_owner_desired_state(&active_owner.owner_key).await?;
+    let path = service_paths()?
+        .for_owner_key(&active_owner.owner_key)
+        .desired_state_path();
+    let state = read_owner_desired_state_resilient(&path).await;
+    *LIVE_DESIRED_STATE.write() = Some((active_owner.owner_key.clone(), state.clone()));
 
     if !state.core_should_be_running {
         if let Some(writer_config) = state.last_writer_config.as_ref()
@@ -250,16 +288,22 @@ async fn backup_legacy_state_file(path: &std::path::Path) -> Result<Option<std::
 async fn update_owner_desired_state(owner_key: &str, update: impl FnOnce(&mut DesiredState)) -> Result<DesiredState> {
     let _guard = DESIRED_STATE_LOCK.lock().await;
     let path = service_paths()?.for_owner_key(owner_key).desired_state_path();
-    let mut state = read_owner_desired_state_resilient(&path).await;
+    let mut state = load_owner_desired_state(owner_key).await?;
     update(&mut state);
     state.generation = state.generation.saturating_add(1);
     state.updated_at = unix_timestamp_secs();
+    state.persistence_error = None;
+    let mut pending = state.clone();
+    pending.persistence_error = Some("Recovery state persistence is pending".to_owned());
+    *LIVE_DESIRED_STATE.write() = Some((owner_key.to_owned(), pending));
     if let Err(error) = write_json_atomic(&path, &state).await {
+        state.persistence_error = Some(format!("{error:#}"));
         warn!(
             "Failed to persist owner desired state {:?}; continuing with live core state: {error:#}",
             path
         );
     }
+    *LIVE_DESIRED_STATE.write() = Some((owner_key.to_owned(), state.clone()));
     Ok(state)
 }
 
@@ -619,6 +663,10 @@ mod owner_tests {
 
         assert!(state.core_should_be_running);
         assert!(owner_root.join("desired-state.json").is_dir());
+        assert!(state.persistence_error.is_some());
+        let live = load_owner_desired_state(&owner.key).await?;
+        assert!(live.core_should_be_running);
+        assert!(live.persistence_error.is_some());
         std::fs::remove_dir_all(owner_root)?;
         Ok(())
     }

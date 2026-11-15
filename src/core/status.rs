@@ -42,6 +42,7 @@ pub async fn service_status_snapshot(owner: &AuthenticatedOwner) -> Result<Servi
         desired_core_should_be_running: desired.core_should_be_running,
         desired_generation: desired.generation,
         desired_updated_at: desired.updated_at,
+        desired_persistence_error: desired.persistence_error,
     })
 }
 

@@ -1,3 +1,4 @@
+use crate::OwnerIdentity;
 use crate::core::ClashConfig;
 use crate::core::logger::{LOG_RING, set_or_update_writer, write_core_line};
 use crate::core::process::process_identity;
@@ -5,7 +6,6 @@ use crate::core::reconcile::ensure_startup_reconciled;
 use crate::core::runtime::{CoreRuntimeRecord, remove_core_runtime_record, write_core_runtime_record};
 use crate::core::state::set_core_lifecycle_state;
 use crate::core::structure::ServiceLifecycleState;
-use crate::{OwnerIdentity, WriterConfig};
 use anyhow::{Context as _, Result, anyhow};
 use once_cell::sync::Lazy;
 use std::process::Stdio;
@@ -388,8 +388,8 @@ impl CoreManager {
         prepare_core_ipc_socket(&config.core_config.core_ipc_path, &owner)?;
         let args = core_args(&config);
 
-        let mut child_guard =
-            run_with_logging(&config.core_config.core_path, &args, &config.log_config, &owner).await?;
+        set_or_update_writer(&config.log_config)?;
+        let mut child_guard = run_with_logging(&config.core_config.core_path, &args, &owner).await?;
         let child_pid = child_guard.id();
 
         if let Err(error) = child_guard
@@ -604,7 +604,7 @@ impl CoreManager {
                         continue;
                     }
                     let args = core_args(&config);
-                    match run_with_logging(&config.core_config.core_path, &args, &config.log_config, &owner).await {
+                    match run_with_logging(&config.core_config.core_path, &args, &owner).await {
                         Ok(mut new_guard) => {
                             let new_pid = new_guard.id();
                             if let Err(error) = new_guard
@@ -749,18 +749,12 @@ impl CoreManager {
     }
 }
 
-pub async fn run_with_logging(
-    bin_path: &str,
-    args: &[String],
-    writer_config: &WriterConfig,
-    owner: &OwnerIdentity,
-) -> Result<ChildGuard> {
+pub async fn run_with_logging(bin_path: &str, args: &[String], owner: &OwnerIdentity) -> Result<ChildGuard> {
     // Every spawn is checked here rather than at the IPC boundary alone: desired-state
     // restoration and watchdog restarts reach this point without passing through
     // `prepare_runtime`, and state written by an older build can name a path this build refuses.
     let core = crate::core::runtime_generation::validate_core_path(bin_path)?;
     let bin_path = core.executable();
-    set_or_update_writer(writer_config)?;
 
     #[cfg(windows)]
     let child = {
