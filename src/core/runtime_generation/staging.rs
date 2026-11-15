@@ -214,9 +214,7 @@ pub(crate) async fn stage_runtime(
 
     for copy in &plan.copies {
         let target = resolve_in_generation(&generation, &copy.destination)?;
-        let source =
-            super::source::open_runtime_asset(owner, core.trusted_asset_bundle_root().as_deref(), &copy.source)?;
-        if let Err(error) = copy_staged_file(&source, &target).await {
+        if let Err(error) = copy_staged_file(&copy.source, &target).await {
             return Ok(StageRuntimeOutcome::RestartRequired {
                 reason: StageRejection::RuntimeUnwritable {
                     detail: format!("failed to refresh the runtime asset {}: {error}", copy.destination),
@@ -224,7 +222,7 @@ pub(crate) async fn stage_runtime(
             });
         }
         // Re-stat after copying to avoid recording stale source metadata.
-        if source_identity_changed(&source, &copy.identity) {
+        if source_identity_changed(&copy.source, &copy.identity).await {
             return Ok(StageRuntimeOutcome::RestartRequired {
                 reason: StageRejection::RuntimeUnwritable {
                     detail: format!("runtime asset {} changed while it was being copied", copy.destination),
@@ -296,8 +294,8 @@ pub(super) fn modified_nanos(metadata: &std::fs::Metadata) -> Option<u128> {
 }
 
 /// Returns true when source metadata changed or can no longer be read.
-pub(super) fn source_identity_changed(source: &std::fs::File, recorded: &SourceIdentity) -> bool {
-    match source.metadata() {
+pub(super) async fn source_identity_changed(source: &str, recorded: &SourceIdentity) -> bool {
+    match tokio::fs::metadata(source).await {
         Ok(metadata) => metadata.len() != recorded.len || modified_nanos(&metadata) != recorded.mtime_ns,
         Err(_) => true,
     }
@@ -355,36 +353,28 @@ async fn replace_staged_file(staged: &Path, destination: &Path) -> std::io::Resu
     result
 }
 
-pub(super) async fn copy_staged_file(source: &std::fs::File, destination: &Path) -> std::io::Result<()> {
-    use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
+pub(super) async fn copy_staged_file(source: &str, destination: &Path) -> std::io::Result<()> {
     if let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let staged = staging_temp_path(destination);
-    let modified = source.metadata()?.modified().ok();
-    let mut input = tokio::fs::File::from_std(source.try_clone()?);
-    input.seek(std::io::SeekFrom::Start(0)).await?;
-    let result = async {
-        let mut output = tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&staged)
-            .await?;
-        tokio::io::copy(&mut input, &mut output).await?;
-        output.flush().await?;
-        if let Some(modified) = modified
-            && let Err(error) = output.into_std().await.set_modified(modified)
-        {
-            tracing::warn!(destination = ?destination, error = %error, "Failed to keep runtime asset modification time");
-        }
-        Ok::<_, std::io::Error>(())
-    }
-    .await;
-    if let Err(error) = result {
+    if let Err(error) = tokio::fs::copy(source, &staged).await {
         let _ = tokio::fs::remove_file(&staged).await;
         return Err(error);
     }
+    // Only Windows and macOS copies keep the source time, which mihomo's geo updater reads.
+    if cfg!(target_os = "linux")
+        && let Err(error) = keep_source_modified_time(source, &staged).await
+    {
+        tracing::warn!(destination = ?destination, error = %error, "Failed to keep a runtime asset's modification time");
+    }
     replace_staged_file(&staged, destination).await
+}
+
+async fn keep_source_modified_time(source: &str, staged: &Path) -> std::io::Result<()> {
+    let modified = tokio::fs::metadata(source).await?.modified()?;
+    let staged = tokio::fs::OpenOptions::new().write(true).open(staged).await?;
+    staged.into_std().await.set_modified(modified)
 }
 
 pub(super) async fn commit_staged_config(

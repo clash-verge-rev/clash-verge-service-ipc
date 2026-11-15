@@ -135,7 +135,7 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
         let clash_config = prepared.clash_config().clone();
         // Planning is read-only; materialize only after the previous core has stopped.
         prepared
-            .materialize(self.owner)
+            .materialize()
             .await
             .context("failed to materialize the runtime generation")?;
         let mut core_manager = CORE_MANAGER.lock().await;

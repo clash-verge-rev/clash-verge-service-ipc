@@ -27,7 +27,6 @@ pub(crate) struct PreparedRuntime {
     stale_runtime_paths: Vec<PathBuf>,
     plan: super::staging::StagePlan,
     yaml: String,
-    asset_bundle_root: Option<PathBuf>,
 }
 
 impl PreparedRuntime {
@@ -37,15 +36,8 @@ impl PreparedRuntime {
 
     /// Writes the plan after the outgoing core has stopped.
     /// Keeping this separate from planning avoids touching files still held open by that core.
-    pub(crate) async fn materialize(&self, owner: &AuthenticatedOwner) -> Result<(), ServiceError> {
-        materialize_plan(
-            &self.runtime,
-            &self.plan,
-            &self.yaml,
-            owner,
-            self.asset_bundle_root.as_deref(),
-        )
-        .await
+    pub(crate) async fn materialize(&self) -> Result<(), ServiceError> {
+        materialize_plan(&self.runtime, &self.plan, &self.yaml).await
     }
 
     /// Retires directories left by the old per-start layout after a successful start.
@@ -237,7 +229,6 @@ pub(crate) async fn prepare_runtime(
         stale_runtime_paths: Vec::new(),
         plan: plan_runtime_refresh(owner, bundle, &core, &runtime).await?,
         yaml: bundle.yaml.clone(),
-        asset_bundle_root: core.trusted_asset_bundle_root(),
     };
     prepared.stale_runtime_paths = snapshot_stale_runtime_directories(owner_root, &runtime).await;
     Ok(prepared)
@@ -269,13 +260,7 @@ async fn plan_runtime_refresh(
 }
 
 /// Applies a plan, committing `config.yaml` last so partial failure leaves the old configuration.
-async fn materialize_plan(
-    runtime: &Path,
-    plan: &super::staging::StagePlan,
-    yaml: &str,
-    owner: &AuthenticatedOwner,
-    bundle_root: Option<&Path>,
-) -> Result<(), ServiceError> {
+async fn materialize_plan(runtime: &Path, plan: &super::staging::StagePlan, yaml: &str) -> Result<(), ServiceError> {
     // Do not record a source that changed while it was copied.
     let mut manifest = plan.manifest.clone();
     for destination in &plan.required_deletes {
@@ -287,8 +272,7 @@ async fn materialize_plan(
 
     for copy in &plan.copies {
         let target = resolve_in_generation(runtime, &copy.destination)?;
-        let source = super::source::open_runtime_asset(owner, bundle_root, &copy.source)?;
-        super::staging::copy_staged_file(&source, &target)
+        super::staging::copy_staged_file(&copy.source, &target)
             .await
             .map_err(|error| {
                 invalid_asset(format!(
@@ -298,7 +282,7 @@ async fn materialize_plan(
             })?;
         // Re-stat after copying. If the source moved, omit its proof so the next staging retries;
         // a concurrent geo-data update should not fail the current start.
-        if super::staging::source_identity_changed(&source, &copy.identity) {
+        if super::staging::source_identity_changed(&copy.source, &copy.identity).await {
             tracing::warn!(
                 destination = %copy.destination,
                 "Runtime asset changed while being copied; not recording what it was copied from"
@@ -369,11 +353,11 @@ pub(super) async fn gather_bundle(
     let mut sources = Vec::with_capacity(bundle.assets.len());
     let mut asset_keys = std::collections::BTreeSet::new();
     for asset in &bundle.assets {
-        let source = super::source::open_runtime_asset(owner, app_bundle_root.as_deref(), &asset.source)?;
+        let source = validate_source(owner, app_bundle_root.as_deref(), &asset.source)?;
         let destination = destination_key(&validate_destination(&asset.destination)?)?;
-        let metadata = source
-            .metadata()
-            .map_err(|error| invalid_asset(format!("failed to inspect runtime asset {:?}: {error}", asset.source)))?;
+        let metadata = tokio::fs::metadata(&source)
+            .await
+            .map_err(|error| invalid_asset(format!("failed to inspect runtime asset {source:?}: {error}")))?;
         if !asset_keys.insert(destination.clone()) {
             return Err(invalid_asset(format!(
                 "runtime destination {destination:?} is declared as a copied asset twice"
@@ -386,7 +370,7 @@ pub(super) async fn gather_bundle(
             .map(|copy| (copy.len(), super::staging::modified_nanos(&copy)));
         sources.push(super::staging::AssetSource {
             asset: crate::RuntimeAsset {
-                source: asset.source.clone(),
+                source: source.to_string_lossy().into_owned(),
                 destination,
             },
             len: metadata.len(),
@@ -973,7 +957,7 @@ mod tests {
         bundle: &RuntimeBundle,
     ) -> Result<PreparedRuntime, ServiceError> {
         let prepared = prepare_runtime(owner, bundle).await?;
-        prepared.materialize(owner).await?;
+        prepared.materialize().await?;
         Ok(prepared)
     }
 
@@ -1215,7 +1199,7 @@ mod tests {
             "planning must not copy assets into a directory a core is running in"
         );
 
-        planned.materialize(&owner).await?;
+        planned.materialize().await?;
 
         assert_eq!(
             std::fs::read_to_string(&prepared.clash_config.core_config.config_path)?,
@@ -1266,7 +1250,7 @@ mod tests {
             "planning must not replace an asset the running core has open"
         );
 
-        planned.materialize(&owner).await?;
+        planned.materialize().await?;
 
         assert_eq!(
             std::fs::read_to_string(&live.clash_config.core_config.config_path)?,
