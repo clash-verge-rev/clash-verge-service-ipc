@@ -27,8 +27,6 @@ mod desired;
 #[cfg(feature = "standalone")]
 mod installation;
 #[cfg(feature = "standalone")]
-mod legacy_cleanup;
-#[cfg(feature = "standalone")]
 mod logger;
 #[cfg(feature = "standalone")]
 mod maintenance;
@@ -60,8 +58,6 @@ mod test_credentials;
 mod trusted_core_location;
 #[cfg(all(feature = "standalone", unix))]
 mod unix_security;
-#[cfg(all(feature = "standalone", windows))]
-mod windows_legacy_cleanup;
 #[cfg(all(feature = "standalone", windows))]
 mod windows_security;
 

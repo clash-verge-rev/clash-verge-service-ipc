@@ -5,7 +5,6 @@ use crate::core::desired::{
     ActiveOwnerState, clear_active_owner, commit_active_owner_start, load_active_owner, persist_owner_core_started,
     persist_owner_core_stopped, persist_owner_core_stopped_by_key, persist_owner_writer_config, persist_start_result,
 };
-use crate::core::legacy_cleanup::cleanup_legacy_owner_files;
 use crate::core::logger::{LOG_RING, flush_writer, set_or_update_writer};
 use crate::core::manager::{CORE_IPC_READY_TIMEOUT, CORE_MANAGER, CORE_OUTPUT_DRAIN_TIMEOUT};
 use crate::core::paths::service_paths;
@@ -804,9 +803,6 @@ fn create_ipc_router() -> Result<Router> {
                     Ok(result) => result,
                     Err(error) => return service_error(error),
                 };
-                if let Err(error) = cleanup_legacy_owner_files(&owner).await {
-                    warn!("Core start committed, but legacy owner cleanup will be retried later: {error}");
-                }
                 info!("Core started successfully");
                 let result = StartClashResult {
                     session: OwnerSessionHandle {

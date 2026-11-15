@@ -199,6 +199,7 @@ pub(crate) async fn prepare_runtime(
     let owner_paths = ensure_owner_state_directory(&owner.identity)
         .map_err(|error| invalid_asset(format!("failed to secure owner state root: {error:#}")))?;
     let owner_root = owner_paths.root();
+    #[cfg(windows)]
     crate::core::maintenance::persist_owner_identity(&owner.identity, owner_root)
         .await
         .map_err(|error| invalid_asset(format!("failed to persist owner identity: {error:#}")))?;

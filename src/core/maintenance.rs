@@ -78,6 +78,7 @@ pub fn cleanup_stale_owner_state() -> Result<Vec<String>> {
     Ok(removed)
 }
 
+#[cfg(windows)]
 pub(crate) async fn persist_owner_identity(identity: &OwnerIdentity, owner_root: &std::path::Path) -> Result<()> {
     let path = owner_root.join("owner.json");
     let temporary = owner_root.join("owner.json.tmp");

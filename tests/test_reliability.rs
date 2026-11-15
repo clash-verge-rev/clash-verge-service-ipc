@@ -225,3 +225,64 @@ async fn start_server_after_restore() -> Result<tokio::task::JoinHandle<kode_bri
     wait_until("restored listener", async || connect().await.is_ok()).await?;
     Ok(server)
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn unresponsive_helper_takeover_ignores_a_stale_legacy_pid_file() -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let _ = stop_ipc_server().await;
+    let paths = clash_verge_service_ipc::service_paths()?;
+    let copied_helper = std::env::temp_dir().join(format!("service-owner-fixture-{}", std::process::id()));
+    std::fs::copy(common::test_bin_path("owner_lock_holder"), &copied_helper)?;
+    let mut first = tokio::process::Command::new(&copied_helper)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let first_pid = first.id().context("no first helper PID")?;
+    owner_fixture_ready(&mut first).await?;
+    assert!(
+        std::fs::read_to_string(paths.owner_lock_path())?
+            .lines()
+            .any(|line| line == format!("pid={first_pid}"))
+    );
+    let inode = std::fs::metadata(paths.owner_lock_path())?.ino();
+    let mut unrelated = tokio::process::Command::new("/bin/sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()?;
+    std::fs::write(
+        paths.pid_file_path(),
+        unrelated.id().context("no unrelated fixture PID")?.to_string(),
+    )?;
+    let mut second = tokio::process::Command::new(common::test_bin_path("owner_lock_holder"))
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let second_pid = second.id().context("no second helper PID")?;
+    owner_fixture_ready(&mut second).await?;
+    assert!(
+        std::fs::read_to_string(paths.owner_lock_path())?
+            .lines()
+            .any(|line| line == format!("pid={second_pid}"))
+    );
+    assert!(first.wait().await?.code().is_none());
+    assert!(unrelated.try_wait()?.is_none(), "stale PID file redirected termination");
+    assert!(!paths.pid_file_path().exists());
+    assert_eq!(std::fs::metadata(paths.owner_lock_path())?.ino(), inode);
+    second.kill().await?;
+    unrelated.kill().await?;
+    std::fs::remove_file(copied_helper)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn owner_fixture_ready(child: &mut tokio::process::Child) -> Result<()> {
+    use tokio::io::AsyncBufReadExt as _;
+    let stdout = child.stdout.take().context("fixture stdout is unavailable")?;
+    let mut reader = tokio::io::BufReader::new(stdout);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line)).await??;
+    anyhow::ensure!(line == "owner-ready\n", "fixture failed before ownership was ready");
+    Ok(())
+}
