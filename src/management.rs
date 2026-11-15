@@ -4,7 +4,7 @@ use anyhow::bail;
 use anyhow::{Context as _, Result};
 use sha2::{Digest as _, Sha256};
 use std::{
-    io::Read,
+    io::Read as _,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -59,11 +59,7 @@ impl InstallationVerificationError {
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {
-    let file = std::fs::File::open(path)?;
-    sha256_reader(file)
-}
-
-pub(crate) fn sha256_reader(mut file: impl Read) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
     let mut hash = Sha256::new();
     let mut buffer = [0; 65536];
     loop {
