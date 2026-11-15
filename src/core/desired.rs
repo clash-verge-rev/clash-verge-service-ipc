@@ -43,6 +43,21 @@ pub struct ActiveOwnerState {
     pub start_proxy_outcome: Option<crate::ProxyApplyOutcome>,
 }
 
+pub(super) async fn ensure_owner_read_fence(expected: Option<&ActiveOwnerState>) -> Result<()> {
+    let current = load_active_owner().await?;
+    let unchanged = match (expected, current.as_ref()) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => {
+            expected.owner_key == current.owner_key
+                && expected.generation == current.generation
+                && expected.session_token_hash == current.session_token_hash
+        }
+        _ => false,
+    };
+    anyhow::ensure!(unchanged, "active owner session changed while collecting the response");
+    Ok(())
+}
+
 #[cfg(test)]
 impl From<&AuthenticatedOwner> for ActiveOwnerState {
     fn from(owner: &AuthenticatedOwner) -> Self {
@@ -483,6 +498,22 @@ mod owner_tests {
         clear_active_owner().await?;
         std::fs::remove_dir_all(directory)?;
         assert!(!occupied, "a failed restore with no core must permit Sidecar handoff");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn owner_read_fence_rejects_a_b_a_session_changes() -> anyhow::Result<()> {
+        let a = test_owner(93_101);
+        let b = test_owner(93_102);
+        let first = commit_active_owner_session(&a, &"91".repeat(32)).await?;
+        super::ensure_owner_read_fence(Some(&first)).await?;
+        commit_active_owner_session(&b, &"92".repeat(32)).await?;
+        assert!(super::ensure_owner_read_fence(Some(&first)).await.is_err());
+        let last = commit_active_owner_session(&a, &"93".repeat(32)).await?;
+        assert!(super::ensure_owner_read_fence(Some(&first)).await.is_err());
+        super::ensure_owner_read_fence(Some(&last)).await?;
+        clear_active_owner().await?;
         Ok(())
     }
 

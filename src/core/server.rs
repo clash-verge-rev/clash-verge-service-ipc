@@ -2,8 +2,9 @@ use crate::core::auth::{
     AuthenticatedOwner, ServiceError, authenticate_owner, hash_session_token, ipc_request_context_to_auth_context,
 };
 use crate::core::desired::{
-    ActiveOwnerState, clear_active_owner, commit_active_owner_start, load_active_owner, persist_owner_core_started,
-    persist_owner_core_stopped, persist_owner_core_stopped_by_key, persist_owner_writer_config, persist_start_result,
+    ActiveOwnerState, clear_active_owner, commit_active_owner_start, ensure_owner_read_fence, load_active_owner,
+    persist_owner_core_started, persist_owner_core_stopped, persist_owner_core_stopped_by_key,
+    persist_owner_writer_config, persist_start_result,
 };
 use crate::core::logger::{LOG_RING, flush_writer, set_or_update_writer};
 use crate::core::manager::{CORE_IPC_READY_TIMEOUT, CORE_MANAGER, CORE_OUTPUT_DRAIN_TIMEOUT};
@@ -30,7 +31,7 @@ use std::{
     ops::ControlFlow,
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, MutexGuard, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, trace, warn};
 
@@ -145,7 +146,7 @@ impl OwnerProxyTransition for StartOwnerTransition<'_> {
             .materialize(self.owner)
             .await
             .context("failed to materialize the runtime generation")?;
-        let core_manager = CORE_MANAGER.lock().await;
+        let mut core_manager = CORE_MANAGER.lock().await;
         let start_result = core_manager.start_core(clash_config, self.owner.identity.clone()).await;
         drop(core_manager);
         if let Err(error) = start_result {
@@ -664,32 +665,6 @@ where
     ControlFlow::Continue((request, owner))
 }
 
-/// Authentication state required after acquiring the owner lifecycle lock.
-enum OwnerLifecycleGate<'a> {
-    /// No active owner is required.
-    Unchecked,
-    /// The authenticated owner must be active.
-    ActiveOwner,
-    ActiveSession(&'a OwnerSessionProof),
-}
-
-/// Acquires `OWNER_LIFECYCLE_LOCK`, applies the gate, and returns the guard to the caller.
-async fn enter_owner_lifecycle(
-    owner: &AuthenticatedOwner,
-    gate: OwnerLifecycleGate<'_>,
-) -> ControlFlow<Result<HttpResponse>, MutexGuard<'static, ()>> {
-    let lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
-    let gated = match gate {
-        OwnerLifecycleGate::Unchecked => Ok(()),
-        OwnerLifecycleGate::ActiveOwner => require_active_owner(owner).await,
-        OwnerLifecycleGate::ActiveSession(proof) => require_active_session(owner, proof).await.map(|_| ()),
-    };
-    match gated {
-        Ok(()) => ControlFlow::Continue(lifecycle_guard),
-        Err(error) => ControlFlow::Break(service_error(error)),
-    }
-}
-
 fn create_ipc_router() -> Result<Router> {
     let router = Router::new()
         .get(IpcCommand::Magic.as_ref(), |ctx| async move {
@@ -710,7 +685,6 @@ fn create_ipc_router() -> Result<Router> {
                 Ok(requirements) => requirements,
                 Err(error) => return bad_request(format!("Invalid core requirements: {error}")),
             };
-            let _guard = OWNER_LIFECYCLE_LOCK.lock().await;
             // Omitting this header retains the original response with a service digest.
             let include_service_digest = ctx.headers.get("X-Service-Digest").is_none_or(|value| value != "false");
             match crate::core::installation::inspect(&requirements, include_service_digest).await {
@@ -722,10 +696,6 @@ fn create_ipc_router() -> Result<Router> {
             trace!("Received Status command");
             let (_request, owner) = match authenticate_request::<AuthenticatedRequest<()>>(&ctx) {
                 ControlFlow::Continue(authenticated) => authenticated,
-                ControlFlow::Break(response) => return response,
-            };
-            let _lifecycle_guard = match enter_owner_lifecycle(&owner, OwnerLifecycleGate::Unchecked).await {
-                ControlFlow::Continue(guard) => guard,
                 ControlFlow::Break(response) => return response,
             };
             match service_status_snapshot(&owner).await {
@@ -823,11 +793,15 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Continue(authenticated) => authenticated,
                 ControlFlow::Break(response) => return response,
             };
-            let _lifecycle_guard = match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveOwner).await {
-                ControlFlow::Continue(guard) => guard,
-                ControlFlow::Break(response) => return response,
+            let active = match require_active_owner(&owner).await {
+                Ok(active) => active,
+                Err(error) => return service_error(error),
             };
-            ok_json(LOG_RING.get_logs())
+            let logs = LOG_RING.get_logs();
+            if let Err(error) = ensure_owner_read_fence(Some(&active)).await {
+                return service_unavailable(error.to_string());
+            }
+            ok_json(logs)
         })
         .get(IpcCommand::GetClashLogSnapshot.as_ref(), |ctx| async move {
             trace!("Received GetClashLogSnapshot command");
@@ -835,9 +809,9 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Continue(authenticated) => authenticated,
                 ControlFlow::Break(response) => return response,
             };
-            let _lifecycle_guard = match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveOwner).await {
-                ControlFlow::Continue(guard) => guard,
-                ControlFlow::Break(response) => return response,
+            let active = match require_active_owner(&owner).await {
+                Ok(active) => active,
+                Err(error) => return service_error(error),
             };
             let paths = match service_paths() {
                 Ok(paths) => paths,
@@ -845,7 +819,12 @@ fn create_ipc_router() -> Result<Router> {
             };
             let path = paths.for_owner(&owner.identity).logs_dir().join("service_latest.log");
             match read_log_snapshot(&path).await {
-                Ok(snapshot) => ok_json(snapshot),
+                Ok(snapshot) => {
+                    if let Err(error) = ensure_owner_read_fence(Some(&active)).await {
+                        return service_unavailable(error.to_string());
+                    }
+                    ok_json(snapshot)
+                }
                 Err(error) => service_unavailable(format!("Failed to read core log snapshot: {error}")),
             }
         })
@@ -908,11 +887,10 @@ fn create_ipc_router() -> Result<Router> {
                 ControlFlow::Break(response) => return response,
             };
             // Reads require the session that owns the running core.
-            let _lifecycle_guard =
-                match enter_owner_lifecycle(&owner, OwnerLifecycleGate::ActiveSession(&request.session)).await {
-                    ControlFlow::Continue(guard) => guard,
-                    ControlFlow::Break(response) => return response,
-                };
+            let _lifecycle_guard = OWNER_LIFECYCLE_LOCK.lock().await;
+            if let Err(error) = require_active_session(&owner, &request.session).await {
+                return service_error(error);
+            }
             match read_runtime_file(&owner, &request.payload.destination, request.payload.offset).await {
                 Ok(outcome) => ok_json(outcome),
                 Err(error) => service_error(error),
@@ -987,7 +965,7 @@ async fn read_log_snapshot(path: &std::path::Path) -> std::io::Result<String> {
         file.seek(std::io::SeekFrom::Start(length - MAX_SNAPSHOT_BYTES)).await?;
     }
     let mut content = Vec::with_capacity(length.min(MAX_SNAPSHOT_BYTES) as usize);
-    file.read_to_end(&mut content).await?;
+    file.take(MAX_SNAPSHOT_BYTES).read_to_end(&mut content).await?;
     if length > MAX_SNAPSHOT_BYTES
         && let Some(first_newline) = content.iter().position(|byte| *byte == b'\n')
     {
@@ -1028,16 +1006,12 @@ fn service_error(error: ServiceError) -> Result<HttpResponse> {
     json_response::<()>(status, error.code as u16, error.message, None)
 }
 
-async fn require_active_owner(owner: &crate::core::auth::AuthenticatedOwner) -> std::result::Result<(), ServiceError> {
-    if load_active_owner()
+async fn require_active_owner(owner: &AuthenticatedOwner) -> std::result::Result<ActiveOwnerState, ServiceError> {
+    load_active_owner()
         .await
         .map_err(|_| ServiceError::not_active())?
-        .is_some_and(|active| active.owner_key == owner.key)
-    {
-        Ok(())
-    } else {
-        Err(ServiceError::not_active())
-    }
+        .filter(|active| active.owner_key == owner.key)
+        .ok_or_else(ServiceError::not_active)
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -1127,7 +1101,7 @@ mod owner_lifecycle_tests {
 
     #[tokio::test]
     #[serial]
-    async fn admitted_mutation_survives_deadline_and_is_drained_on_shutdown() -> anyhow::Result<()> {
+    async fn admitted_mutation_survives_caller_cancellation_and_is_drained_on_shutdown() -> anyhow::Result<()> {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1157,6 +1131,34 @@ mod owner_lifecycle_tests {
         assert!(completed.load(std::sync::atomic::Ordering::Acquire));
         let rejected = super::run_owner_mutation(async { panic!("shutdown admitted a mutation") }).await?;
         assert_eq!(rejected.status, http::StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn handler_deadline_does_not_cancel_an_admitted_operation() -> anyhow::Result<()> {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        super::OWNER_OPERATIONS.lock().accepting = true;
+        let observed = committed.clone();
+        let handler = tokio::spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                super::run_owner_mutation(async move {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                    observed.store(true, std::sync::atomic::Ordering::Release);
+                    super::ok_empty("committed")
+                }),
+            )
+            .await
+        });
+        entered_rx.await?;
+        assert!(handler.await?.is_err());
+        let _ = release_tx.send(());
+        super::drain_owner_operations().await;
+        assert!(committed.load(std::sync::atomic::Ordering::Acquire));
         Ok(())
     }
 

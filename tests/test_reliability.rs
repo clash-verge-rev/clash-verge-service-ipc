@@ -286,3 +286,129 @@ async fn owner_fixture_ready(child: &mut tokio::process::Child) -> Result<()> {
     anyhow::ensure!(line == "owner-ready\n", "fixture failed before ownership was ready");
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn status_and_logs_do_not_wait_for_another_owners_start() -> Result<()> {
+    let server = start_server().await?;
+    clash_verge_service_ipc::set_config(Some(clash_verge_service_ipc::IpcConfig {
+        default_timeout: Duration::from_secs(1),
+        max_retries: 20,
+        retry_delay: Duration::from_millis(500),
+    }))
+    .await;
+    let root = std::env::temp_dir().join(format!("service-status-start-{}", std::process::id()));
+    let a = clash_verge_service_ipc::test_owner_credentials_for_uid(&root.join("a"), 93_201)?;
+    let b = clash_verge_service_ipc::test_owner_credentials_for_uid(&root.join("b"), 93_202)?;
+    let gate = root.join("core.gate");
+    let mut request = StartClashRequest {
+        runtime: RuntimeBundle {
+            yaml: "mode: direct\n".into(),
+            assets: Vec::new(),
+            remote_providers: Vec::new(),
+            core_path: common::test_bin_path("crash_binary").to_string_lossy().into_owned(),
+        },
+        proposed_session_token: "94".repeat(32),
+        macos_proxy: None,
+    };
+    let first = start_clash(&a, &request).await?;
+    anyhow::ensure!(first.code == 0, "{}", first.message);
+    wait_until("first owner crash recovery", async || {
+        get_status(&a)
+            .await
+            .ok()
+            .and_then(|reply| reply.data)
+            .is_some_and(|status| status.restart_count > 0)
+    })
+    .await?;
+    request.runtime.core_path = common::test_bin_path("mock_binary").to_string_lossy().into_owned();
+    request.runtime.yaml = format!("mode: direct\nfixture-ready-gate: {}\n", gate.display());
+    request.proposed_session_token = "95".repeat(32);
+    let credentials = b.clone();
+    let start = tokio::spawn(async move { start_clash(&credentials, &request).await });
+    wait_until("blocked core readiness", async || {
+        gate.with_extension("waiting").exists()
+    })
+    .await?;
+    let status = tokio::time::timeout(Duration::from_millis(500), get_status(&a)).await;
+    let logs = tokio::time::timeout(Duration::from_millis(500), clash_verge_service_ipc::get_clash_logs(&a)).await;
+    std::fs::write(&gate, b"ready")?;
+    let started = start.await??;
+    anyhow::ensure!(started.code == 0, "{}", started.message);
+    let session = OwnerSessionProof {
+        generation: started.data.context("no start result")?.session.generation,
+        token: "95".repeat(32),
+    };
+    let new_owner_status = get_status(&b).await?.data.context("no new owner status")?;
+    assert_eq!(stop_clash(&b, &session).await?.code, 0);
+    stop_server(server).await?;
+    clash_verge_service_ipc::set_config(None).await;
+    std::fs::remove_dir_all(root)?;
+    let status = status
+        .context("Status waited for Start's lifecycle/manager lock")??
+        .data
+        .context("no status")?;
+    assert_eq!(new_owner_status.restart_count, 0);
+    assert_eq!(new_owner_status.last_core_exit_reason, None);
+    assert!(!status.is_active);
+    assert_eq!(status.core_pid, None);
+    assert_eq!(status.last_core_exit_reason, None);
+    assert_eq!(
+        logs.context("logs waited for Start's lifecycle lock")??.code,
+        clash_verge_service_ipc::ServiceErrorCode::NotActive as u16
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn cancelled_start_is_owned_until_shutdown_finishes_and_reaps_the_core() -> Result<()> {
+    let server = start_server().await?;
+    let credentials = common::owner_credentials();
+    let root = std::env::temp_dir().join(format!("service-cancel-start-{}", std::process::id()));
+    std::fs::create_dir_all(&root)?;
+    let gate = root.join("core.gate");
+    let request = StartClashRequest {
+        runtime: RuntimeBundle {
+            yaml: format!("mode: direct\nfixture-ready-gate: {}\n", gate.display()),
+            assets: Vec::new(),
+            remote_providers: Vec::new(),
+            core_path: common::test_bin_path("mock_binary").to_string_lossy().into_owned(),
+        },
+        proposed_session_token: "96".repeat(32),
+        macos_proxy: None,
+    };
+    let caller_credentials = credentials.clone();
+    let caller = tokio::spawn(async move { start_clash(&caller_credentials, &request).await });
+    wait_until("admitted core startup", async || {
+        gate.with_extension("waiting").exists()
+    })
+    .await?;
+    let pid: i32 = std::fs::read_to_string(gate.with_extension("waiting"))?.parse()?;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    let shutdown = tokio::spawn(stop_ipc_server());
+    tokio::task::yield_now().await;
+    let draining = !shutdown.is_finished();
+    std::fs::write(&gate, b"ready")?;
+    shutdown.await??;
+    server.await??;
+    assert!(draining, "shutdown did not wait for the admitted Start");
+    assert_ne!(unsafe { platform_lib::kill(pid, 0) }, 0, "core survived shutdown");
+    assert!(!std::path::Path::new(clash_verge_service_ipc::IPC_PATH).exists());
+    assert!(!std::path::Path::new(&clash_verge_service_ipc::mihomo_ipc_path(&credentials.identity)).exists());
+    let active = clash_verge_service_ipc::load_active_owner()
+        .await?
+        .context("cancelled Start lost its recoverable owner")?;
+    let session = OwnerSessionProof {
+        generation: active.generation,
+        token: "96".repeat(32),
+    };
+    let server = start_server().await?;
+    assert_eq!(stop_clash(&credentials, &session).await?.code, 0);
+    stop_server(server).await?;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}

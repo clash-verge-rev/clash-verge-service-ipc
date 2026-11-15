@@ -9,12 +9,9 @@ use crate::core::structure::ServiceLifecycleState;
 use anyhow::{Context as _, Result, anyhow};
 use once_cell::sync::Lazy;
 use std::process::Stdio;
+use std::sync::Arc;
 #[cfg(feature = "test")]
 use std::sync::Mutex as StdMutex;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU32, AtomicU64, Ordering},
-};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncBufReadExt;
 use tokio::{io::BufReader, process::Command};
@@ -288,14 +285,6 @@ fn unix_timestamp_secs() -> u64 {
         .unwrap_or_default()
 }
 
-fn non_zero_u32(value: u32) -> Option<u32> {
-    (value != 0).then_some(value)
-}
-
-fn non_zero_u64(value: u64) -> Option<u64> {
-    (value != 0).then_some(value)
-}
-
 async fn write_runtime_record_for_config(pid: Option<u32>, config: &ClashConfig, context: &'static str) -> Result<()> {
     let pid = pid.context("spawned core did not expose a process ID")?;
     let identity =
@@ -310,20 +299,15 @@ async fn write_runtime_record_for_config(pid: Option<u32>, config: &ClashConfig,
 }
 
 pub struct CoreManager {
-    running_pid: Arc<AtomicU32>,
-    running_config: Mutex<Option<ClashConfig>>,
-    core_start_time: Arc<Mutex<Option<Instant>>>,
-    core_started_at: Arc<AtomicU64>,
-    last_core_exit_reason: Arc<Mutex<Option<String>>>,
-    restart_count: Arc<AtomicU32>,
-    last_recovery_at: Arc<AtomicU64>,
-    watchdog_shutdown: Mutex<Option<oneshot::Sender<Option<Instant>>>>,
-    watchdog_handle: Mutex<Option<JoinHandle<Result<()>>>>,
+    status: Arc<parking_lot::RwLock<CoreStatusSnapshot>>,
+    running_config: Option<ClashConfig>,
+    watchdog_shutdown: Option<oneshot::Sender<Option<Instant>>>,
+    watchdog_handle: Option<JoinHandle<Result<()>>>,
     failed_child: Arc<Mutex<Option<ChildGuard>>>,
-    execution: Mutex<Option<std::sync::Arc<crate::execution::CoreExecutionGuard>>>,
+    execution: Option<Arc<crate::execution::CoreExecutionGuard>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct CoreStatusSnapshot {
     pub(super) core_pid: Option<u32>,
     pub(super) core_started_at: Option<u64>,
@@ -332,53 +316,60 @@ pub(super) struct CoreStatusSnapshot {
     pub(super) last_recovery_at: Option<u64>,
 }
 
+impl CoreStatusSnapshot {
+    fn started(&mut self, pid: Option<u32>) {
+        self.core_pid = pid;
+        self.core_started_at = Some(unix_timestamp_secs());
+    }
+
+    fn stopped(&mut self) {
+        self.core_pid = None;
+        self.core_started_at = None;
+    }
+}
+
+static CORE_STATUS: Lazy<Arc<parking_lot::RwLock<CoreStatusSnapshot>>> =
+    Lazy::new(|| Arc::new(parking_lot::RwLock::new(CoreStatusSnapshot::default())));
+
+pub(super) fn core_status_snapshot() -> CoreStatusSnapshot {
+    CORE_STATUS.read().clone()
+}
+
 impl CoreManager {
     fn new() -> Self {
-        CoreManager {
-            running_pid: Arc::new(AtomicU32::new(0)),
-            running_config: Mutex::new(None),
-            core_start_time: Arc::new(Mutex::new(None)),
-            core_started_at: Arc::new(AtomicU64::new(0)),
-            last_core_exit_reason: Arc::new(Mutex::new(None)),
-            restart_count: Arc::new(AtomicU32::new(0)),
-            last_recovery_at: Arc::new(AtomicU64::new(0)),
-            watchdog_shutdown: Mutex::new(None),
-            watchdog_handle: Mutex::new(None),
+        Self {
+            status: Arc::clone(&CORE_STATUS),
+            running_config: None,
+            watchdog_shutdown: None,
+            watchdog_handle: None,
             failed_child: Arc::new(Mutex::new(None)),
-            execution: Mutex::new(None),
+            execution: None,
         }
     }
 
-    /// Returns the live core's PID and configuration from one consistent read.
-    /// The configuration guard must be acquired before reading the PID because the watchdog can
-    /// clear it without holding that guard.
-    pub(super) async fn running_core_config(&self) -> Option<(u32, ClashConfig)> {
-        let config = self.running_config.lock().await;
-        let pid = self.running_pid.load(Ordering::Acquire);
-        if pid == 0 {
-            return None;
-        }
-        config.clone().map(|config| (pid, config))
+    pub(super) fn running_core_config(&self) -> Option<(u32, ClashConfig)> {
+        let pid = self.status.read().core_pid?;
+        self.running_config.clone().map(|config| (pid, config))
     }
 
-    pub async fn start_core(&self, config: ClashConfig, owner: OwnerIdentity) -> Result<()> {
+    pub async fn start_core(&mut self, config: ClashConfig, owner: OwnerIdentity) -> Result<()> {
         ensure_startup_reconciled()?;
         set_core_lifecycle_state(ServiceLifecycleState::Starting);
-        if self.running_pid.load(Ordering::Relaxed) != 0 || self.execution.lock().await.is_some() {
+        if self.status.read().core_pid.is_some() || self.execution.is_some() {
             info!("Core is already running, stopping existing instance");
             self.stop_core().await?;
         }
 
         let execution = std::sync::Arc::new(crate::execution::CoreExecutionGuard::acquire()?);
         let result = self.start_reserved_core(config, owner, execution.clone()).await;
-        if result.is_ok() || self.running_pid.load(Ordering::Acquire) != 0 {
-            *self.execution.lock().await = Some(execution);
+        if result.is_ok() || self.status.read().core_pid.is_some() {
+            self.execution = Some(execution);
         }
         result
     }
 
     async fn start_reserved_core(
-        &self,
+        &mut self,
         config: ClashConfig,
         owner: OwnerIdentity,
         execution: Arc<crate::execution::CoreExecutionGuard>,
@@ -398,11 +389,8 @@ impl CoreManager {
         {
             // Never became ready: kill at once.
             if let Err(kill_error) = child_guard.terminate(Duration::ZERO).await {
-                let now_secs = unix_timestamp_secs();
-                self.running_pid.store(child_pid.unwrap_or_default(), Ordering::Release);
-                *self.running_config.lock().await = Some(config.clone());
-                *self.core_start_time.lock().await = Some(Instant::now());
-                self.core_started_at.store(now_secs, Ordering::Relaxed);
+                self.status.write().started(child_pid);
+                self.running_config = Some(config.clone());
                 if let Err(record_error) =
                     write_runtime_record_for_config(child_pid, &config, "after failed initial cleanup").await
                 {
@@ -419,11 +407,8 @@ impl CoreManager {
 
         if let Err(record_error) = write_runtime_record_for_config(child_pid, &config, "after start").await {
             if let Err(kill_error) = child_guard.terminate(Duration::ZERO).await {
-                let now_secs = unix_timestamp_secs();
-                self.running_pid.store(child_pid.unwrap_or_default(), Ordering::Release);
-                *self.running_config.lock().await = Some(config.clone());
-                *self.core_start_time.lock().await = Some(Instant::now());
-                self.core_started_at.store(now_secs, Ordering::Relaxed);
+                self.status.write().started(child_pid);
+                self.running_config = Some(config.clone());
                 *self.failed_child.lock().await = Some(child_guard);
                 set_core_lifecycle_state(ServiceLifecycleState::Fatal);
                 return Err(anyhow!(
@@ -433,23 +418,25 @@ impl CoreManager {
             return Err(record_error);
         }
 
-        *self.core_start_time.lock().await = Some(Instant::now());
-        self.core_started_at.store(unix_timestamp_secs(), Ordering::Relaxed);
-        self.running_pid.store(child_pid.unwrap_or_default(), Ordering::Release);
-        *self.running_config.lock().await = Some(config.clone());
+        {
+            let mut status = self.status.write();
+            *status = CoreStatusSnapshot::default();
+            status.started(child_pid);
+        }
+        self.running_config = Some(config.clone());
 
-        self.start_watchdog(child_guard, config, owner, execution).await;
+        self.start_watchdog(child_guard, config, owner, execution);
         set_core_lifecycle_state(ServiceLifecycleState::Running);
 
         Ok(())
     }
 
-    pub async fn stop_core(&self) -> Result<()> {
+    pub async fn stop_core(&mut self) -> Result<()> {
         self.stop_core_by(None).await
     }
 
     /// Stops the core; IPC handlers pass the deadline by which it must be SIGKILLed.
-    pub(super) async fn stop_core_by(&self, kill_by: Option<Instant>) -> Result<()> {
+    pub(super) async fn stop_core_by(&mut self, kill_by: Option<Instant>) -> Result<()> {
         info!("Stopping core");
         LOG_RING.clear_logs();
 
@@ -468,11 +455,8 @@ impl CoreManager {
             watchdog_result?;
         }
 
-        self.running_pid.store(0, Ordering::Release);
-        *self.core_start_time.lock().await = None;
-        self.core_started_at.store(0, Ordering::Relaxed);
-
-        let start_clash = self.running_config.lock().await.take();
+        self.status.write().stopped();
+        let start_clash = self.running_config.take();
         let core_ipc_path = start_clash
             .as_ref()
             .map(|config| config.core_config.core_ipc_path.clone());
@@ -489,19 +473,14 @@ impl CoreManager {
         Ok(())
     }
 
-    async fn start_watchdog(
-        &self,
+    fn start_watchdog(
+        &mut self,
         child_guard: ChildGuard,
         config: ClashConfig,
         owner: OwnerIdentity,
         execution: Arc<crate::execution::CoreExecutionGuard>,
     ) {
-        let running_pid_arc = Arc::clone(&self.running_pid);
-        let start_time_arc = Arc::clone(&self.core_start_time);
-        let started_at_arc = Arc::clone(&self.core_started_at);
-        let last_exit_reason_arc = Arc::clone(&self.last_core_exit_reason);
-        let restart_count_arc = Arc::clone(&self.restart_count);
-        let last_recovery_at_arc = Arc::clone(&self.last_recovery_at);
+        let shared_status = Arc::clone(&self.status);
         let failed_child_arc = Arc::clone(&self.failed_child);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let watchdog_config = watchdog_config();
@@ -513,6 +492,7 @@ impl CoreManager {
             let mut shutdown_rx = shutdown_rx;
             let mut restart_timestamps: Vec<Instant> = Vec::new();
             let mut consecutive_attempt = 0u32;
+            let mut core_started = Instant::now();
 
             'watchdog: loop {
                 let Some(mut current_guard) = child_guard.take() else {
@@ -550,16 +530,17 @@ impl CoreManager {
                     }
                 };
 
-                let uptime = start_time_arc.lock().await.map(|t| t.elapsed()).unwrap_or_default();
-                let exit_reason = log_core_exit(&status, uptime);
-                *last_exit_reason_arc.lock().await = Some(exit_reason);
+                let exit_reason = log_core_exit(&status, core_started.elapsed());
+                {
+                    let mut status = shared_status.write();
+                    status.last_core_exit_reason = Some(exit_reason);
+                    status.stopped();
+                }
                 set_core_lifecycle_state(ServiceLifecycleState::RecoveringCore);
 
                 // Dropping the guard cancels its readers.
                 current_guard.drain_output().await;
                 let _ = current_guard.take();
-                running_pid_arc.store(0, Ordering::Release);
-                started_at_arc.store(0, Ordering::Relaxed);
                 remove_core_runtime_record().await;
 
                 let now = Instant::now();
@@ -614,10 +595,7 @@ impl CoreManager {
                                 error!("Failed to secure restarted core IPC: {error:#}");
                                 if let Err(kill_error) = new_guard.terminate(Duration::ZERO).await {
                                     error!("Failed to terminate core after IPC hardening failure: {kill_error:#}");
-                                    let now_secs = unix_timestamp_secs();
-                                    running_pid_arc.store(new_pid.unwrap_or_default(), Ordering::Release);
-                                    *start_time_arc.lock().await = Some(Instant::now());
-                                    started_at_arc.store(now_secs, Ordering::Relaxed);
+                                    shared_status.write().started(new_pid);
                                     if let Err(record_error) = write_runtime_record_for_config(
                                         new_pid,
                                         &config,
@@ -645,10 +623,7 @@ impl CoreManager {
                             {
                                 error!("Failed to commit restarted core runtime: {record_error:#}");
                                 if let Err(kill_error) = new_guard.terminate(Duration::ZERO).await {
-                                    let now_secs = unix_timestamp_secs();
-                                    running_pid_arc.store(new_pid.unwrap_or_default(), Ordering::Release);
-                                    *start_time_arc.lock().await = Some(Instant::now());
-                                    started_at_arc.store(now_secs, Ordering::Relaxed);
+                                    shared_status.write().started(new_pid);
                                     *failed_child_arc.lock().await = Some(new_guard);
                                     set_core_lifecycle_state(ServiceLifecycleState::Fatal);
                                     return Err(anyhow!(
@@ -658,12 +633,13 @@ impl CoreManager {
                                 recovery_exhausted = true;
                                 break 'watchdog;
                             }
-                            running_pid_arc.store(new_pid.unwrap_or_default(), Ordering::Release);
-                            *start_time_arc.lock().await = Some(Instant::now());
-                            let now_secs = unix_timestamp_secs();
-                            started_at_arc.store(now_secs, Ordering::Relaxed);
-                            restart_count_arc.fetch_add(1, Ordering::Relaxed);
-                            last_recovery_at_arc.store(now_secs, Ordering::Relaxed);
+                            core_started = Instant::now();
+                            {
+                                let mut status = shared_status.write();
+                                status.started(new_pid);
+                                status.restart_count = status.restart_count.saturating_add(1);
+                                status.last_recovery_at = Some(unix_timestamp_secs());
+                            }
                             consecutive_attempt += 1;
                             info!("Core restarted successfully (attempt #{})", consecutive_attempt);
                             set_core_lifecycle_state(ServiceLifecycleState::Running);
@@ -681,9 +657,7 @@ impl CoreManager {
                 }
             }
 
-            running_pid_arc.store(0, Ordering::Release);
-            *start_time_arc.lock().await = None;
-            started_at_arc.store(0, Ordering::Relaxed);
+            shared_status.write().stopped();
             remove_core_runtime_record().await;
             if recovery_exhausted {
                 set_core_lifecycle_state(ServiceLifecycleState::Fatal);
@@ -691,19 +665,18 @@ impl CoreManager {
             Ok(())
         });
 
-        *self.watchdog_shutdown.lock().await = Some(shutdown_tx);
-        *self.watchdog_handle.lock().await = Some(handle);
+        self.watchdog_shutdown = Some(shutdown_tx);
+        self.watchdog_handle = Some(handle);
     }
 
-    async fn stop_watchdog(&self, kill_by: Option<Instant>) -> Result<()> {
-        if let Some(shutdown_tx) = self.watchdog_shutdown.lock().await.take() {
+    async fn stop_watchdog(&mut self, kill_by: Option<Instant>) -> Result<()> {
+        if let Some(shutdown_tx) = self.watchdog_shutdown.take() {
             let _ = shutdown_tx.send(kill_by);
         }
 
-        let mut handle = self.watchdog_handle.lock().await;
-        if let Some(task) = handle.as_mut() {
+        if let Some(task) = self.watchdog_handle.as_mut() {
             let result = task.await;
-            handle.take();
+            self.watchdog_handle.take();
             result.context("watchdog task failed to join")??;
             info!("Watchdog stopped");
         }
@@ -711,18 +684,8 @@ impl CoreManager {
         Ok(())
     }
 
-    pub(super) async fn status(&self) -> CoreStatusSnapshot {
-        CoreStatusSnapshot {
-            core_pid: non_zero_u32(self.running_pid.load(Ordering::Relaxed)),
-            core_started_at: non_zero_u64(self.core_started_at.load(Ordering::Relaxed)),
-            last_core_exit_reason: self.last_core_exit_reason.lock().await.clone(),
-            restart_count: self.restart_count.load(Ordering::Relaxed),
-            last_recovery_at: non_zero_u64(self.last_recovery_at.load(Ordering::Relaxed)),
-        }
-    }
-
-    async fn after_stop(&self, core_ipc_path: Option<String>) {
-        self.execution.lock().await.take();
+    async fn after_stop(&mut self, core_ipc_path: Option<String>) {
+        self.execution.take();
         #[cfg(unix)]
         {
             use std::path::Path;

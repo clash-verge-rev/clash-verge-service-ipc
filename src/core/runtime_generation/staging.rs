@@ -174,7 +174,7 @@ pub(crate) async fn stage_runtime(
     owner: &AuthenticatedOwner,
     bundle: &RuntimeBundle,
 ) -> Result<StageRuntimeOutcome, ServiceError> {
-    let Some((core_pid, running)) = CORE_MANAGER.lock().await.running_core_config().await else {
+    let Some((core_pid, running)) = CORE_MANAGER.lock().await.running_core_config() else {
         return Ok(StageRuntimeOutcome::RestartRequired {
             reason: StageRejection::CoreNotRunning,
         });
@@ -235,14 +235,7 @@ pub(crate) async fn stage_runtime(
 
     // The watchdog can replace the core without the lifecycle lock. Never commit provenance built
     // for an earlier process; force a clean restart instead.
-    if CORE_MANAGER
-        .lock()
-        .await
-        .running_core_config()
-        .await
-        .map(|(pid, _)| pid)
-        != Some(core_pid)
-    {
+    if CORE_MANAGER.lock().await.running_core_config().map(|(pid, _)| pid) != Some(core_pid) {
         return Ok(StageRuntimeOutcome::RestartRequired {
             reason: StageRejection::CoreRestarted,
         });

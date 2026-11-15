@@ -2,7 +2,7 @@ use crate::core::runtime_generation::approved_core_copy;
 use crate::core::trusted_core_location::require_trusted_core_location;
 use crate::core::{
     desired::{load_active_owner, load_owner_desired_state},
-    manager::CORE_MANAGER,
+    manager::core_status_snapshot,
     paths::service_paths,
 };
 use crate::{CoreAvailability, CoreInspection, CoreRequirement, InstallationStatus, ProtocolInfo};
@@ -17,9 +17,8 @@ pub(super) async fn inspect(
         Some(owner) => load_owner_desired_state(&owner.owner_key).await?.core_should_be_running,
         None => false,
     };
-    let core_busy = recovering
-        || CORE_MANAGER.lock().await.status().await.core_pid.is_some()
-        || crate::execution::CoreExecutionGuard::is_held()?;
+    let core_busy =
+        recovering || core_status_snapshot().core_pid.is_some() || crate::execution::CoreExecutionGuard::is_held()?;
     let requirements = requirements.to_vec();
     tokio::task::spawn_blocking(move || {
         let directory = service_paths()?.core_dir();
