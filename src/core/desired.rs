@@ -148,22 +148,24 @@ pub async fn restore_desired_state() -> Result<()> {
     };
     let state = load_owner_desired_state(&active_owner.owner_key).await?;
 
-    if let Some(writer_config) = state.last_writer_config.as_ref()
-        && let Err(error) = set_or_update_writer(writer_config)
-    {
-        warn!("Failed to restore writer config: {}", error);
-    }
-
     if !state.core_should_be_running {
+        if let Some(writer_config) = state.last_writer_config.as_ref()
+            && let Err(error) = set_or_update_writer(writer_config)
+        {
+            warn!("Failed to restore writer config: {error}");
+        }
         info!("Desired state does not require core restore");
         return Ok(());
     }
 
-    let Some(config) = state.last_clash_config else {
+    let Some(mut config) = state.last_clash_config else {
         warn!("Desired state requests core restore but has no ClashConfig");
         return Ok(());
     };
 
+    if let Some(writer_config) = state.last_writer_config {
+        config.log_config = writer_config;
+    }
     info!("Restoring core from desired state generation {}", state.generation);
     if let Err(error) = CORE_MANAGER
         .lock()

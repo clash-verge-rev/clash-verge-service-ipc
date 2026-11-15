@@ -99,7 +99,9 @@ pub(super) fn plan_stage(previous: &RuntimeManifest, sources: &[AssetSource], re
             && recorded.is_some_and(|recorded| recorded.source == identity.source)
             && source.mtime_ns.is_some()
             && source.runtime_copy == Some((source.len, source.mtime_ns));
-        if synced_back || recorded.is_some_and(|recorded| recorded.still_matches(&identity)) {
+        if synced_back
+            || (source.runtime_copy.is_some() && recorded.is_some_and(|recorded| recorded.still_matches(&identity)))
+        {
             plan.skipped.push(destination.clone());
         } else {
             plan.copies.push(PlannedCopy {
@@ -469,13 +471,22 @@ mod tests {
     #[test]
     fn an_asset_made_from_the_same_source_is_not_copied_again() {
         let previous = manifest(&[("geoip.metadb", identity("/app/geoip.metadb", 60_000_000, 42))], &[]);
-        let sources = [asset_source("/app/geoip.metadb", "geoip.metadb", 60_000_000, 42)];
-
-        let plan = plan_stage(&previous, &sources, &[]);
+        let mut source = asset_source("/app/geoip.metadb", "geoip.metadb", 60_000_000, 42);
+        source.runtime_copy = Some((60_000_000, Some(42)));
+        let plan = plan_stage(&previous, &[source], &[]);
 
         assert!(plan.copies.is_empty(), "unchanged geo data must not be re-copied");
         assert_eq!(plan.skipped, ["geoip.metadb"]);
         assert!(plan.required_deletes.is_empty());
+    }
+
+    #[test]
+    fn a_missing_destination_is_copied_even_when_the_source_matches() {
+        let previous = manifest(&[("geoip.metadb", identity("/app/geoip.metadb", 128, 42))], &[]);
+        let source = asset_source("/app/geoip.metadb", "geoip.metadb", 128, 42);
+        let plan = plan_stage(&previous, &[source], &[]);
+        assert_eq!(plan.copies.len(), 1);
+        assert!(plan.skipped.is_empty());
     }
 
     #[test]

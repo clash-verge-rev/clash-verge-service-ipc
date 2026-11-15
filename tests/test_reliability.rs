@@ -141,3 +141,70 @@ async fn core_watchdog_stops_a_bounded_crash_loop() -> Result<()> {
     assert_eq!(stop_clash(&credentials, &session).await?.code, 0);
     stop_server(server).await
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn desired_restore_recreates_the_volatile_owner_ipc_directory() -> Result<()> {
+    use clash_verge_service_ipc::{mihomo_ipc_path, restore_desired_state};
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+
+    let server = start_server().await?;
+    let credentials = common::owner_credentials();
+    let token = "51".repeat(32);
+    let response = start_clash(
+        &credentials,
+        &StartClashRequest {
+            runtime: RuntimeBundle {
+                yaml: "mode: direct\n".into(),
+                assets: Vec::new(),
+                remote_providers: Vec::new(),
+                core_path: common::test_bin_path("mock_binary").to_string_lossy().into_owned(),
+            },
+            proposed_session_token: token.clone(),
+            macos_proxy: None,
+        },
+    )
+    .await?;
+    anyhow::ensure!(response.code == 0, "{}", response.message);
+    let generation = response.data.context("no start result")?.session.generation;
+    let before = get_status(&credentials).await?.data.context("no status")?.core_pid;
+    stop_server(server).await?;
+    let socket = std::path::PathBuf::from(mihomo_ipc_path(&credentials.identity));
+    std::fs::remove_dir(socket.parent().context("no parent")?)?;
+    std::fs::write(socket.parent().context("no parent")?, b"not a directory")?;
+    assert!(restore_desired_state().await.is_err());
+    assert!(
+        clash_verge_service_ipc::load_owner_desired_state(&clash_verge_service_ipc::owner_key(&credentials.identity),)
+            .await?
+            .core_should_be_running
+    );
+    std::fs::remove_file(socket.parent().context("no parent")?)?;
+    restore_desired_state().await?;
+    let server = start_server_after_restore().await?;
+    let status = get_status(&credentials).await?.data.context("no restored status")?;
+    assert!(status.core_pid.is_some());
+    assert_ne!(status.core_pid, before);
+    assert_eq!(status.active_generation, Some(generation));
+    assert!(status.desired_core_should_be_running);
+    let metadata = std::fs::symlink_metadata(&socket)?;
+    assert!(metadata.file_type().is_socket());
+    if let clash_verge_service_ipc::OwnerIdentity::Unix { uid, .. } = credentials.identity {
+        assert_eq!(metadata.uid(), uid);
+    }
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        stop_clash(&credentials, &OwnerSessionProof { generation, token })
+            .await?
+            .code,
+        0
+    );
+    stop_server(server).await
+}
+
+#[cfg(unix)]
+async fn start_server_after_restore() -> Result<tokio::task::JoinHandle<kode_bridge::Result<()>>> {
+    let server = clash_verge_service_ipc::run_ipc_server().await?;
+    wait_until("restored listener", async || connect().await.is_ok()).await?;
+    Ok(server)
+}

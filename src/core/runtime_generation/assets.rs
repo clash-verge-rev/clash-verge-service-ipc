@@ -202,7 +202,6 @@ pub(crate) async fn prepare_runtime(
     crate::core::maintenance::persist_owner_identity(&owner.identity, owner_root)
         .await
         .map_err(|error| invalid_asset(format!("failed to persist owner identity: {error:#}")))?;
-    prepare_owner_ipc_directory(owner).await?;
 
     let logs = owner_paths.logs_dir();
     tokio::fs::create_dir_all(&logs)
@@ -643,18 +642,25 @@ async fn set_private_directory_permissions(path: &Path) -> Result<(), ServiceErr
     Ok(())
 }
 
-async fn prepare_owner_ipc_directory(owner: &AuthenticatedOwner) -> Result<(), ServiceError> {
+pub(crate) fn prepare_owner_ipc_directory(identity: &crate::OwnerIdentity) -> Result<(), ServiceError> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let ipc_path = PathBuf::from(mihomo_ipc_path(&owner.identity));
+        let ipc_path = PathBuf::from(mihomo_ipc_path(identity));
         let directory = ipc_path
             .parent()
             .ok_or_else(|| invalid_asset("owner IPC path has no parent directory"))?;
         let users_directory = directory
             .parent()
             .ok_or_else(|| invalid_asset("owner IPC directory has no users root"))?;
+        crate::core::unix_security::ensure_service_directory(
+            crate::core::paths::service_paths()
+                .map_err(|error| invalid_asset(error.to_string()))?
+                .runtime_dir(),
+            0o755,
+        )
+        .map_err(|error| invalid_asset(format!("failed to secure IPC runtime directory: {error:#}")))?;
         crate::core::unix_security::ensure_service_directory(users_directory, 0o755)
             .map_err(|error| invalid_asset(format!("failed to secure IPC users directory: {error:#}")))?;
         match std::fs::create_dir(directory) {
@@ -678,7 +684,7 @@ async fn prepare_owner_ipc_directory(owner: &AuthenticatedOwner) -> Result<(), S
                 std::io::Error::last_os_error()
             )));
         }
-        let crate::OwnerIdentity::Unix { uid, .. } = owner.identity else {
+        let crate::OwnerIdentity::Unix { uid, .. } = *identity else {
             unsafe { platform_lib::close(fd) };
             return Err(invalid_asset("Unix IPC directory requires a Unix owner"));
         };
@@ -702,7 +708,7 @@ async fn prepare_owner_ipc_directory(owner: &AuthenticatedOwner) -> Result<(), S
     }
 
     #[cfg(windows)]
-    let _ = owner;
+    let _ = identity;
 
     Ok(())
 }

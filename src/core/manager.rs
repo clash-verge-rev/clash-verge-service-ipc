@@ -822,6 +822,8 @@ where
 }
 
 fn prepare_core_ipc_socket(core_ipc_path: &str, owner: &OwnerIdentity) -> Result<()> {
+    crate::core::runtime_generation::prepare_owner_ipc_directory(owner)
+        .map_err(|error| anyhow!("failed to prepare owner IPC directory: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
