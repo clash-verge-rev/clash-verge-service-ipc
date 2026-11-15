@@ -235,6 +235,11 @@ fn authenticate_synthetic_test_owner(
 }
 
 #[cfg(windows)]
+pub(super) fn validate_open_file_owner(file: &std::fs::File, sid: &str) -> Result<(), ServiceError> {
+    windows_auth::validate_open_file_owner(file, sid)
+}
+
+#[cfg(windows)]
 mod windows_auth {
     use super::{AuthenticatedOwner, ServiceError};
     use crate::{OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, owner_key};
@@ -346,6 +351,11 @@ mod windows_auth {
             return Err(unauthorized("owner token file has an invalid size"));
         }
         Ok(())
+    }
+
+    pub(super) fn validate_open_file_owner(file: &std::fs::File, sid: &str) -> Result<(), ServiceError> {
+        let declared_sid = LocalSid::from_string(sid)?;
+        validate_owner(file.as_raw_handle(), declared_sid.as_ptr())
     }
 
     fn validate_owner(handle: *mut c_void, declared_sid: PSID) -> Result<(), ServiceError> {
