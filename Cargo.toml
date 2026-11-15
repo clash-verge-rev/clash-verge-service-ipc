@@ -113,7 +113,7 @@ parking_lot = { version = "0.13", optional = true }
 url = "2.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-sysproxy = { git = "https://github.com/clash-verge-rev/sysproxy-rs.git", branch = "main", default-features = false }
+sysproxy = { git = "https://github.com/clash-verge-rev/sysproxy-rs.git", rev = "7414ff739b72f036f3314e61feb6aeca0ab9275d", default-features = false, features = ["serde"] }
 
 [target.'cfg(unix)'.dependencies]
 platform_lib = { package = "libc", version = "0.2", optional = true }

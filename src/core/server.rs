@@ -13,9 +13,7 @@ use crate::core::runtime_generation::{PreparedRuntime, prepare_runtime, read_run
 use crate::core::state::{set_core_lifecycle_state, set_service_lifecycle_state};
 use crate::core::status::service_status_snapshot;
 use crate::core::structure::{OwnerSessionProof, Response, ServiceLifecycleState};
-use crate::core::{
-    apply_proxy, apply_proxy_or_direct, clear_proxy, clear_proxy_waiting_for_network, validate_proxy_config,
-};
+use crate::core::validate_proxy_config;
 use crate::{
     AuthenticatedRequest, AuthenticatedSessionRequest, IpcCommand, MIN_SUPPORTED_CLIENT_REVISION, MacosProxyConfig,
     OwnerSessionHandle, ProtocolInfo, ProtocolVersion, ProxyApplyOutcome, RuntimeBundle, RuntimeFileRequest,
@@ -108,17 +106,11 @@ struct StartOwnerTransition<'a> {
 
 impl OwnerProxyTransition for StartOwnerTransition<'_> {
     async fn clear_previous_proxy(&mut self) -> AnyResult<()> {
-        // A recorded owner may not have stopped cleanly, so its proxy is worth waiting for.
-        // Without one, clear at once as before rather than delay every offline or VPN start.
-        if self.previous_owner.is_some() {
-            clear_previous_owner_proxy().await
-        } else {
-            clear_service_proxy().await
-        }
+        clear_service_proxy().await
     }
 
     async fn compensate_direct(&mut self) -> AnyResult<()> {
-        compensate_service_proxy().await
+        clear_service_proxy().await
     }
 
     async fn stop_previous_core(&mut self) -> AnyResult<()> {
@@ -203,54 +195,21 @@ impl StartOwnerTransition<'_> {
     }
 }
 
-/// Whether proxy routes affect real system settings in this build.
-const SERVICE_PROXY_IS_LIVE: bool = cfg!(all(target_os = "macos", not(feature = "test")));
-
 async fn clear_service_proxy() -> AnyResult<()> {
-    if SERVICE_PROXY_IS_LIVE {
-        clear_proxy().await
-    } else {
-        Ok(())
-    }
+    let proxy = CORE_MANAGER.lock().await.proxy_scope();
+    proxy.clear().await
 }
 
-/// Only the takeover waits for a network service; stopping keeps the immediate [`clear_proxy`].
-async fn clear_previous_owner_proxy() -> AnyResult<()> {
-    if SERVICE_PROXY_IS_LIVE {
-        clear_proxy_waiting_for_network().await
-    } else {
-        Ok(())
-    }
-}
-
-async fn compensate_service_proxy() -> AnyResult<()> {
-    if SERVICE_PROXY_IS_LIVE {
-        apply_proxy(&MacosProxyConfig::Disabled).await
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(feature = "test"))]
 async fn apply_service_proxy_or_direct(config: Option<&MacosProxyConfig>) -> AnyResult<ProxyApplyOutcome> {
-    apply_proxy_or_direct(config).await
-}
-
-#[cfg(feature = "test")]
-async fn apply_service_proxy_or_direct(config: Option<&MacosProxyConfig>) -> AnyResult<ProxyApplyOutcome> {
-    let _ = apply_proxy_or_direct;
-    Ok(if config.is_some() {
-        ProxyApplyOutcome::Applied
-    } else {
-        ProxyApplyOutcome::NotRequested
-    })
+    let proxy = CORE_MANAGER.lock().await.proxy_scope();
+    proxy.apply(config).await
 }
 
 async fn clear_proxy_with_direct_compensation() -> std::result::Result<(), ServiceError> {
     let Err(clear_error) = clear_service_proxy().await else {
         return Ok(());
     };
-    let compensation = compensate_service_proxy().await;
+    let compensation = clear_service_proxy().await;
     let message = match compensation {
         Ok(()) => format!("Failed to clear the active owner's proxy: {clear_error:#}"),
         Err(compensation_error) => format!(
@@ -408,18 +367,27 @@ pub async fn stop_ipc_server() -> Result<()> {
     }
 
     drain_owner_operations().await;
-    CORE_MANAGER
+    let core_result = CORE_MANAGER
         .lock()
         .await
         .stop_core()
         .await
-        .map_err(|error| kode_bridge::KodeBridgeError::custom(error.to_string()))?;
+        .map_err(|error| kode_bridge::KodeBridgeError::custom(error.to_string()));
+    complete_ipc_cleanup(core_result).await
+}
 
-    cleanup_ipc_path().await?;
+async fn complete_ipc_cleanup(core_result: Result<()>) -> Result<()> {
+    let socket_result = cleanup_ipc_path().await;
     #[cfg(windows)]
     tokio::time::sleep(std::time::Duration::from_millis(70)).await;
 
-    Ok(())
+    match (core_result, socket_result) {
+        (Err(core), Err(socket)) => Err(kode_bridge::KodeBridgeError::custom(format!(
+            "{core}; socket cleanup also failed: {socket}"
+        ))),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        _ => Ok(()),
+    }
 }
 
 pub async fn run_ipc_supervisor_until_shutdown(shutdown: impl Future<Output = ()>) -> AnyResult<()> {
@@ -1060,6 +1028,24 @@ static OWNER_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[cfg(test)]
 mod owner_lifecycle_tests {
+
+    #[cfg(all(unix, feature = "test"))]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_error_still_removes_the_owned_socket() -> anyhow::Result<()> {
+        super::make_ipc_dir().await?;
+        super::cleanup_stale_ipc_socket().await?;
+        let listener = tokio::net::UnixListener::bind(crate::IPC_PATH)?;
+        let error = super::complete_ipc_cleanup(Err(kode_bridge::KodeBridgeError::custom(
+            "fixture proxy cleanup failure",
+        )))
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("fixture proxy cleanup failure"));
+        assert!(!std::path::Path::new(crate::IPC_PATH).exists());
+        drop(listener);
+        Ok(())
+    }
     use super::{
         OwnerProxyTransition, WINDOWS_CONTROL_PIPE_SDDL, owner_proxy_transition, require_active_owner,
         require_active_session,

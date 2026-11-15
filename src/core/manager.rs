@@ -306,6 +306,7 @@ pub struct CoreManager {
     watchdog_handle: Option<JoinHandle<Result<()>>>,
     failed_child: Arc<Mutex<Option<ChildGuard>>>,
     execution: Option<Arc<crate::execution::CoreExecutionGuard>>,
+    proxy: Arc<crate::core::proxy::ProxyScope>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -345,7 +346,16 @@ impl CoreManager {
             watchdog_handle: None,
             failed_child: Arc::new(Mutex::new(None)),
             execution: None,
+            proxy: Arc::new(crate::core::proxy::ProxyScope::default()),
         }
+    }
+
+    pub(super) fn proxy_scope(&self) -> Arc<crate::core::proxy::ProxyScope> {
+        Arc::clone(&self.proxy)
+    }
+
+    pub(super) fn restore_proxy_scope(&mut self, active: crate::core::desired::ActiveOwnerState) {
+        self.proxy = crate::core::proxy::ProxyScope::restored(active);
     }
 
     pub(super) fn running_core_config(&self) -> Option<(u32, ClashConfig)> {
@@ -361,6 +371,10 @@ impl CoreManager {
             self.stop_core().await?;
         }
 
+        self.proxy = match crate::core::desired::load_active_owner().await? {
+            Some(active) if active.identity == owner => crate::core::proxy::ProxyScope::restored(active),
+            _ => Arc::new(crate::core::proxy::ProxyScope::default()),
+        };
         let execution = std::sync::Arc::new(crate::execution::CoreExecutionGuard::acquire()?);
         let result = self.start_reserved_core(config, owner, execution.clone()).await;
         if result.is_ok() || self.status.read().core_pid.is_some() {
@@ -438,6 +452,11 @@ impl CoreManager {
 
     /// Stops the core; IPC handlers pass the deadline by which it must be SIGKILLed.
     pub(super) async fn stop_core_by(&mut self, kill_by: Option<Instant>) -> Result<()> {
+        let proxy_result = self.proxy.finish().await;
+        self.stop_after_proxy_cleanup(proxy_result, kill_by).await
+    }
+
+    async fn stop_after_proxy_cleanup(&mut self, proxy_result: Result<()>, kill_by: Option<Instant>) -> Result<()> {
         info!("Stopping core");
         LOG_RING.clear_logs();
 
@@ -471,7 +490,7 @@ impl CoreManager {
         self.after_stop(core_ipc_path).await;
         set_core_lifecycle_state(ServiceLifecycleState::Running);
 
-        Ok(())
+        proxy_result.context("core stopped but its proxy cleanup remains pending")
     }
 
     fn start_watchdog(
@@ -481,6 +500,7 @@ impl CoreManager {
         owner: OwnerIdentity,
         execution: Arc<crate::execution::CoreExecutionGuard>,
     ) {
+        let proxy = Arc::clone(&self.proxy);
         let shared_status = Arc::clone(&self.status);
         let failed_child_arc = Arc::clone(&self.failed_child);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -662,6 +682,9 @@ impl CoreManager {
             remove_core_runtime_record().await;
             if recovery_exhausted {
                 set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                if let Err(error) = proxy.finish().await {
+                    error!("Failed to clear exhausted core's proxy; retaining its recovery receipt: {error:#}");
+                }
             }
             Ok(())
         });
@@ -1088,6 +1111,69 @@ pub static CORE_MANAGER: Lazy<Arc<Mutex<CoreManager>>> = Lazy::new(|| Arc::new(M
 
 #[cfg(all(test, unix))]
 mod tests {
+
+    #[test]
+    fn proxy_cleanup_fixture_child() {
+        if std::env::var_os("CVS_PROXY_CLEANUP_FIXTURE_CHILD").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
+    #[cfg(feature = "test")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn proxy_cleanup_failure_still_joins_and_reaps_the_owned_core() -> anyhow::Result<()> {
+        use super::*;
+        let child = Command::new(std::env::current_exe()?)
+            .args(["--exact", "core::manager::tests::proxy_cleanup_fixture_child"])
+            .env("CVS_PROXY_CLEANUP_FIXTURE_CHILD", "1")
+            .kill_on_drop(true)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let pid = child.id().unwrap();
+        let guard = ChildGuard {
+            child: Some(child),
+            readers: Vec::new(),
+        };
+        let directory = std::env::temp_dir().join(format!("proxy-core-stop-{}", std::process::id()));
+        let config = ClashConfig {
+            core_config: crate::CoreConfig {
+                core_path: String::new(),
+                core_ipc_path: directory.join("core.sock").to_string_lossy().into_owned(),
+                config_path: String::new(),
+                config_dir: directory.to_string_lossy().into_owned(),
+            },
+            log_config: crate::WriterConfig {
+                directory: directory.to_string_lossy().into_owned(),
+                max_log_size: 1024,
+                max_log_files: 1,
+            },
+        };
+        let mut manager = CoreManager::new();
+        manager.status.write().started(Some(pid));
+        let reservation = Arc::new(crate::execution::CoreExecutionGuard::acquire()?);
+        manager.start_watchdog(
+            guard,
+            config,
+            OwnerIdentity::Unix {
+                uid: unsafe { platform_lib::geteuid() },
+                gid: unsafe { platform_lib::getegid() },
+            },
+            reservation,
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.stop_after_proxy_cleanup(Err(anyhow!("fixture native proxy clear failed")), None),
+        )
+        .await?
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("fixture native proxy clear failed"));
+        assert!(process_identity(pid)?.is_none());
+        assert!(manager.watchdog_handle.is_none());
+        assert!(manager.status.read().core_pid.is_none());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn core_output_bounds_long_lines_and_continues_after_invalid_utf8() {
