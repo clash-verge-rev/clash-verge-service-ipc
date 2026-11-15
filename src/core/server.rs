@@ -21,7 +21,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result as AnyResult, anyhow};
 use http::StatusCode;
-use kode_bridge::{HttpServerShutdown, IpcHttpServer, Result, Router, ServerConfig, ipc_http_server::HttpResponse};
+use kode_bridge::{IpcHttpServer, Result, Router, ServerConfig, ipc_http_server::HttpResponse};
 use once_cell::sync::Lazy;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -246,7 +246,7 @@ async fn rollback_started_owner(owner: &AuthenticatedOwner, handler_deadline: In
 // Serializes listener replacement so old cleanup cannot remove the new socket.
 static IPC_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-static IPC_SHUTDOWN_SENDER: Lazy<Mutex<Option<HttpServerShutdown>>> = Lazy::new(|| Mutex::new(None));
+static IPC_SHUTDOWN_SENDER: Lazy<Mutex<Option<oneshot::Sender<()>>>> = Lazy::new(|| Mutex::new(None));
 static IPC_SHUTDOWN_DONE: Lazy<Mutex<Option<oneshot::Receiver<()>>>> = Lazy::new(|| Mutex::new(None));
 
 struct OwnerOperations {
@@ -333,14 +333,17 @@ pub async fn run_ipc_server() -> Result<JoinHandle<Result<()>>> {
         operations.accepting = true;
     }
 
-    let shutdown = server.shutdown_handle();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let (done_tx, done_rx) = oneshot::channel::<()>();
 
-    *IPC_SHUTDOWN_SENDER.lock().await = Some(shutdown);
+    *IPC_SHUTDOWN_SENDER.lock().await = Some(shutdown_tx);
     *IPC_SHUTDOWN_DONE.lock().await = Some(done_rx);
 
     Ok(tokio::spawn(async move {
-        let res = server.serve().await;
+        let res = tokio::select! {
+            res = server.serve() => res,
+            _ = &mut shutdown_rx => Ok(()),
+        };
         let _ = done_tx.send(());
         res
     }))
@@ -352,7 +355,7 @@ pub async fn stop_ipc_server() -> Result<()> {
     OWNER_OPERATIONS.lock().accepting = false;
 
     if let Some(sender) = IPC_SHUTDOWN_SENDER.lock().await.take() {
-        sender.shutdown();
+        let _ = sender.send(());
     }
 
     {
@@ -551,8 +554,6 @@ fn create_ipc_server() -> Result<IpcHttpServer> {
     let server = IpcHttpServer::with_config(
         paths.ipc_path(),
         ServerConfig {
-            // Owner operations have their own completion registry; idle HTTP tasks can close now.
-            shutdown_timeout: Duration::ZERO,
             write_timeout: IPC_HANDLER_TIMEOUT,
             ..ServerConfig::default()
         },
