@@ -235,6 +235,16 @@ fn authenticate_synthetic_test_owner(
 }
 
 #[cfg(windows)]
+pub(super) fn validate_open_file_owner(file: &std::fs::File, sid: &str) -> Result<(), ServiceError> {
+    windows_auth::validate_open_file_owner(file, sid)
+}
+
+#[cfg(windows)]
+pub(super) fn validate_open_asset_access(file: &std::fs::File, sid: &str) -> Result<(), ServiceError> {
+    windows_auth::validate_open_asset_access(file, sid)
+}
+
+#[cfg(windows)]
 mod windows_auth {
     use super::{AuthenticatedOwner, ServiceError};
     use crate::{OWNER_TOKEN_FILE_NAME, OwnerCredentials, OwnerIdentity, owner_key};
@@ -346,6 +356,68 @@ mod windows_auth {
             return Err(unauthorized("owner token file has an invalid size"));
         }
         Ok(())
+    }
+
+    pub(super) fn validate_open_file_owner(file: &std::fs::File, sid: &str) -> Result<(), ServiceError> {
+        let declared_sid = LocalSid::from_string(sid)?;
+        validate_owner(file.as_raw_handle(), declared_sid.as_ptr())
+    }
+
+    // Asset files may be created with the Administrators group as owner by an
+    // elevated GUI. Only the authenticated SID's own full-control grant is an
+    // alternative to ownership; group membership never authorizes this read.
+    pub(super) fn validate_open_asset_access(file: &std::fs::File, sid: &str) -> Result<(), ServiceError> {
+        use windows_sys::Win32::Security::{ACE_HEADER, INHERIT_ONLY_ACE, IsValidAcl};
+        let declared_sid = LocalSid::from_string(sid)?;
+        let security = SecurityInfo::read(
+            file.as_raw_handle(),
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        )?;
+        if !security.owner.is_null() && unsafe { EqualSid(security.owner, declared_sid.as_ptr()) } != 0 {
+            return Ok(());
+        }
+        if security.dacl.is_null() || unsafe { IsValidAcl(security.dacl) } == 0 {
+            return Err(unauthorized("runtime asset has no inspectable DACL"));
+        }
+        let mut caller_controls = false;
+        for index in 0..unsafe { (*security.dacl).AceCount } as u32 {
+            let mut ace = std::ptr::null_mut();
+            if unsafe { GetAce(security.dacl, index, &mut ace) } == 0 || ace.is_null() {
+                return Err(unauthorized("runtime asset DACL could not be inspected"));
+            }
+            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+            // Reject deny, object and conditional ACEs rather than approximate
+            // their effective access or depend on the service's privileged token.
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE
+                || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+            {
+                return Err(unauthorized("runtime asset DACL contains an unsupported ACE"));
+            }
+            if header.AceFlags & INHERIT_ONLY_ACE as u8 != 0 {
+                continue;
+            }
+            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+            let sid_bytes = usize::from(header.AceSize) - sid_offset;
+            if sid_bytes < 8 {
+                return Err(unauthorized("runtime asset DACL contains a truncated SID"));
+            }
+            let ace_sid = std::ptr::addr_of!(allowed.SidStart).cast_mut().cast::<c_void>();
+            let subauthorities = unsafe { *ace_sid.cast::<u8>().add(1) } as usize;
+            if sid_bytes < 8 + 4 * subauthorities || unsafe { IsValidSid(ace_sid) } == 0 {
+                return Err(unauthorized("runtime asset DACL contains an invalid SID"));
+            }
+            if allowed.Mask & FILE_ALL_ACCESS == FILE_ALL_ACCESS
+                && unsafe { EqualSid(ace_sid, declared_sid.as_ptr()) } != 0
+            {
+                caller_controls = true;
+            }
+        }
+        if caller_controls {
+            Ok(())
+        } else {
+            Err(unauthorized("runtime asset is not controlled by the authenticated SID"))
+        }
     }
 
     fn validate_owner(handle: *mut c_void, declared_sid: PSID) -> Result<(), ServiceError> {
@@ -576,7 +648,7 @@ mod tests {
 
 #[cfg(all(test, windows, feature = "test"))]
 mod windows_tests {
-    use super::windows_auth::authenticate;
+    use super::windows_auth::{authenticate, validate_open_asset_access, validate_open_file_owner};
     use crate::{OWNER_TOKEN_FILE_NAME, OwnerIdentity, ServiceErrorCode, test_owner_credentials};
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Foundation::LocalFree;
@@ -592,10 +664,11 @@ mod windows_tests {
     }
 
     fn apply_everyone_dacl(path: &std::path::Path) -> anyhow::Result<()> {
-        let mut sddl = "D:P(A;;FA;;;WD)"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
+        apply_dacl(path, "D:P(A;;FA;;;WD)")
+    }
+
+    fn apply_dacl(path: &std::path::Path, sddl: &str) -> anyhow::Result<()> {
+        let mut sddl = sddl.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
         let mut descriptor = std::ptr::null_mut();
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -631,6 +704,43 @@ mod windows_tests {
         {
             return Err(std::io::Error::last_os_error().into());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_owned_asset_requires_exact_caller_full_control_on_the_open_handle() -> anyhow::Result<()> {
+        let root = test_root("asset-access");
+        let credentials = test_owner_credentials(&root)?;
+        let OwnerIdentity::Windows { sid: actual_sid } = credentials.identity else {
+            unreachable!()
+        };
+        let source = root.join("asset");
+        std::fs::write(&source, b"harmless asset fixture")?;
+        let file = std::fs::File::open(&source)?;
+        let caller = "S-1-5-21-123456789-123456789-123456789-1001";
+        assert!(validate_open_file_owner(&file, caller).is_err());
+        for (ace, allowed) in [
+            (format!("(A;;FA;;;{caller})"), true),
+            (format!("(A;;FR;;;{caller})"), false),
+            (format!("(A;OICIIO;FA;;;{caller})"), false),
+            (format!("(D;;FR;;;{caller})(A;;FA;;;{caller})"), false),
+            ("(A;;FA;;;WD)".to_owned(), false),
+            (String::new(), false),
+        ] {
+            apply_dacl(
+                &source,
+                &format!("D:P{ace}(A;;FA;;;{actual_sid})(A;;FA;;;SY)(A;;FA;;;BA)"),
+            )?;
+            assert_eq!(validate_open_asset_access(&file, caller).is_ok(), allowed, "{ace}");
+            assert!(validate_open_file_owner(&file, caller).is_err());
+        }
+        // A link to an unrelated privileged file does not acquire authority
+        // merely by being placed in the authenticated application's directory.
+        let link = root.join("hardlink");
+        std::fs::hard_link(&source, &link)?;
+        assert!(validate_open_asset_access(&std::fs::File::open(&link)?, caller).is_err());
+        drop(file);
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

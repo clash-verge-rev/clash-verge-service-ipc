@@ -4,6 +4,7 @@
 
 mod assets;
 mod readback;
+mod source;
 mod staging;
 
 pub(crate) use assets::{

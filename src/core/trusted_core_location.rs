@@ -115,6 +115,15 @@ pub(crate) fn require_trusted_service_registration(
 }
 
 #[cfg(windows)]
+pub(super) fn review_open_asset_component(
+    handle: *mut std::ffi::c_void,
+    path: &Path,
+    directory: bool,
+) -> Result<(), ServiceError> {
+    windows_location::review_asset_component(handle, path, directory)
+}
+
+#[cfg(windows)]
 mod windows_location {
     use super::{ServiceError, untrusted};
     use std::ffi::c_void;
@@ -174,6 +183,23 @@ mod windows_location {
             review_component(handle.as_raw_handle(), component, hijack_rights, &trusted)?;
         }
         Ok(())
+    }
+
+    pub(super) fn review_asset_component(
+        handle: *mut c_void,
+        path: &Path,
+        directory: bool,
+    ) -> Result<(), ServiceError> {
+        review_component(
+            handle,
+            path,
+            if directory {
+                DIRECTORY_HIJACK_RIGHTS
+            } else {
+                FILE_HIJACK_RIGHTS
+            },
+            &TrustedSids::new()?,
+        )
     }
 
     fn review_component(
