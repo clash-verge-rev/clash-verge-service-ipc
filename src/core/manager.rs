@@ -175,13 +175,9 @@ impl Drop for ChildGuard {
             reader.abort();
         }
         if let Some(mut child) = self.child.take() {
-            tokio::spawn(async move {
-                if let Err(e) = child.kill().await {
-                    warn!("Failed to kill child ({:?}): {e}", child.id());
-                } else {
-                    info!("Successfully killed child ({:?})", child.id());
-                }
-            });
+            if let Err(error) = child.start_kill() {
+                warn!("Failed to initiate core termination ({:?}): {error}", child.id());
+            }
         } else {
             info!("No running core process found");
         }
@@ -704,8 +700,11 @@ impl CoreManager {
             let _ = shutdown_tx.send(kill_by);
         }
 
-        if let Some(handle) = self.watchdog_handle.lock().await.take() {
-            handle.await.context("watchdog task failed to join")??;
+        let mut handle = self.watchdog_handle.lock().await;
+        if let Some(task) = handle.as_mut() {
+            let result = task.await;
+            handle.take();
+            result.context("watchdog task failed to join")??;
             info!("Watchdog stopped");
         }
 
@@ -769,6 +768,7 @@ pub async fn run_with_logging(
             return Err(anyhow!("Windows core requires a Windows owner identity"));
         };
         Command::new(bin_path)
+            .kill_on_drop(true)
             .args(args)
             .env("LISTEN_NAMEDPIPE_SDDL", windows_owner_pipe_sddl(sid))
             .stdout(Stdio::piped())
@@ -780,6 +780,7 @@ pub async fn run_with_logging(
     let child = unsafe {
         let _ = owner;
         Command::new(bin_path)
+            .kill_on_drop(true)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
