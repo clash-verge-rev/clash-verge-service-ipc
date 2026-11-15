@@ -132,6 +132,7 @@ dependencies = [
  "strum",
  "strum_macros",
  "sysproxy",
+ "system-configuration",
  "tokio",
  "tracing",
  "tracing-estuary",
