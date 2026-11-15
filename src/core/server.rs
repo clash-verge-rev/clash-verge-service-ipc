@@ -917,7 +917,7 @@ fn create_ipc_router() -> Result<Router> {
                     .logs_dir()
                     .to_string_lossy()
                     .into_owned();
-                match set_or_update_writer(&writer_config) {
+                match set_or_update_writer(&writer_config).await {
                     Ok(_) => info!("Update writer successfully"),
                     Err(e) => {
                         return service_unavailable(format!("Failed to update writer: {}", e));

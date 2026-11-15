@@ -203,7 +203,7 @@ pub async fn restore_desired_state() -> Result<()> {
 
     if !state.core_should_be_running {
         if let Some(writer_config) = state.last_writer_config.as_ref()
-            && let Err(error) = set_or_update_writer(writer_config)
+            && let Err(error) = set_or_update_writer(writer_config).await
         {
             warn!("Failed to restore writer config: {error}");
         }

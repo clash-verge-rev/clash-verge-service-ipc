@@ -1,6 +1,6 @@
 use crate::OwnerIdentity;
 use crate::core::ClashConfig;
-use crate::core::logger::{LOG_RING, set_or_update_writer, write_core_line};
+use crate::core::logger::{LOG_RING, MAX_CORE_LINE_BYTES, set_or_update_writer, write_core_line};
 use crate::core::process::process_identity;
 use crate::core::reconcile::ensure_startup_reconciled;
 use crate::core::runtime::{CoreRuntimeRecord, remove_core_runtime_record, write_core_runtime_record};
@@ -130,6 +130,7 @@ impl ChildGuard {
                 Err(_) => {
                     warn!("Core output stayed open after the core exited; dropping the rest");
                     reader.abort();
+                    let _ = reader.await;
                 }
             }
             self.readers.remove(0);
@@ -379,7 +380,7 @@ impl CoreManager {
         prepare_core_ipc_socket(&config.core_config.core_ipc_path, &owner)?;
         let args = core_args(&config);
 
-        set_or_update_writer(&config.log_config)?;
+        set_or_update_writer(&config.log_config).await?;
         let mut child_guard = run_with_logging(&config.core_config.core_path, &args, &owner).await?;
         let child_pid = child_guard.id();
 
@@ -770,13 +771,59 @@ fn spawn_line_reader<R>(reader: R, level: log::Level) -> JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    let epoch = LOG_RING.reader_epoch();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            write_core_line(level, &line);
-            LOG_RING.append_log(line);
-        }
+        read_core_lines(reader, |line| write_core_line(&epoch, level, line)).await;
     })
+}
+
+pub(super) async fn read_core_lines<R: tokio::io::AsyncRead + Unpin>(reader: R, mut emit: impl FnMut(String)) {
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::with_capacity(MAX_CORE_LINE_BYTES);
+    let mut truncated = false;
+    loop {
+        let available = match reader.fill_buf().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!("Failed to read core output; retaining the bounded log tail: {error}");
+                break;
+            }
+        };
+        if available.is_empty() {
+            if !line.is_empty() || truncated {
+                emit(bounded_core_line(&line, truncated));
+            }
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let length = newline.map_or(available.len(), |index| index + 1);
+        let content = if newline.is_some() { length - 1 } else { length };
+        let retained = content.min(MAX_CORE_LINE_BYTES - line.len());
+        line.extend_from_slice(&available[..retained]);
+        truncated |= retained < content;
+        reader.consume(length);
+        if newline.is_some() {
+            emit(bounded_core_line(&line, truncated));
+            line.clear();
+            truncated = false;
+        }
+    }
+}
+
+fn bounded_core_line(bytes: &[u8], truncated: bool) -> String {
+    const MARKER: &str = " [truncated]";
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    let mut line = String::from_utf8_lossy(bytes).into_owned();
+    let limit = MAX_CORE_LINE_BYTES - if truncated { MARKER.len() } else { 0 };
+    let mut end = line.len().min(limit);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line.truncate(end);
+    if truncated {
+        line.push_str(MARKER);
+    }
+    line
 }
 
 fn prepare_core_ipc_socket(core_ipc_path: &str, owner: &OwnerIdentity) -> Result<()> {
@@ -1041,6 +1088,25 @@ pub static CORE_MANAGER: Lazy<Arc<Mutex<CoreManager>>> = Lazy::new(|| Arc::new(M
 
 #[cfg(all(test, unix))]
 mod tests {
+
+    #[tokio::test]
+    async fn core_output_bounds_long_lines_and_continues_after_invalid_utf8() {
+        let mut input = vec![b'x'; super::MAX_CORE_LINE_BYTES * 32];
+        input.extend_from_slice(b"\ninvalid-\xff\xfe\nvalid\nunterminated");
+        let mut lines = Vec::new();
+        super::read_core_lines(input.as_slice(), |line| lines.push(line)).await;
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0].len(), super::MAX_CORE_LINE_BYTES);
+        assert!(lines[0].ends_with(" [truncated]"));
+        assert!(lines[1].contains('\u{fffd}'));
+        assert_eq!(lines[2], "valid");
+        assert_eq!(lines[3], "unterminated");
+        let input = vec![b'x'; super::MAX_CORE_LINE_BYTES * 32];
+        let mut tail = Vec::new();
+        super::read_core_lines(input.as_slice(), |line| tail.push(line)).await;
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].len(), super::MAX_CORE_LINE_BYTES);
+    }
     use super::{prepare_core_ipc_socket, secure_core_ipc_socket};
     use crate::OwnerIdentity;
     use serial_test::serial;
