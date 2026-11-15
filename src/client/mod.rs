@@ -1,4 +1,8 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 #[cfg(windows)]
 use anyhow::Result;
@@ -7,7 +11,7 @@ use anyhow::{Result, anyhow};
 use kode_bridge::{ClientConfig, IpcHttpClient};
 use log::{debug, warn};
 use once_cell::sync::Lazy;
-use tokio::sync::RwLock;
+use tokio::{sync::Mutex, task::JoinHandle};
 
 #[cfg(all(windows, any(not(feature = "test"), test)))]
 mod windows_identity;
@@ -20,7 +24,72 @@ use crate::{
     core::structure::{JsonConvert, Response},
 };
 
-static CLIENT_CONFIG: Lazy<Arc<RwLock<Option<IpcConfig>>>> = Lazy::new(|| Arc::new(RwLock::new(None)));
+static CLIENT_STATE: Lazy<Mutex<ClientState>> = Lazy::new(|| Mutex::new(ClientState::default()));
+
+#[derive(Default)]
+struct ClientState {
+    config: Option<IpcConfig>,
+    cached: Option<CachedClient>,
+}
+
+struct CachedClient {
+    runtime: tokio::runtime::Id,
+    client: Weak<IpcHttpClient>,
+    // The runtime owns the client lifetime; this slot owns the task and aborts it on replacement.
+    keeper: JoinHandle<()>,
+}
+
+impl Drop for CachedClient {
+    fn drop(&mut self) {
+        self.keeper.abort();
+    }
+}
+
+async fn shared_client() -> Result<Arc<IpcHttpClient>> {
+    let runtime = tokio::runtime::Handle::current().id();
+    let mut state = CLIENT_STATE.lock().await;
+    if let Some(cached) = &state.cached
+        && cached.runtime == runtime
+        && !cached.keeper.is_finished()
+        && let Some(client) = cached.client.upgrade()
+    {
+        return Ok(client);
+    }
+    state.cached = None;
+    let client = Arc::new(connect_with_config(state.config.clone().unwrap_or_default()).await?);
+    let retained = Arc::clone(&client);
+    let keeper = tokio::spawn(async move {
+        let _retained = retained;
+        std::future::pending::<()>().await;
+    });
+    state.cached = Some(CachedClient {
+        runtime,
+        client: Arc::downgrade(&client),
+        keeper,
+    });
+    Ok(client)
+}
+
+async fn send_cached(
+    client: &Arc<IpcHttpClient>,
+    request: kode_bridge::HttpRequestBuilder<'_>,
+) -> Result<kode_bridge::HttpResponse> {
+    match request.send().await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            let mut state = CLIENT_STATE.lock().await;
+            if state
+                .cached
+                .as_ref()
+                .and_then(|entry| entry.client.upgrade())
+                .is_some_and(|cached| Arc::ptr_eq(&cached, client))
+            {
+                state.cached = None;
+            }
+            Err(error.into())
+        }
+    }
+}
 
 static IPC_AUTH_HEADER_KEY: &str = "X-IPC-Magic";
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -56,7 +125,7 @@ where
     P: serde::Serialize + for<'de> serde::Deserialize<'de>,
     R: for<'de> serde::Deserialize<'de>,
 {
-    let client = connect().await?;
+    let client = shared_client().await?;
     let body = match session {
         None => AuthenticatedRequest {
             credentials: credentials.clone(),
@@ -81,7 +150,9 @@ where
         Some(timeout) => request.timeout(timeout),
         None => request,
     };
-    let response = request.json_body(&body).send().await?.json::<Response<R>>()?;
+    let response = send_cached(&client, request.json_body(&body))
+        .await?
+        .json::<Response<R>>()?;
     Ok(response)
 }
 
@@ -103,11 +174,17 @@ impl Default for IpcConfig {
 }
 
 pub async fn set_config(config: Option<IpcConfig>) {
-    let mut guard = CLIENT_CONFIG.write().await;
-    *guard = config;
+    let mut state = CLIENT_STATE.lock().await;
+    state.cached = None;
+    state.config = config;
 }
 
 pub async fn connect() -> Result<IpcHttpClient> {
+    let config = CLIENT_STATE.lock().await.config.clone().unwrap_or_default();
+    connect_with_config(config).await
+}
+
+async fn connect_with_config(c: IpcConfig) -> Result<IpcHttpClient> {
     debug!("Connecting to IPC at {}", IPC_PATH);
 
     #[cfg(unix)]
@@ -117,7 +194,6 @@ pub async fn connect() -> Result<IpcHttpClient> {
         }
     }
 
-    let c = { CLIENT_CONFIG.read().await.clone() }.unwrap_or_default();
     debug!("Using config: {:?}", c);
     let client = kode_bridge::IpcHttpClient::with_config(
         IPC_PATH,
@@ -153,13 +229,11 @@ pub fn is_ipc_path_exists() -> bool {
 }
 
 pub async fn get_version() -> Result<Response<ProtocolInfo>> {
-    let client = connect().await?;
-    let response = client
+    let client = shared_client().await?;
+    let request = client
         .get(IpcCommand::GetVersion.as_ref())
-        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
-        .send()
-        .await?
-        .json::<Response<ProtocolInfo>>()?;
+        .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT);
+    let response = send_cached(&client, request).await?.json::<Response<ProtocolInfo>>()?;
     Ok(response)
 }
 
@@ -289,16 +363,16 @@ pub(crate) async fn inspect_installation_with_digest(
     requirements: &[crate::CoreRequirement],
     include_service_digest: bool,
 ) -> Result<crate::InstallationStatus> {
-    let client = connect().await?;
-    let response = protected(client.post(IpcCommand::InspectInstallation.as_ref()))
+    let client = shared_client().await?;
+    let request = protected(client.post(IpcCommand::InspectInstallation.as_ref()))
         .timeout(LIFECYCLE_TIMEOUT)
         .header(IPC_AUTH_HEADER_KEY, IPC_AUTH_EXPECT)
         .header(
             "X-Service-Digest",
             if include_service_digest { "true" } else { "false" },
         )
-        .json_body(&serde_json::to_value(requirements)?)
-        .send()
+        .json_body(&serde_json::to_value(requirements)?);
+    let response = send_cached(&client, request)
         .await?
         .json::<Response<crate::InstallationStatus>>()?;
     anyhow::ensure!(
@@ -310,4 +384,67 @@ pub(crate) async fn inspect_installation_with_digest(
     response
         .data
         .ok_or_else(|| anyhow::anyhow!("service omitted installation status"))
+}
+
+#[cfg(all(test, feature = "standalone", feature = "test"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn pooled_client_is_scoped_to_runtime_and_configuration() -> Result<()> {
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        }
+        async fn start_server() -> Result<JoinHandle<kode_bridge::Result<()>>> {
+            let server = crate::run_ipc_server().await?;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if connect().await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            Ok(server)
+        }
+        let first_runtime = runtime();
+        let weak = first_runtime.block_on(async {
+            let server = start_server().await?;
+            set_config(Some(IpcConfig {
+                default_timeout: Duration::from_secs(1),
+                max_retries: 20,
+                retry_delay: Duration::from_millis(500),
+            }))
+            .await;
+            let first = shared_client().await?;
+            assert!(Arc::ptr_eq(&first, &shared_client().await?));
+            get_version().await?;
+            crate::stop_ipc_server().await?;
+            server.await??;
+            let restarted = start_server().await?;
+            get_version().await?;
+            assert!(Arc::ptr_eq(&first, &shared_client().await?));
+            set_config(None).await;
+            let configured = shared_client().await?;
+            assert!(!Arc::ptr_eq(&first, &configured));
+            crate::stop_ipc_server().await?;
+            restarted.await??;
+            Ok::<_, anyhow::Error>(Arc::downgrade(&configured))
+        })?;
+        drop(first_runtime);
+        assert!(weak.upgrade().is_none(), "client outlived its runtime");
+        runtime().block_on(async {
+            let server = start_server().await?;
+            get_version().await?;
+            crate::stop_ipc_server().await?;
+            server.await??;
+            set_config(None).await;
+            Ok::<_, anyhow::Error>(())
+        })
+    }
 }
