@@ -53,6 +53,17 @@ pub fn uninstall_old_service() -> Result<(), Error> {
     Ok(())
 }
 
+/// OpenRC manages the service when the system was not booted by systemd.
+#[cfg(target_os = "linux")]
+pub(crate) fn openrc_booted() -> bool {
+    !std::path::Path::new("/run/systemd/system").exists() && std::path::Path::new("/run/openrc").exists()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn openrc_script_path() -> std::path::PathBuf {
+    std::path::Path::new("/etc/init.d").join(clash_verge_service_ipc::SERVICE_SLUG)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn run_command(cmd: &str, args: &[&str], debug: bool) -> Result<(), Error> {
     if debug {

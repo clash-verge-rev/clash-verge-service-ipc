@@ -159,15 +159,24 @@ fn main() -> Result<(), Error> {
     let debug = env::args().any(|arg| arg == "--debug");
     let service_name = clash_verge_service_ipc::SERVICE_SLUG;
 
-    let _ = run_command("systemctl", &["stop", &format!("{}.service", service_name)], debug);
-    let _ = run_command("systemctl", &["disable", &format!("{}.service", service_name)], debug);
+    if shared::openrc_booted() {
+        let _ = run_command("rc-service", &[service_name, "stop"], debug);
+        let _ = run_command("rc-update", &["del", service_name, "default"], debug);
+        let script = shared::openrc_script_path();
+        if script.exists() {
+            std::fs::remove_file(&script).map_err(|e| anyhow::anyhow!("Failed to remove OpenRC script: {}", e))?;
+        }
+    } else {
+        let _ = run_command("systemctl", &["stop", &format!("{}.service", service_name)], debug);
+        let _ = run_command("systemctl", &["disable", &format!("{}.service", service_name)], debug);
 
-    let unit_file = format!("/etc/systemd/system/{}.service", service_name);
-    if std::path::Path::new(&unit_file).exists() {
-        std::fs::remove_file(&unit_file).map_err(|e| anyhow::anyhow!("Failed to remove service file: {}", e))?;
+        let unit_file = format!("/etc/systemd/system/{}.service", service_name);
+        if std::path::Path::new(&unit_file).exists() {
+            std::fs::remove_file(&unit_file).map_err(|e| anyhow::anyhow!("Failed to remove service file: {}", e))?;
+        }
+
+        let _ = run_command("systemctl", &["daemon-reload"], debug);
     }
-
-    let _ = run_command("systemctl", &["daemon-reload"], debug);
     let target = clash_verge_service_ipc::prepare_service_install_directory()?.join("clash-verge-service");
     if target.exists() {
         std::fs::remove_file(&target)
