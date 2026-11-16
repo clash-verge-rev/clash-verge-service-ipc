@@ -555,8 +555,8 @@ dependencies = [
 
 [[package]]
 name = "kode-bridge"
-version = "0.5.2"
-source = "git+https://github.com/clash-verge-rev/kode-bridge.git?rev=9379a82f149c1c8f71eb1419f4957c961f778195#9379a82f149c1c8f71eb1419f4957c961f778195"
+version = "0.5.3"
+source = "git+https://github.com/clash-verge-rev/kode-bridge.git?rev=35023b4cda12bedd25af459acc6b1b37c000cc40#35023b4cda12bedd25af459acc6b1b37c000cc40"
 dependencies = [
  "bytes",
  "futures",
