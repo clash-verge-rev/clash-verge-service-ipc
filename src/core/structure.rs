@@ -299,6 +299,8 @@ pub struct ServiceStatusSnapshot {
     pub desired_core_should_be_running: bool,
     pub desired_generation: u64,
     pub desired_updated_at: u64,
+    #[serde(default)]
+    pub desired_persistence_error: Option<String>,
 }
 
 #[cfg(feature = "response")]

@@ -65,13 +65,13 @@ mod windows {
 
     pub(super) fn create(root: &Path) -> Result<(OwnerIdentity, Option<String>)> {
         let sid = current_sid()?;
-        let descriptor = SecurityDescriptor::for_owner(&sid)?;
+        let descriptor = SecurityDescriptor::for_owner(&sid, true)?;
         descriptor.apply(root)?;
 
         let token = [0xa5_u8; TOKEN_BYTES];
         let token_path = root.join(OWNER_TOKEN_FILE_NAME);
         std::fs::write(&token_path, token).context("failed to write test owner token")?;
-        descriptor.apply(&token_path)?;
+        SecurityDescriptor::for_owner(&sid, false)?.apply(&token_path)?;
 
         Ok((OwnerIdentity::Windows { sid }, Some(encode_token(&token))))
     }
@@ -150,8 +150,9 @@ mod windows {
     struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
 
     impl SecurityDescriptor {
-        fn for_owner(sid: &str) -> Result<Self> {
-            let sddl = format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)");
+        fn for_owner(sid: &str, directory: bool) -> Result<Self> {
+            let flags = if directory { "OICI" } else { "" };
+            let sddl = format!("O:{sid}D:P(A;{flags};FA;;;{sid})(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)");
             let mut wide: Vec<u16> = sddl.encode_utf16().collect();
             wide.push(0);
             let mut descriptor = std::ptr::null_mut();

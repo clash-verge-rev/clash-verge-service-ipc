@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 static DESIRED_STATE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static LIVE_DESIRED_STATE: parking_lot::RwLock<Option<(String, DesiredState)>> = parking_lot::RwLock::new(None);
 static STATE_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -23,6 +24,8 @@ pub struct DesiredState {
     pub last_writer_config: Option<WriterConfig>,
     pub generation: u64,
     pub updated_at: u64,
+    #[serde(default)]
+    pub persistence_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,6 +37,28 @@ pub struct ActiveOwnerState {
     pub generation: u64,
     #[serde(default)]
     pub session_token_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_request_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_proxy_outcome: Option<crate::ProxyApplyOutcome>,
+    #[cfg(target_os = "macos")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_receipt: Option<sysproxy::PrivilegedProxyReceipt>,
+}
+
+pub(super) async fn ensure_owner_read_fence(expected: Option<&ActiveOwnerState>) -> Result<()> {
+    let current = load_active_owner().await?;
+    let unchanged = match (expected, current.as_ref()) {
+        (None, None) => true,
+        (Some(expected), Some(current)) => {
+            expected.owner_key == current.owner_key
+                && expected.generation == current.generation
+                && expected.session_token_hash == current.session_token_hash
+        }
+        _ => false,
+    };
+    anyhow::ensure!(unchanged, "active owner session changed while collecting the response");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -45,6 +70,10 @@ impl From<&AuthenticatedOwner> for ActiveOwnerState {
             app_data_root: owner.app_data_root.to_string_lossy().into_owned(),
             generation: 0,
             session_token_hash: String::new(),
+            start_request_hash: None,
+            start_proxy_outcome: None,
+            #[cfg(target_os = "macos")]
+            proxy_receipt: None,
         }
     }
 }
@@ -55,6 +84,11 @@ struct OwnerGenerationState {
 }
 
 pub async fn load_owner_desired_state(owner_key: &str) -> Result<DesiredState> {
+    if let Some((key, state)) = LIVE_DESIRED_STATE.read().as_ref()
+        && key == owner_key
+    {
+        return Ok(state.clone());
+    }
     let path = service_paths()?.for_owner_key(owner_key).desired_state_path();
     Ok(read_owner_desired_state_resilient(&path).await)
 }
@@ -109,7 +143,16 @@ pub async fn persist_active_owner(owner: &AuthenticatedOwner) -> Result<ActiveOw
     Ok(state)
 }
 
+#[cfg(test)]
 pub async fn commit_active_owner_session(owner: &AuthenticatedOwner, session_token: &str) -> Result<ActiveOwnerState> {
+    commit_active_owner_start(owner, session_token, None).await
+}
+
+pub(super) async fn commit_active_owner_start(
+    owner: &AuthenticatedOwner,
+    session_token: &str,
+    start_request_hash: Option<String>,
+) -> Result<ActiveOwnerState> {
     let session_token_hash = hash_session_token(session_token)?;
     let _guard = DESIRED_STATE_LOCK.lock().await;
     let paths = service_paths()?;
@@ -124,9 +167,56 @@ pub async fn commit_active_owner_session(owner: &AuthenticatedOwner, session_tok
         app_data_root: owner.app_data_root.to_string_lossy().into_owned(),
         generation: generation_state.generation,
         session_token_hash,
+        start_request_hash,
+        start_proxy_outcome: None,
+        #[cfg(target_os = "macos")]
+        proxy_receipt: None,
     };
     write_json_atomic(&paths.active_owner_path(), &state).await?;
     Ok(state)
+}
+
+pub(super) async fn persist_start_result(
+    active: &mut ActiveOwnerState,
+    outcome: crate::ProxyApplyOutcome,
+) -> Result<()> {
+    let _guard = DESIRED_STATE_LOCK.lock().await;
+    let mut current = load_active_owner()
+        .await?
+        .context("active owner disappeared before Start result commit")?;
+    ensure_same_session(active, &current)?;
+    current.start_proxy_outcome = Some(outcome);
+    write_json_atomic(&service_paths()?.active_owner_path(), &current).await?;
+    *active = current;
+    Ok(())
+}
+
+fn ensure_same_session(expected: &ActiveOwnerState, current: &ActiveOwnerState) -> Result<()> {
+    anyhow::ensure!(
+        expected.owner_key == current.owner_key
+            && expected.generation == current.generation
+            && expected.session_token_hash == current.session_token_hash,
+        "active owner session changed"
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", any(not(feature = "test"), test)))]
+pub(super) async fn persist_proxy_receipt(
+    expected: &ActiveOwnerState,
+    receipt: Option<sysproxy::PrivilegedProxyReceipt>,
+) -> Result<()> {
+    let _guard = DESIRED_STATE_LOCK.lock().await;
+    let mut current = load_active_owner()
+        .await?
+        .context("active owner is unavailable for proxy receipt")?;
+    ensure_same_session(expected, &current)?;
+    #[cfg(all(test, not(feature = "test"), feature = "client", feature = "development-channel"))]
+    if let Some(receipt) = receipt.as_ref() {
+        crate::core::proxy::native_tests::before_proxy_write(receipt)?;
+    }
+    current.proxy_receipt = receipt;
+    write_json_atomic(&service_paths()?.active_owner_path(), &current).await
 }
 
 pub async fn clear_active_owner() -> Result<()> {
@@ -146,33 +236,44 @@ pub async fn restore_desired_state() -> Result<()> {
         info!("No active owner to restore");
         return Ok(());
     };
-    let state = load_owner_desired_state(&active_owner.owner_key).await?;
-
-    if let Some(writer_config) = state.last_writer_config.as_ref()
-        && let Err(error) = set_or_update_writer(writer_config)
-    {
-        warn!("Failed to restore writer config: {}", error);
-    }
+    CORE_MANAGER.lock().await.restore_proxy_scope(active_owner.clone());
+    let path = service_paths()?
+        .for_owner_key(&active_owner.owner_key)
+        .desired_state_path();
+    let state = read_owner_desired_state_resilient(&path).await;
+    *LIVE_DESIRED_STATE.write() = Some((active_owner.owner_key.clone(), state.clone()));
 
     if !state.core_should_be_running {
+        CORE_MANAGER.lock().await.proxy_scope().finish().await?;
+        if let Some(writer_config) = state.last_writer_config.as_ref()
+            && let Err(error) = set_or_update_writer(writer_config).await
+        {
+            warn!("Failed to restore writer config: {error}");
+        }
         info!("Desired state does not require core restore");
         return Ok(());
     }
 
-    let Some(config) = state.last_clash_config else {
-        warn!("Desired state requests core restore but has no ClashConfig");
-        return Ok(());
+    let Some(mut config) = state.last_clash_config else {
+        let proxy_result = CORE_MANAGER.lock().await.proxy_scope().finish().await;
+        persist_owner_core_stopped_by_key(&active_owner.owner_key).await?;
+        set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+        proxy_result.context("missing core configuration; proxy cleanup remains pending")?;
+        anyhow::bail!("desired state requests core restore but has no ClashConfig");
     };
 
+    if let Some(writer_config) = state.last_writer_config {
+        config.log_config = writer_config;
+    }
     info!("Restoring core from desired state generation {}", state.generation);
-    if let Err(error) = CORE_MANAGER
-        .lock()
-        .await
-        .start_core(config, active_owner.identity.clone())
-        .await
-    {
+    let start_result = {
+        let mut manager = CORE_MANAGER.lock().await;
+        manager.start_core(config, active_owner.identity.clone()).await
+    };
+    if let Err(error) = start_result {
         // A missing core path makes the desired state stale; retain intent for other errors.
         if core_path_is_unusable(&error) {
+            let proxy_result = CORE_MANAGER.lock().await.proxy_scope().finish().await;
             warn!(
                 "Persisted core path cannot be launched (missing, moved, or no longer in a \
                  location this build trusts); clearing desired core-run state to stop retrying: {error:#}"
@@ -180,8 +281,12 @@ pub async fn restore_desired_state() -> Result<()> {
             if let Err(clear_error) = persist_owner_core_stopped_by_key(&active_owner.owner_key).await {
                 warn!("Failed to clear stale desired state after not-found core path: {clear_error:#}");
             }
-            set_core_lifecycle_state(ServiceLifecycleState::Running);
-            return Ok(());
+            set_core_lifecycle_state(if proxy_result.is_ok() {
+                ServiceLifecycleState::Running
+            } else {
+                ServiceLifecycleState::Fatal
+            });
+            return proxy_result.context("unusable core stopped; proxy cleanup remains pending");
         }
         set_core_lifecycle_state(ServiceLifecycleState::Fatal);
         return Err(error);
@@ -248,16 +353,22 @@ async fn backup_legacy_state_file(path: &std::path::Path) -> Result<Option<std::
 async fn update_owner_desired_state(owner_key: &str, update: impl FnOnce(&mut DesiredState)) -> Result<DesiredState> {
     let _guard = DESIRED_STATE_LOCK.lock().await;
     let path = service_paths()?.for_owner_key(owner_key).desired_state_path();
-    let mut state = read_owner_desired_state_resilient(&path).await;
+    let mut state = load_owner_desired_state(owner_key).await?;
     update(&mut state);
     state.generation = state.generation.saturating_add(1);
     state.updated_at = unix_timestamp_secs();
+    state.persistence_error = None;
+    let mut pending = state.clone();
+    pending.persistence_error = Some("Recovery state persistence is pending".to_owned());
+    *LIVE_DESIRED_STATE.write() = Some((owner_key.to_owned(), pending));
     if let Err(error) = write_json_atomic(&path, &state).await {
+        state.persistence_error = Some(format!("{error:#}"));
         warn!(
             "Failed to persist owner desired state {:?}; continuing with live core state: {error:#}",
             path
         );
     }
+    *LIVE_DESIRED_STATE.write() = Some((owner_key.to_owned(), state.clone()));
     Ok(state)
 }
 
@@ -396,6 +507,56 @@ fn unix_timestamp_secs() -> u64 {
 
 #[cfg(test)]
 mod owner_tests {
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn missing_restore_configuration_is_not_reported_as_settling() -> anyhow::Result<()> {
+        use super::*;
+        let owner = test_owner(91_502);
+        commit_active_owner_session(&owner, &"73".repeat(32)).await?;
+        let path = service_paths()?.for_owner_key(&owner.key).desired_state_path();
+        write_json_atomic(
+            &path,
+            &DesiredState {
+                core_should_be_running: true,
+                ..DesiredState::default()
+            },
+        )
+        .await?;
+        let error = tokio::time::timeout(std::time::Duration::from_secs(3), restore_desired_state())
+            .await?
+            .unwrap_err();
+        assert!(error.to_string().contains("no ClashConfig"));
+        assert!(!load_owner_desired_state(&owner.key).await?.core_should_be_running);
+        let status = crate::core::status::service_status_snapshot(&owner).await?;
+        assert!(!status.desired_core_should_be_running);
+        assert_eq!(crate::core::state::core_lifecycle_state(), ServiceLifecycleState::Fatal);
+        clear_active_owner().await?;
+        set_core_lifecycle_state(ServiceLifecycleState::Running);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn proxy_receipt_commit_preserves_start_result_and_rejects_displaced_owner() -> anyhow::Result<()> {
+        use super::*;
+        let owner = test_owner(91_501);
+        let mut active = commit_active_owner_session(&owner, &"71".repeat(32)).await?;
+        let receipt = serde_json::from_value(serde_json::json!({
+            "service_id": "isolated-fixture-only", "states": [vec![serde_json::Value::Null; 12]],
+        }))?;
+        persist_proxy_receipt(&active, Some(receipt)).await?;
+        persist_start_result(&mut active, crate::ProxyApplyOutcome::Applied).await?;
+        assert!(active.proxy_receipt.is_some());
+        let restored = load_active_owner().await?.unwrap();
+        assert_eq!(restored.proxy_receipt, active.proxy_receipt);
+        let newer = commit_active_owner_session(&owner, &"72".repeat(32)).await?;
+        assert!(persist_proxy_receipt(&active, None).await.is_err());
+        assert_eq!(load_active_owner().await?.unwrap().generation, newer.generation);
+        clear_active_owner().await?;
+        Ok(())
+    }
     use super::{
         backup_legacy_state_file, clear_active_owner, commit_active_owner_session, load_active_owner,
         load_owner_desired_state, persist_active_owner, persist_owner_core_started, persist_owner_core_stopped,
@@ -430,13 +591,29 @@ mod owner_tests {
         persist_owner_core_started(&owner, &config).await?;
         persist_active_owner(&owner).await?;
         assert!(crate::core::installation::inspect(&[], false).await?.core_busy);
-        super::restore_desired_state().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), super::restore_desired_state()).await??;
         let status = crate::core::installation::inspect(&[], false).await?;
         let occupied = status.core_busy;
         assert!(status.service_sha256.is_empty());
         clear_active_owner().await?;
         std::fs::remove_dir_all(directory)?;
         assert!(!occupied, "a failed restore with no core must permit Sidecar handoff");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn owner_read_fence_rejects_a_b_a_session_changes() -> anyhow::Result<()> {
+        let a = test_owner(93_101);
+        let b = test_owner(93_102);
+        let first = commit_active_owner_session(&a, &"91".repeat(32)).await?;
+        super::ensure_owner_read_fence(Some(&first)).await?;
+        commit_active_owner_session(&b, &"92".repeat(32)).await?;
+        assert!(super::ensure_owner_read_fence(Some(&first)).await.is_err());
+        let last = commit_active_owner_session(&a, &"93".repeat(32)).await?;
+        assert!(super::ensure_owner_read_fence(Some(&first)).await.is_err());
+        super::ensure_owner_read_fence(Some(&last)).await?;
+        clear_active_owner().await?;
         Ok(())
     }
 
@@ -617,6 +794,10 @@ mod owner_tests {
 
         assert!(state.core_should_be_running);
         assert!(owner_root.join("desired-state.json").is_dir());
+        assert!(state.persistence_error.is_some());
+        let live = load_owner_desired_state(&owner.key).await?;
+        assert!(live.core_should_be_running);
+        assert!(live.persistence_error.is_some());
         std::fs::remove_dir_all(owner_root)?;
         Ok(())
     }

@@ -13,6 +13,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    println!("owner-ready");
 
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;

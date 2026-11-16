@@ -142,6 +142,14 @@ async fn staging_updates_declared_assets_but_preserves_core_owned_files() -> Res
             b"proxies: []\n"
         );
 
+        std::fs::remove_file(core.generation.join("providers/copied.yaml"))?;
+        core.stage(&declared).await?;
+        assert_eq!(
+            std::fs::read(core.generation.join("providers/copied.yaml"))?,
+            b"proxies: []\n"
+        );
+        assert_eq!(std::fs::read(&core_state)?, b"selected node");
+
         core.stage(&bundle(&core.app_root, "mode: direct\n")).await?;
         assert!(!core.generation.join("providers/copied.yaml").exists());
         assert_eq!(std::fs::read(&core_state)?, b"selected node");

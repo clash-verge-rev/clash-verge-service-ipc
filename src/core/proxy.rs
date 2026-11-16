@@ -1,9 +1,6 @@
-use std::future::Future;
 use std::net::IpAddr;
-use std::time::Duration;
 
 use anyhow::{Context, ensure};
-use tracing::warn;
 use url::{Host, Url};
 
 use crate::{MacosProxyConfig, ProxyApplyOutcome};
@@ -12,16 +9,6 @@ const MAX_HOST_LEN: usize = 64;
 const MAX_BYPASS_LEN: usize = 8192;
 const MAX_PAC_URL_LEN: usize = 256;
 const PAC_PATH: &str = "/commands/pac";
-
-/// Sleeps between attempts to clear a previous owner's proxy while no network service exists.
-/// They add up to 7.75 s; the attempts themselves take extra time.
-const CLEAR_PROXY_RETRY_DELAYS: &[Duration] = &[
-    Duration::from_millis(250),
-    Duration::from_millis(500),
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-    Duration::from_secs(4),
-];
 
 pub fn validate_proxy_config(config: &MacosProxyConfig) -> anyhow::Result<()> {
     match config {
@@ -93,9 +80,9 @@ fn explicit_port(authority: &str) -> anyhow::Result<u16> {
     port.parse::<u16>().context("PAC URL port must be a u16")
 }
 
-#[cfg(target_os = "macos")]
-fn apply_real(config: &MacosProxyConfig) -> anyhow::Result<()> {
-    let (system, auto) = match config {
+#[cfg(all(target_os = "macos", not(feature = "test")))]
+fn native_proxy_config(config: &MacosProxyConfig) -> (sysproxy::Sysproxy, sysproxy::Autoproxy) {
+    match config {
         MacosProxyConfig::Disabled => (sysproxy::Sysproxy::default(), sysproxy::Autoproxy::default()),
         MacosProxyConfig::Global { host, port, bypass } => (
             sysproxy::Sysproxy {
@@ -113,131 +100,32 @@ fn apply_real(config: &MacosProxyConfig) -> anyhow::Result<()> {
                 enable: true,
             },
         ),
-    };
-    sysproxy::apply_privileged_native(&system, &auto).map_err(Into::into)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn apply_proxy_or_direct_with(
-    config: Option<&MacosProxyConfig>,
-    mut apply: impl FnMut(&MacosProxyConfig) -> anyhow::Result<()>,
-) -> anyhow::Result<ProxyApplyOutcome> {
-    let Some(config) = config else {
-        return Ok(ProxyApplyOutcome::NotRequested);
-    };
-    validate_proxy_config(config)?;
-
-    match apply(config) {
-        Ok(()) => Ok(ProxyApplyOutcome::Applied),
-        Err(apply_error) => {
-            // A lookup failure means no write of ours failed midway, so there is nothing to undo.
-            let nothing_to_undo = is_no_active_network_service(&apply_error);
-            match apply(&MacosProxyConfig::Disabled) {
-                Ok(()) => {}
-                Err(compensation_error) if nothing_to_undo && is_no_active_network_service(&compensation_error) => {}
-                Err(compensation_error) => {
-                    return Err(compensation_error).with_context(|| {
-                        format!("failed to compensate proxy apply failure ({apply_error}) with direct mode")
-                    });
-                }
-            }
-            Ok(ProxyApplyOutcome::DirectFallback {
-                message: apply_error.to_string(),
-            })
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub async fn apply_proxy(config: &MacosProxyConfig) -> anyhow::Result<()> {
-    validate_proxy_config(config)?;
-    let config = config.clone();
-    tokio::task::spawn_blocking(move || apply_real(&config))
-        .await
-        .context("proxy apply task failed")?
-}
-
-#[cfg(not(target_os = "macos"))]
-pub async fn apply_proxy(_config: &MacosProxyConfig) -> anyhow::Result<()> {
-    anyhow::bail!("macOS proxy configuration is unsupported on this platform")
-}
-
-/// Succeeds when macOS has no active network service: with nothing to write to, the requested
-/// "no proxy" state already holds, and failing would block callers that clear before stopping.
-pub async fn clear_proxy() -> anyhow::Result<()> {
-    match apply_proxy(&MacosProxyConfig::Disabled).await {
-        Err(error) if is_no_active_network_service(&error) => {
-            warn!("no active network service, nothing to clear: {error:#}");
-            Ok(())
-        }
-        result => result,
-    }
-}
-
-/// [`clear_proxy`], but a missing network service is first waited for, since at login the network
-/// can come up after the core starts.
-pub async fn clear_proxy_waiting_for_network() -> anyhow::Result<()> {
-    clear_proxy_waiting_with(|| apply_proxy(&MacosProxyConfig::Disabled), CLEAR_PROXY_RETRY_DELAYS).await
-}
-
-async fn clear_proxy_waiting_with<F, Fut>(mut apply: F, delays: &[Duration]) -> anyhow::Result<()>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = anyhow::Result<()>>,
-{
-    let mut retries = 0;
-    loop {
-        match apply().await {
-            Ok(()) => return Ok(()),
-            Err(error) if is_no_active_network_service(&error) => {
-                let Some(delay) = delays.get(retries) else {
-                    warn!("no active network service after {retries} retries, nothing to clear: {error:#}");
-                    return Ok(());
-                };
-                warn!("no active network service yet, retrying proxy clear in {delay:?}: {error:#}");
-                tokio::time::sleep(*delay).await;
-                retries += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn is_no_active_network_service(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<sysproxy::Error>(),
-            Some(sysproxy::Error::NoActiveNetworkService)
-        )
-    })
-}
-
-#[cfg(not(target_os = "macos"))]
-const fn is_no_active_network_service(_error: &anyhow::Error) -> bool {
-    false
-}
-
-#[cfg(target_os = "macos")]
-pub async fn apply_proxy_or_direct(config: Option<&MacosProxyConfig>) -> anyhow::Result<ProxyApplyOutcome> {
-    let config = config.cloned();
-    tokio::task::spawn_blocking(move || apply_proxy_or_direct_with(config.as_ref(), apply_real))
-        .await
-        .context("proxy apply task failed")?
-}
-
-#[cfg(not(target_os = "macos"))]
-pub async fn apply_proxy_or_direct(config: Option<&MacosProxyConfig>) -> anyhow::Result<ProxyApplyOutcome> {
-    match config {
-        None => Ok(ProxyApplyOutcome::NotRequested),
-        Some(_) => anyhow::bail!("macOS proxy configuration is unsupported on this platform"),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_proxy_or_direct_with, validate_proxy_config};
-    use crate::{MacosProxyConfig, ProxyApplyOutcome};
+
+    #[cfg(feature = "test")]
+    #[tokio::test]
+    async fn finished_execution_cannot_reapply_proxy_after_terminal_cleanup() -> anyhow::Result<()> {
+        let old = super::ProxyScope::default();
+        let config = crate::MacosProxyConfig::Global {
+            host: "127.0.0.1".into(),
+            port: 7897,
+            bypass: String::new(),
+        };
+        old.apply(Some(&config)).await?;
+        old.finish().await?;
+        assert!(old.apply(Some(&config)).await.is_err());
+        let current = super::ProxyScope::default();
+        current.apply(Some(&config)).await?;
+        old.finish().await?;
+        assert!(current.apply(Some(&config)).await.is_ok());
+        Ok(())
+    }
+    use super::validate_proxy_config;
+    use crate::MacosProxyConfig;
 
     #[test]
     fn proxy_contract_accepts_only_loopback_targets() {
@@ -350,142 +238,153 @@ mod tests {
             assert!(validate_proxy_config(&config).is_err(), "accepted {config:?}");
         }
     }
+}
 
-    #[test]
-    fn proxy_apply_failure_compensates_once_with_disabled() {
-        let config = MacosProxyConfig::Global {
-            host: "127.0.0.1".to_owned(),
-            port: 7897,
-            bypass: String::new(),
-        };
-        let mut calls = Vec::new();
+/// One core execution and its watchdog share exactly one proxy responsibility.
+#[derive(Default)]
+pub(super) struct ProxyScope {
+    state: tokio::sync::Mutex<ProxyScopeState>,
+}
 
-        let outcome = apply_proxy_or_direct_with(Some(&config), |config| {
-            calls.push(config.clone());
-            if calls.len() == 1 {
-                anyhow::bail!("apply failed")
-            }
-            Ok(())
-        })
-        .unwrap();
+#[derive(Default)]
+struct ProxyScopeState {
+    closed: bool,
+    #[cfg(all(target_os = "macos", not(feature = "test")))]
+    owner: Option<crate::core::desired::ActiveOwnerState>,
+}
 
-        assert_eq!(
-            outcome,
-            ProxyApplyOutcome::DirectFallback {
-                message: "apply failed".to_owned(),
-            }
-        );
-        assert_eq!(calls, [config, MacosProxyConfig::Disabled]);
+impl ProxyScope {
+    pub(super) fn restored(active: crate::core::desired::ActiveOwnerState) -> std::sync::Arc<Self> {
+        #[cfg(all(target_os = "macos", not(feature = "test")))]
+        return std::sync::Arc::new(Self {
+            state: tokio::sync::Mutex::new(ProxyScopeState {
+                closed: false,
+                owner: active.proxy_receipt.as_ref().map(|_| active.clone()),
+            }),
+        });
+        #[cfg(any(not(target_os = "macos"), feature = "test"))]
+        {
+            let _ = active;
+            std::sync::Arc::new(Self::default())
+        }
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn missing_network_service_still_reports_direct_fallback() {
-        let config = MacosProxyConfig::Global {
-            host: "127.0.0.1".to_owned(),
-            port: 7897,
-            bypass: String::new(),
-        };
-        let mut calls = Vec::new();
-
-        let outcome = apply_proxy_or_direct_with(Some(&config), |config| {
-            calls.push(config.clone());
-            Err(anyhow::Error::new(sysproxy::Error::NoActiveNetworkService))
-        })
-        .unwrap();
-
-        assert!(matches!(outcome, ProxyApplyOutcome::DirectFallback { .. }));
-        assert_eq!(calls, [config, MacosProxyConfig::Disabled]);
+    pub(super) async fn clear(&self) -> anyhow::Result<()> {
+        #[cfg(all(target_os = "macos", not(feature = "test")))]
+        {
+            let mut state = self.state.lock().await;
+            clear_owned_proxy(&mut state.owner).await
+        }
+        #[cfg(any(not(target_os = "macos"), feature = "test"))]
+        Ok(())
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_partial_write_still_requires_compensation() {
-        let config = MacosProxyConfig::Global {
-            host: "127.0.0.1".to_owned(),
-            port: 7897,
-            bypass: String::new(),
-        };
-        let mut calls = 0;
+    pub(super) async fn finish(&self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        state.closed = true;
+        #[cfg(all(target_os = "macos", not(feature = "test")))]
+        clear_owned_proxy(&mut state.owner).await?;
+        Ok(())
+    }
 
-        let error = apply_proxy_or_direct_with(Some(&config), |_| {
-            calls += 1;
-            if calls == 1 {
-                Err(anyhow::anyhow!("native proxy transaction failed"))
-            } else {
-                Err(anyhow::Error::new(sysproxy::Error::NoActiveNetworkService))
+    pub(super) async fn apply(&self, config: Option<&MacosProxyConfig>) -> anyhow::Result<ProxyApplyOutcome> {
+        let Some(config) = config else {
+            return Ok(ProxyApplyOutcome::NotRequested);
+        };
+        validate_proxy_config(config)?;
+        #[allow(unused_mut)]
+        let mut state = self.state.lock().await;
+        ensure!(!state.closed, "core execution no longer accepts proxy changes");
+        #[cfg(feature = "test")]
+        return Ok(ProxyApplyOutcome::Applied);
+        #[cfg(all(not(feature = "test"), not(target_os = "macos")))]
+        anyhow::bail!("macOS proxy configuration is unsupported on this platform");
+        #[cfg(all(target_os = "macos", not(feature = "test")))]
+        {
+            let slot = &mut state.owner;
+            // Finish the previous setting's conditional cleanup before replacing its receipt.
+            clear_owned_proxy(slot).await?;
+            let mut active = crate::core::desired::load_active_owner()
+                .await?
+                .context("proxy apply requires an active owner")?;
+            let (system, auto) = native_proxy_config(config);
+            let runtime = tokio::runtime::Handle::current();
+            let (updated, applied) = tokio::task::spawn_blocking(move || {
+                let applied = sysproxy::apply_privileged_native_owned(&system, &auto, |receipt| {
+                    runtime
+                        .block_on(crate::core::desired::persist_proxy_receipt(
+                            &active,
+                            Some(receipt.clone()),
+                        ))
+                        .map_err(|error| sysproxy::Error::Io(std::io::Error::other(format!("{error:#}"))))?;
+                    active.proxy_receipt = Some(receipt.clone());
+                    Ok(())
+                });
+                (active, applied)
+            })
+            .await
+            .context("owned proxy apply task failed")?;
+            if updated.proxy_receipt.is_some() {
+                *slot = Some(updated);
             }
-        })
-        .unwrap_err();
-
-        assert!(format!("{error:#}").contains("failed to compensate proxy apply failure"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn clearing_waits_for_a_resolvable_network_service() -> anyhow::Result<()> {
-        let attempts = std::cell::Cell::new(0);
-        let delays = [std::time::Duration::ZERO, std::time::Duration::ZERO];
-
-        super::clear_proxy_waiting_with(
-            || {
-                let attempt = attempts.get();
-                attempts.set(attempt + 1);
-                async move {
-                    if attempt < 2 {
-                        Err(anyhow::Error::new(sysproxy::Error::NoActiveNetworkService))
-                    } else {
-                        Ok(())
+            match applied {
+                Ok(applied) => match applied.result {
+                    Ok(()) => Ok(ProxyApplyOutcome::Applied),
+                    Err(error) => {
+                        clear_owned_proxy(slot)
+                            .await
+                            .with_context(|| format!("failed to compensate proxy apply ({error}) with direct mode"))?;
+                        Ok(ProxyApplyOutcome::DirectFallback {
+                            message: error.to_string(),
+                        })
                     }
-                }
-            },
-            &delays,
-        )
-        .await?;
-
-        assert_eq!(
-            attempts.get(),
-            3,
-            "the clear must be retried until the service resolves"
-        );
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn clearing_tolerates_a_service_that_never_resolves() -> anyhow::Result<()> {
-        let attempts = std::cell::Cell::new(0);
-        let delays = [std::time::Duration::ZERO, std::time::Duration::ZERO];
-
-        super::clear_proxy_waiting_with(
-            || {
-                attempts.set(attempts.get() + 1);
-                async { Err(anyhow::Error::new(sysproxy::Error::NoActiveNetworkService)) }
-            },
-            &delays,
-        )
-        .await?;
-
-        assert_eq!(attempts.get(), 3, "the retry budget is bounded by the delay schedule");
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn clearing_reports_write_failures_without_retrying() {
-        let attempts = std::cell::Cell::new(0);
-
-        let error = super::clear_proxy_waiting_with(
-            || {
-                attempts.set(attempts.get() + 1);
-                async { Err(anyhow::anyhow!("native proxy transaction failed")) }
-            },
-            &[std::time::Duration::ZERO],
-        )
-        .await
-        .expect_err("a write failure must not be treated as nothing to clear");
-
-        assert!(format!("{error:#}").contains("native proxy transaction failed"));
-        assert_eq!(attempts.get(), 1);
+                },
+                Err(sysproxy::Error::NoActiveNetworkService) => Ok(ProxyApplyOutcome::DirectFallback {
+                    message: sysproxy::Error::NoActiveNetworkService.to_string(),
+                }),
+                Err(error) => Err(error.into()),
+            }
+        }
     }
 }
+
+#[cfg(all(target_os = "macos", not(feature = "test")))]
+async fn clear_owned_proxy(slot: &mut Option<crate::core::desired::ActiveOwnerState>) -> anyhow::Result<()> {
+    let Some(active) = slot.as_ref() else {
+        return Ok(());
+    };
+    let mut active = active.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let (updated, cleared) = tokio::task::spawn_blocking(move || {
+        let mut receipt = active
+            .proxy_receipt
+            .take()
+            .expect("owned proxy scope must retain its receipt");
+        let cleared = sysproxy::clear_privileged_native_if_unchanged(&mut receipt, |updated| {
+            runtime
+                .block_on(crate::core::desired::persist_proxy_receipt(
+                    &active,
+                    Some(updated.clone()),
+                ))
+                .map_err(|error| sysproxy::Error::Io(std::io::Error::other(format!("{error:#}"))))
+        });
+        active.proxy_receipt = Some(receipt);
+        (active, cleared)
+    })
+    .await
+    .context("owned proxy clear task failed")?;
+    *slot = Some(updated.clone());
+    cleared?;
+    crate::core::desired::persist_proxy_receipt(&updated, None).await?;
+    *slot = None;
+    Ok(())
+}
+
+#[cfg(all(
+    test,
+    target_os = "macos",
+    not(feature = "test"),
+    feature = "client",
+    feature = "development-channel"
+))]
+pub(in crate::core) mod native_tests;

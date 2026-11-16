@@ -99,7 +99,9 @@ pub(super) fn plan_stage(previous: &RuntimeManifest, sources: &[AssetSource], re
             && recorded.is_some_and(|recorded| recorded.source == identity.source)
             && source.mtime_ns.is_some()
             && source.runtime_copy == Some((source.len, source.mtime_ns));
-        if synced_back || recorded.is_some_and(|recorded| recorded.still_matches(&identity)) {
+        if synced_back
+            || (source.runtime_copy.is_some() && recorded.is_some_and(|recorded| recorded.still_matches(&identity)))
+        {
             plan.skipped.push(destination.clone());
         } else {
             plan.copies.push(PlannedCopy {
@@ -172,7 +174,7 @@ pub(crate) async fn stage_runtime(
     owner: &AuthenticatedOwner,
     bundle: &RuntimeBundle,
 ) -> Result<StageRuntimeOutcome, ServiceError> {
-    let Some((core_pid, running)) = CORE_MANAGER.lock().await.running_core_config().await else {
+    let Some((core_pid, running)) = CORE_MANAGER.lock().await.running_core_config() else {
         return Ok(StageRuntimeOutcome::RestartRequired {
             reason: StageRejection::CoreNotRunning,
         });
@@ -212,7 +214,9 @@ pub(crate) async fn stage_runtime(
 
     for copy in &plan.copies {
         let target = resolve_in_generation(&generation, &copy.destination)?;
-        if let Err(error) = copy_staged_file(&copy.source, &target).await {
+        let source =
+            super::source::open_runtime_asset(owner, core.trusted_asset_bundle_root().as_deref(), &copy.source)?;
+        if let Err(error) = copy_staged_file(&source, &target).await {
             return Ok(StageRuntimeOutcome::RestartRequired {
                 reason: StageRejection::RuntimeUnwritable {
                     detail: format!("failed to refresh the runtime asset {}: {error}", copy.destination),
@@ -220,7 +224,7 @@ pub(crate) async fn stage_runtime(
             });
         }
         // Re-stat after copying to avoid recording stale source metadata.
-        if source_identity_changed(&copy.source, &copy.identity).await {
+        if source_identity_changed(&source, &copy.identity) {
             return Ok(StageRuntimeOutcome::RestartRequired {
                 reason: StageRejection::RuntimeUnwritable {
                     detail: format!("runtime asset {} changed while it was being copied", copy.destination),
@@ -231,14 +235,7 @@ pub(crate) async fn stage_runtime(
 
     // The watchdog can replace the core without the lifecycle lock. Never commit provenance built
     // for an earlier process; force a clean restart instead.
-    if CORE_MANAGER
-        .lock()
-        .await
-        .running_core_config()
-        .await
-        .map(|(pid, _)| pid)
-        != Some(core_pid)
-    {
+    if CORE_MANAGER.lock().await.running_core_config().map(|(pid, _)| pid) != Some(core_pid) {
         return Ok(StageRuntimeOutcome::RestartRequired {
             reason: StageRejection::CoreRestarted,
         });
@@ -299,8 +296,8 @@ pub(super) fn modified_nanos(metadata: &std::fs::Metadata) -> Option<u128> {
 }
 
 /// Returns true when source metadata changed or can no longer be read.
-pub(super) async fn source_identity_changed(source: &str, recorded: &SourceIdentity) -> bool {
-    match tokio::fs::metadata(source).await {
+pub(super) fn source_identity_changed(source: &std::fs::File, recorded: &SourceIdentity) -> bool {
+    match source.metadata() {
         Ok(metadata) => metadata.len() != recorded.len || modified_nanos(&metadata) != recorded.mtime_ns,
         Err(_) => true,
     }
@@ -358,28 +355,36 @@ async fn replace_staged_file(staged: &Path, destination: &Path) -> std::io::Resu
     result
 }
 
-pub(super) async fn copy_staged_file(source: &str, destination: &Path) -> std::io::Result<()> {
+pub(super) async fn copy_staged_file(source: &std::fs::File, destination: &Path) -> std::io::Result<()> {
+    use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
     if let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let staged = staging_temp_path(destination);
-    if let Err(error) = tokio::fs::copy(source, &staged).await {
+    let modified = source.metadata()?.modified().ok();
+    let mut input = tokio::fs::File::from_std(source.try_clone()?);
+    input.seek(std::io::SeekFrom::Start(0)).await?;
+    let result = async {
+        let mut output = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staged)
+            .await?;
+        tokio::io::copy(&mut input, &mut output).await?;
+        output.flush().await?;
+        if let Some(modified) = modified
+            && let Err(error) = output.into_std().await.set_modified(modified)
+        {
+            tracing::warn!(destination = ?destination, error = %error, "Failed to keep runtime asset modification time");
+        }
+        Ok::<_, std::io::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
         let _ = tokio::fs::remove_file(&staged).await;
         return Err(error);
     }
-    // Only Windows and macOS copies keep the source time, which mihomo's geo updater reads.
-    if cfg!(target_os = "linux")
-        && let Err(error) = keep_source_modified_time(source, &staged).await
-    {
-        tracing::warn!(destination = ?destination, error = %error, "Failed to keep a runtime asset's modification time");
-    }
     replace_staged_file(&staged, destination).await
-}
-
-async fn keep_source_modified_time(source: &str, staged: &Path) -> std::io::Result<()> {
-    let modified = tokio::fs::metadata(source).await?.modified()?;
-    let staged = tokio::fs::OpenOptions::new().write(true).open(staged).await?;
-    staged.into_std().await.set_modified(modified)
 }
 
 pub(super) async fn commit_staged_config(
@@ -469,13 +474,22 @@ mod tests {
     #[test]
     fn an_asset_made_from_the_same_source_is_not_copied_again() {
         let previous = manifest(&[("geoip.metadb", identity("/app/geoip.metadb", 60_000_000, 42))], &[]);
-        let sources = [asset_source("/app/geoip.metadb", "geoip.metadb", 60_000_000, 42)];
-
-        let plan = plan_stage(&previous, &sources, &[]);
+        let mut source = asset_source("/app/geoip.metadb", "geoip.metadb", 60_000_000, 42);
+        source.runtime_copy = Some((60_000_000, Some(42)));
+        let plan = plan_stage(&previous, &[source], &[]);
 
         assert!(plan.copies.is_empty(), "unchanged geo data must not be re-copied");
         assert_eq!(plan.skipped, ["geoip.metadb"]);
         assert!(plan.required_deletes.is_empty());
+    }
+
+    #[test]
+    fn a_missing_destination_is_copied_even_when_the_source_matches() {
+        let previous = manifest(&[("geoip.metadb", identity("/app/geoip.metadb", 128, 42))], &[]);
+        let source = asset_source("/app/geoip.metadb", "geoip.metadb", 128, 42);
+        let plan = plan_stage(&previous, &[source], &[]);
+        assert_eq!(plan.copies.len(), 1);
+        assert!(plan.skipped.is_empty());
     }
 
     #[test]

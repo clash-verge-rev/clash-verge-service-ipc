@@ -5,8 +5,6 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::time::Duration;
 use tracing::warn;
 
-const STALE_OWNER_TERM_GRACE: Duration = Duration::from_secs(1);
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct ProcessIdentity {
     pub(super) executable: String,
@@ -273,21 +271,20 @@ fn open_windows_process_handle(pid: u32) -> Result<Option<OwnedHandle>> {
     }
 }
 
-async fn terminate_process_inner(pid: u32, expected_identity: Option<&ProcessIdentity>, grace: Duration) -> Result<()> {
+pub(super) async fn terminate_process_if_identity(
+    pid: u32,
+    expected_identity: &ProcessIdentity,
+    grace: Duration,
+) -> Result<()> {
     #[cfg(unix)]
     {
         let unix_pid = checked_unix_pid(pid).ok_or_else(|| anyhow::anyhow!("invalid Unix process ID {pid}"))?;
-        let termination_identity = if let Some(expected_identity) = expected_identity {
-            let Some(current_identity) = process_identity(pid)? else {
-                return Ok(());
-            };
-            if &current_identity != expected_identity {
-                bail!("process {pid} identity changed before termination");
-            }
-            Some(expected_identity.clone())
-        } else {
-            process_identity(pid).ok().flatten()
+        let Some(current_identity) = process_identity(pid)? else {
+            return Ok(());
         };
+        if &current_identity != expected_identity {
+            bail!("process {pid} identity changed before termination");
+        }
         warn!("Terminating process {}", pid);
         if unsafe { platform_lib::kill(unix_pid, platform_lib::SIGTERM) } != 0
             && std::io::Error::last_os_error().raw_os_error() != Some(platform_lib::ESRCH)
@@ -303,13 +300,11 @@ async fn terminate_process_inner(pid: u32, expected_identity: Option<&ProcessIde
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        if let Some(termination_identity) = &termination_identity {
-            let Some(current_identity) = process_identity(pid)? else {
-                return Ok(());
-            };
-            if &current_identity != termination_identity {
-                bail!("process {pid} identity changed before SIGKILL");
-            }
+        let Some(current_identity) = process_identity(pid)? else {
+            return Ok(());
+        };
+        if &current_identity != expected_identity {
+            bail!("process {pid} identity changed before SIGKILL");
         }
         warn!("Process {} did not exit within {:?}, sending SIGKILL", pid, grace);
         if unsafe { platform_lib::kill(unix_pid, platform_lib::SIGKILL) } != 0
@@ -336,12 +331,11 @@ async fn terminate_process_inner(pid: u32, expected_identity: Option<&ProcessIde
         let Some(handle) = open_windows_process_handle(pid)? else {
             return Ok(());
         };
-        if let Some(expected_identity) = expected_identity {
-            let current_identity = windows_process_identity_details_from_handle(&handle)?;
-            if &current_identity != expected_identity {
-                bail!("process {pid} identity changed before termination");
-            }
+        let current_identity = windows_process_identity_details_from_handle(&handle)?;
+        if &current_identity != expected_identity {
+            bail!("process {pid} identity changed before termination");
         }
+        // Keeping this handle open prevents PID reuse while taskkill terminates the child tree.
         let status = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .status()?;
@@ -356,18 +350,6 @@ async fn terminate_process_inner(pid: u32, expected_identity: Option<&ProcessIde
         }
         bail!("process {pid} is still alive after taskkill");
     }
-}
-
-pub(super) async fn terminate_process(pid: u32) -> Result<()> {
-    terminate_process_inner(pid, None, STALE_OWNER_TERM_GRACE).await
-}
-
-pub(super) async fn terminate_process_if_identity(
-    pid: u32,
-    expected_identity: &ProcessIdentity,
-    grace: Duration,
-) -> Result<()> {
-    terminate_process_inner(pid, Some(expected_identity), grace).await
 }
 
 #[cfg(test)]
