@@ -27,6 +27,7 @@ pub(crate) struct PreparedRuntime {
     stale_runtime_paths: Vec<PathBuf>,
     plan: super::staging::StagePlan,
     yaml: String,
+    asset_bundle_root: Option<PathBuf>,
 }
 
 impl PreparedRuntime {
@@ -36,8 +37,15 @@ impl PreparedRuntime {
 
     /// Writes the plan after the outgoing core has stopped.
     /// Keeping this separate from planning avoids touching files still held open by that core.
-    pub(crate) async fn materialize(&self) -> Result<(), ServiceError> {
-        materialize_plan(&self.runtime, &self.plan, &self.yaml).await
+    pub(crate) async fn materialize(&self, owner: &AuthenticatedOwner) -> Result<(), ServiceError> {
+        materialize_plan(
+            &self.runtime,
+            &self.plan,
+            &self.yaml,
+            owner,
+            self.asset_bundle_root.as_deref(),
+        )
+        .await
     }
 
     /// Retires directories left by the old per-start layout after a successful start.
@@ -199,10 +207,10 @@ pub(crate) async fn prepare_runtime(
     let owner_paths = ensure_owner_state_directory(&owner.identity)
         .map_err(|error| invalid_asset(format!("failed to secure owner state root: {error:#}")))?;
     let owner_root = owner_paths.root();
+    #[cfg(windows)]
     crate::core::maintenance::persist_owner_identity(&owner.identity, owner_root)
         .await
         .map_err(|error| invalid_asset(format!("failed to persist owner identity: {error:#}")))?;
-    prepare_owner_ipc_directory(owner).await?;
 
     let logs = owner_paths.logs_dir();
     tokio::fs::create_dir_all(&logs)
@@ -229,6 +237,7 @@ pub(crate) async fn prepare_runtime(
         stale_runtime_paths: Vec::new(),
         plan: plan_runtime_refresh(owner, bundle, &core, &runtime).await?,
         yaml: bundle.yaml.clone(),
+        asset_bundle_root: core.trusted_asset_bundle_root(),
     };
     prepared.stale_runtime_paths = snapshot_stale_runtime_directories(owner_root, &runtime).await;
     Ok(prepared)
@@ -242,7 +251,7 @@ async fn plan_runtime_refresh(
     core: &ResolvedCore,
     runtime: &Path,
 ) -> Result<super::staging::StagePlan, ServiceError> {
-    let gathered = gather_bundle(owner, bundle, core).await?;
+    let gathered = gather_bundle(owner, bundle, core, runtime).await?;
     // A corrupt manifest must not prevent the restart that staging uses as its fallback.
     // Treat it as untrusted: copy everything and sweep nothing.
     let previous = super::staging::read_manifest(runtime).await.unwrap_or_else(|detail| {
@@ -260,7 +269,13 @@ async fn plan_runtime_refresh(
 }
 
 /// Applies a plan, committing `config.yaml` last so partial failure leaves the old configuration.
-async fn materialize_plan(runtime: &Path, plan: &super::staging::StagePlan, yaml: &str) -> Result<(), ServiceError> {
+async fn materialize_plan(
+    runtime: &Path,
+    plan: &super::staging::StagePlan,
+    yaml: &str,
+    owner: &AuthenticatedOwner,
+    bundle_root: Option<&Path>,
+) -> Result<(), ServiceError> {
     // Do not record a source that changed while it was copied.
     let mut manifest = plan.manifest.clone();
     for destination in &plan.required_deletes {
@@ -272,7 +287,8 @@ async fn materialize_plan(runtime: &Path, plan: &super::staging::StagePlan, yaml
 
     for copy in &plan.copies {
         let target = resolve_in_generation(runtime, &copy.destination)?;
-        super::staging::copy_staged_file(&copy.source, &target)
+        let source = super::source::open_runtime_asset(owner, bundle_root, &copy.source)?;
+        super::staging::copy_staged_file(&source, &target)
             .await
             .map_err(|error| {
                 invalid_asset(format!(
@@ -282,7 +298,7 @@ async fn materialize_plan(runtime: &Path, plan: &super::staging::StagePlan, yaml
             })?;
         // Re-stat after copying. If the source moved, omit its proof so the next staging retries;
         // a concurrent geo-data update should not fail the current start.
-        if super::staging::source_identity_changed(&copy.source, &copy.identity).await {
+        if super::staging::source_identity_changed(&source, &copy.identity) {
             tracing::warn!(
                 destination = %copy.destination,
                 "Runtime asset changed while being copied; not recording what it was copied from"
@@ -347,28 +363,35 @@ pub(super) async fn gather_bundle(
     owner: &AuthenticatedOwner,
     bundle: &RuntimeBundle,
     core: &ResolvedCore,
+    generation: &Path,
 ) -> Result<GatheredBundle, ServiceError> {
     let app_bundle_root = core.trusted_asset_bundle_root();
     let mut sources = Vec::with_capacity(bundle.assets.len());
     let mut asset_keys = std::collections::BTreeSet::new();
     for asset in &bundle.assets {
-        let source = validate_source(owner, app_bundle_root.as_deref(), &asset.source)?;
+        let source = super::source::open_runtime_asset(owner, app_bundle_root.as_deref(), &asset.source)?;
         let destination = destination_key(&validate_destination(&asset.destination)?)?;
-        let metadata = tokio::fs::metadata(&source)
-            .await
-            .map_err(|error| invalid_asset(format!("failed to inspect runtime asset {source:?}: {error}")))?;
+        let metadata = source
+            .metadata()
+            .map_err(|error| invalid_asset(format!("failed to inspect runtime asset {:?}: {error}", asset.source)))?;
         if !asset_keys.insert(destination.clone()) {
             return Err(invalid_asset(format!(
                 "runtime destination {destination:?} is declared as a copied asset twice"
             )));
         }
+        let runtime_copy = tokio::fs::symlink_metadata(generation.join(&destination))
+            .await
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map(|copy| (copy.len(), super::staging::modified_nanos(&copy)));
         sources.push(super::staging::AssetSource {
             asset: crate::RuntimeAsset {
-                source: source.to_string_lossy().into_owned(),
+                source: asset.source.clone(),
                 destination,
             },
             len: metadata.len(),
             mtime_ns: super::staging::modified_nanos(&metadata),
+            runtime_copy,
         });
     }
     let remote = super::staging::declared_remote_providers(&bundle.remote_providers, &asset_keys)?;
@@ -636,18 +659,25 @@ async fn set_private_directory_permissions(path: &Path) -> Result<(), ServiceErr
     Ok(())
 }
 
-async fn prepare_owner_ipc_directory(owner: &AuthenticatedOwner) -> Result<(), ServiceError> {
+pub(crate) fn prepare_owner_ipc_directory(identity: &crate::OwnerIdentity) -> Result<(), ServiceError> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let ipc_path = PathBuf::from(mihomo_ipc_path(&owner.identity));
+        let ipc_path = PathBuf::from(mihomo_ipc_path(identity));
         let directory = ipc_path
             .parent()
             .ok_or_else(|| invalid_asset("owner IPC path has no parent directory"))?;
         let users_directory = directory
             .parent()
             .ok_or_else(|| invalid_asset("owner IPC directory has no users root"))?;
+        crate::core::unix_security::ensure_service_directory(
+            crate::core::paths::service_paths()
+                .map_err(|error| invalid_asset(error.to_string()))?
+                .runtime_dir(),
+            0o755,
+        )
+        .map_err(|error| invalid_asset(format!("failed to secure IPC runtime directory: {error:#}")))?;
         crate::core::unix_security::ensure_service_directory(users_directory, 0o755)
             .map_err(|error| invalid_asset(format!("failed to secure IPC users directory: {error:#}")))?;
         match std::fs::create_dir(directory) {
@@ -671,7 +701,7 @@ async fn prepare_owner_ipc_directory(owner: &AuthenticatedOwner) -> Result<(), S
                 std::io::Error::last_os_error()
             )));
         }
-        let crate::OwnerIdentity::Unix { uid, .. } = owner.identity else {
+        let crate::OwnerIdentity::Unix { uid, .. } = *identity else {
             unsafe { platform_lib::close(fd) };
             return Err(invalid_asset("Unix IPC directory requires a Unix owner"));
         };
@@ -695,7 +725,7 @@ async fn prepare_owner_ipc_directory(owner: &AuthenticatedOwner) -> Result<(), S
     }
 
     #[cfg(windows)]
-    let _ = owner;
+    let _ = identity;
 
     Ok(())
 }
@@ -943,7 +973,7 @@ mod tests {
         bundle: &RuntimeBundle,
     ) -> Result<PreparedRuntime, ServiceError> {
         let prepared = prepare_runtime(owner, bundle).await?;
-        prepared.materialize().await?;
+        prepared.materialize(owner).await?;
         Ok(prepared)
     }
 
@@ -1185,7 +1215,7 @@ mod tests {
             "planning must not copy assets into a directory a core is running in"
         );
 
-        planned.materialize().await?;
+        planned.materialize(&owner).await?;
 
         assert_eq!(
             std::fs::read_to_string(&prepared.clash_config.core_config.config_path)?,
@@ -1236,7 +1266,7 @@ mod tests {
             "planning must not replace an asset the running core has open"
         );
 
-        planned.materialize().await?;
+        planned.materialize(&owner).await?;
 
         assert_eq!(
             std::fs::read_to_string(&live.clash_config.core_config.config_path)?,

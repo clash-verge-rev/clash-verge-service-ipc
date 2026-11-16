@@ -1,25 +1,21 @@
 use crate::core::auth::AuthenticatedOwner;
-use crate::core::desired::{load_active_owner, load_owner_desired_state};
-use crate::core::manager::CORE_MANAGER;
+use crate::core::desired::{ensure_owner_read_fence, load_active_owner, load_owner_desired_state};
+use crate::core::manager::core_status_snapshot;
 use crate::core::state::{core_lifecycle_state, service_lifecycle_state};
 use crate::core::structure::{ServiceLifecycleState, ServiceStatusSnapshot};
 use anyhow::Result;
 
 pub async fn service_status_snapshot(owner: &AuthenticatedOwner) -> Result<ServiceStatusSnapshot> {
+    let active_owner = load_active_owner().await?;
     let reported_service_state = service_lifecycle_state();
     let reported_core_state = core_lifecycle_state();
     let desired = load_owner_desired_state(&owner.key).await.unwrap_or_default();
-    let active_owner = load_active_owner().await?;
     let active_generation = active_owner
         .as_ref()
         .filter(|active| active.owner_key == owner.key)
         .map(|active| active.generation);
     let is_active = active_generation.is_some();
-    let core = if is_active {
-        Some(CORE_MANAGER.lock().await.status().await)
-    } else {
-        None
-    };
+    let core = if is_active { Some(core_status_snapshot()) } else { None };
 
     let core_pid = core.as_ref().and_then(|core| core.core_pid);
     let service_state = effective_service_state(
@@ -29,6 +25,7 @@ pub async fn service_status_snapshot(owner: &AuthenticatedOwner) -> Result<Servi
         desired.core_should_be_running,
         core_pid,
     );
+    ensure_owner_read_fence(active_owner.as_ref()).await?;
 
     Ok(ServiceStatusSnapshot {
         is_active,
@@ -42,6 +39,7 @@ pub async fn service_status_snapshot(owner: &AuthenticatedOwner) -> Result<Servi
         desired_core_should_be_running: desired.core_should_be_running,
         desired_generation: desired.generation,
         desired_updated_at: desired.updated_at,
+        desired_persistence_error: desired.persistence_error,
     })
 }
 

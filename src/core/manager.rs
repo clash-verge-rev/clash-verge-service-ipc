@@ -1,20 +1,17 @@
+use crate::OwnerIdentity;
 use crate::core::ClashConfig;
-use crate::core::logger::{LOG_RING, set_or_update_writer, write_core_line};
+use crate::core::logger::{LOG_RING, MAX_CORE_LINE_BYTES, set_or_update_writer, write_core_line};
 use crate::core::process::process_identity;
 use crate::core::reconcile::ensure_startup_reconciled;
 use crate::core::runtime::{CoreRuntimeRecord, remove_core_runtime_record, write_core_runtime_record};
 use crate::core::state::set_core_lifecycle_state;
 use crate::core::structure::ServiceLifecycleState;
-use crate::{OwnerIdentity, WriterConfig};
 use anyhow::{Context as _, Result, anyhow};
 use once_cell::sync::Lazy;
 use std::process::Stdio;
+use std::sync::Arc;
 #[cfg(feature = "test")]
 use std::sync::Mutex as StdMutex;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU32, AtomicU64, Ordering},
-};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncBufReadExt;
 use tokio::{io::BufReader, process::Command};
@@ -133,6 +130,7 @@ impl ChildGuard {
                 Err(_) => {
                     warn!("Core output stayed open after the core exited; dropping the rest");
                     reader.abort();
+                    let _ = reader.await;
                 }
             }
             self.readers.remove(0);
@@ -175,13 +173,9 @@ impl Drop for ChildGuard {
             reader.abort();
         }
         if let Some(mut child) = self.child.take() {
-            tokio::spawn(async move {
-                if let Err(e) = child.kill().await {
-                    warn!("Failed to kill child ({:?}): {e}", child.id());
-                } else {
-                    info!("Successfully killed child ({:?})", child.id());
-                }
-            });
+            if let Err(error) = child.start_kill() {
+                warn!("Failed to initiate core termination ({:?}): {error}", child.id());
+            }
         } else {
             info!("No running core process found");
         }
@@ -292,14 +286,6 @@ fn unix_timestamp_secs() -> u64 {
         .unwrap_or_default()
 }
 
-fn non_zero_u32(value: u32) -> Option<u32> {
-    (value != 0).then_some(value)
-}
-
-fn non_zero_u64(value: u64) -> Option<u64> {
-    (value != 0).then_some(value)
-}
-
 async fn write_runtime_record_for_config(pid: Option<u32>, config: &ClashConfig, context: &'static str) -> Result<()> {
     let pid = pid.context("spawned core did not expose a process ID")?;
     let identity =
@@ -314,20 +300,16 @@ async fn write_runtime_record_for_config(pid: Option<u32>, config: &ClashConfig,
 }
 
 pub struct CoreManager {
-    running_pid: Arc<AtomicU32>,
-    running_config: Mutex<Option<ClashConfig>>,
-    core_start_time: Arc<Mutex<Option<Instant>>>,
-    core_started_at: Arc<AtomicU64>,
-    last_core_exit_reason: Arc<Mutex<Option<String>>>,
-    restart_count: Arc<AtomicU32>,
-    last_recovery_at: Arc<AtomicU64>,
-    watchdog_shutdown: Mutex<Option<oneshot::Sender<Option<Instant>>>>,
-    watchdog_handle: Mutex<Option<JoinHandle<Result<()>>>>,
+    status: Arc<parking_lot::RwLock<CoreStatusSnapshot>>,
+    running_config: Option<ClashConfig>,
+    watchdog_shutdown: Option<oneshot::Sender<Option<Instant>>>,
+    watchdog_handle: Option<JoinHandle<Result<()>>>,
     failed_child: Arc<Mutex<Option<ChildGuard>>>,
-    execution: Mutex<Option<std::sync::Arc<crate::execution::CoreExecutionGuard>>>,
+    execution: Option<Arc<crate::execution::CoreExecutionGuard>>,
+    proxy: Arc<crate::core::proxy::ProxyScope>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct CoreStatusSnapshot {
     pub(super) core_pid: Option<u32>,
     pub(super) core_started_at: Option<u64>,
@@ -336,53 +318,73 @@ pub(super) struct CoreStatusSnapshot {
     pub(super) last_recovery_at: Option<u64>,
 }
 
+impl CoreStatusSnapshot {
+    fn started(&mut self, pid: Option<u32>) {
+        self.core_pid = pid;
+        self.core_started_at = Some(unix_timestamp_secs());
+    }
+
+    fn stopped(&mut self) {
+        self.core_pid = None;
+        self.core_started_at = None;
+    }
+}
+
+static CORE_STATUS: Lazy<Arc<parking_lot::RwLock<CoreStatusSnapshot>>> =
+    Lazy::new(|| Arc::new(parking_lot::RwLock::new(CoreStatusSnapshot::default())));
+
+pub(super) fn core_status_snapshot() -> CoreStatusSnapshot {
+    CORE_STATUS.read().clone()
+}
+
 impl CoreManager {
     fn new() -> Self {
-        CoreManager {
-            running_pid: Arc::new(AtomicU32::new(0)),
-            running_config: Mutex::new(None),
-            core_start_time: Arc::new(Mutex::new(None)),
-            core_started_at: Arc::new(AtomicU64::new(0)),
-            last_core_exit_reason: Arc::new(Mutex::new(None)),
-            restart_count: Arc::new(AtomicU32::new(0)),
-            last_recovery_at: Arc::new(AtomicU64::new(0)),
-            watchdog_shutdown: Mutex::new(None),
-            watchdog_handle: Mutex::new(None),
+        Self {
+            status: Arc::clone(&CORE_STATUS),
+            running_config: None,
+            watchdog_shutdown: None,
+            watchdog_handle: None,
             failed_child: Arc::new(Mutex::new(None)),
-            execution: Mutex::new(None),
+            execution: None,
+            proxy: Arc::new(crate::core::proxy::ProxyScope::default()),
         }
     }
 
-    /// Returns the live core's PID and configuration from one consistent read.
-    /// The configuration guard must be acquired before reading the PID because the watchdog can
-    /// clear it without holding that guard.
-    pub(super) async fn running_core_config(&self) -> Option<(u32, ClashConfig)> {
-        let config = self.running_config.lock().await;
-        let pid = self.running_pid.load(Ordering::Acquire);
-        if pid == 0 {
-            return None;
-        }
-        config.clone().map(|config| (pid, config))
+    pub(super) fn proxy_scope(&self) -> Arc<crate::core::proxy::ProxyScope> {
+        Arc::clone(&self.proxy)
     }
 
-    pub async fn start_core(&self, config: ClashConfig, owner: OwnerIdentity) -> Result<()> {
+    pub(super) fn restore_proxy_scope(&mut self, active: crate::core::desired::ActiveOwnerState) {
+        self.proxy = crate::core::proxy::ProxyScope::restored(active);
+    }
+
+    pub(super) fn running_core_config(&self) -> Option<(u32, ClashConfig)> {
+        let pid = self.status.read().core_pid?;
+        self.running_config.clone().map(|config| (pid, config))
+    }
+
+    pub async fn start_core(&mut self, config: ClashConfig, owner: OwnerIdentity) -> Result<()> {
         ensure_startup_reconciled()?;
         set_core_lifecycle_state(ServiceLifecycleState::Starting);
-        if self.running_pid.load(Ordering::Relaxed) != 0 || self.execution.lock().await.is_some() {
+        if self.status.read().core_pid.is_some() || self.execution.is_some() {
             info!("Core is already running, stopping existing instance");
             self.stop_core().await?;
         }
 
+        self.proxy = match crate::core::desired::load_active_owner().await? {
+            Some(active) if active.identity == owner => crate::core::proxy::ProxyScope::restored(active),
+            _ => Arc::new(crate::core::proxy::ProxyScope::default()),
+        };
         let execution = std::sync::Arc::new(crate::execution::CoreExecutionGuard::acquire()?);
         let result = self.start_reserved_core(config, owner, execution.clone()).await;
-        if result.is_ok() || self.running_pid.load(Ordering::Acquire) != 0 {
-            *self.execution.lock().await = Some(execution);
+        if result.is_ok() || self.status.read().core_pid.is_some() {
+            self.execution = Some(execution);
         }
         result
     }
 
     async fn start_reserved_core(
-        &self,
+        &mut self,
         config: ClashConfig,
         owner: OwnerIdentity,
         execution: Arc<crate::execution::CoreExecutionGuard>,
@@ -392,8 +394,8 @@ impl CoreManager {
         prepare_core_ipc_socket(&config.core_config.core_ipc_path, &owner)?;
         let args = core_args(&config);
 
-        let mut child_guard =
-            run_with_logging(&config.core_config.core_path, &args, &config.log_config, &owner).await?;
+        set_or_update_writer(&config.log_config).await?;
+        let mut child_guard = run_with_logging(&config.core_config.core_path, &args, &owner).await?;
         let child_pid = child_guard.id();
 
         if let Err(error) = child_guard
@@ -402,11 +404,8 @@ impl CoreManager {
         {
             // Never became ready: kill at once.
             if let Err(kill_error) = child_guard.terminate(Duration::ZERO).await {
-                let now_secs = unix_timestamp_secs();
-                self.running_pid.store(child_pid.unwrap_or_default(), Ordering::Release);
-                *self.running_config.lock().await = Some(config.clone());
-                *self.core_start_time.lock().await = Some(Instant::now());
-                self.core_started_at.store(now_secs, Ordering::Relaxed);
+                self.status.write().started(child_pid);
+                self.running_config = Some(config.clone());
                 if let Err(record_error) =
                     write_runtime_record_for_config(child_pid, &config, "after failed initial cleanup").await
                 {
@@ -423,11 +422,8 @@ impl CoreManager {
 
         if let Err(record_error) = write_runtime_record_for_config(child_pid, &config, "after start").await {
             if let Err(kill_error) = child_guard.terminate(Duration::ZERO).await {
-                let now_secs = unix_timestamp_secs();
-                self.running_pid.store(child_pid.unwrap_or_default(), Ordering::Release);
-                *self.running_config.lock().await = Some(config.clone());
-                *self.core_start_time.lock().await = Some(Instant::now());
-                self.core_started_at.store(now_secs, Ordering::Relaxed);
+                self.status.write().started(child_pid);
+                self.running_config = Some(config.clone());
                 *self.failed_child.lock().await = Some(child_guard);
                 set_core_lifecycle_state(ServiceLifecycleState::Fatal);
                 return Err(anyhow!(
@@ -437,23 +433,30 @@ impl CoreManager {
             return Err(record_error);
         }
 
-        *self.core_start_time.lock().await = Some(Instant::now());
-        self.core_started_at.store(unix_timestamp_secs(), Ordering::Relaxed);
-        self.running_pid.store(child_pid.unwrap_or_default(), Ordering::Release);
-        *self.running_config.lock().await = Some(config.clone());
+        {
+            let mut status = self.status.write();
+            *status = CoreStatusSnapshot::default();
+            status.started(child_pid);
+        }
+        self.running_config = Some(config.clone());
 
-        self.start_watchdog(child_guard, config, owner, execution).await;
+        self.start_watchdog(child_guard, config, owner, execution);
         set_core_lifecycle_state(ServiceLifecycleState::Running);
 
         Ok(())
     }
 
-    pub async fn stop_core(&self) -> Result<()> {
+    pub async fn stop_core(&mut self) -> Result<()> {
         self.stop_core_by(None).await
     }
 
     /// Stops the core; IPC handlers pass the deadline by which it must be SIGKILLed.
-    pub(super) async fn stop_core_by(&self, kill_by: Option<Instant>) -> Result<()> {
+    pub(super) async fn stop_core_by(&mut self, kill_by: Option<Instant>) -> Result<()> {
+        let proxy_result = self.proxy.finish().await;
+        self.stop_after_proxy_cleanup(proxy_result, kill_by).await
+    }
+
+    async fn stop_after_proxy_cleanup(&mut self, proxy_result: Result<()>, kill_by: Option<Instant>) -> Result<()> {
         info!("Stopping core");
         LOG_RING.clear_logs();
 
@@ -472,11 +475,8 @@ impl CoreManager {
             watchdog_result?;
         }
 
-        self.running_pid.store(0, Ordering::Release);
-        *self.core_start_time.lock().await = None;
-        self.core_started_at.store(0, Ordering::Relaxed);
-
-        let start_clash = self.running_config.lock().await.take();
+        self.status.write().stopped();
+        let start_clash = self.running_config.take();
         let core_ipc_path = start_clash
             .as_ref()
             .map(|config| config.core_config.core_ipc_path.clone());
@@ -490,22 +490,18 @@ impl CoreManager {
         self.after_stop(core_ipc_path).await;
         set_core_lifecycle_state(ServiceLifecycleState::Running);
 
-        Ok(())
+        proxy_result.context("core stopped but its proxy cleanup remains pending")
     }
 
-    async fn start_watchdog(
-        &self,
+    fn start_watchdog(
+        &mut self,
         child_guard: ChildGuard,
         config: ClashConfig,
         owner: OwnerIdentity,
         execution: Arc<crate::execution::CoreExecutionGuard>,
     ) {
-        let running_pid_arc = Arc::clone(&self.running_pid);
-        let start_time_arc = Arc::clone(&self.core_start_time);
-        let started_at_arc = Arc::clone(&self.core_started_at);
-        let last_exit_reason_arc = Arc::clone(&self.last_core_exit_reason);
-        let restart_count_arc = Arc::clone(&self.restart_count);
-        let last_recovery_at_arc = Arc::clone(&self.last_recovery_at);
+        let proxy = Arc::clone(&self.proxy);
+        let shared_status = Arc::clone(&self.status);
         let failed_child_arc = Arc::clone(&self.failed_child);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let watchdog_config = watchdog_config();
@@ -517,6 +513,7 @@ impl CoreManager {
             let mut shutdown_rx = shutdown_rx;
             let mut restart_timestamps: Vec<Instant> = Vec::new();
             let mut consecutive_attempt = 0u32;
+            let mut core_started = Instant::now();
 
             'watchdog: loop {
                 let Some(mut current_guard) = child_guard.take() else {
@@ -554,16 +551,17 @@ impl CoreManager {
                     }
                 };
 
-                let uptime = start_time_arc.lock().await.map(|t| t.elapsed()).unwrap_or_default();
-                let exit_reason = log_core_exit(&status, uptime);
-                *last_exit_reason_arc.lock().await = Some(exit_reason);
+                let exit_reason = log_core_exit(&status, core_started.elapsed());
+                {
+                    let mut status = shared_status.write();
+                    status.last_core_exit_reason = Some(exit_reason);
+                    status.stopped();
+                }
                 set_core_lifecycle_state(ServiceLifecycleState::RecoveringCore);
 
                 // Dropping the guard cancels its readers.
                 current_guard.drain_output().await;
                 let _ = current_guard.take();
-                running_pid_arc.store(0, Ordering::Release);
-                started_at_arc.store(0, Ordering::Relaxed);
                 remove_core_runtime_record().await;
 
                 let now = Instant::now();
@@ -608,7 +606,7 @@ impl CoreManager {
                         continue;
                     }
                     let args = core_args(&config);
-                    match run_with_logging(&config.core_config.core_path, &args, &config.log_config, &owner).await {
+                    match run_with_logging(&config.core_config.core_path, &args, &owner).await {
                         Ok(mut new_guard) => {
                             let new_pid = new_guard.id();
                             if let Err(error) = new_guard
@@ -618,10 +616,7 @@ impl CoreManager {
                                 error!("Failed to secure restarted core IPC: {error:#}");
                                 if let Err(kill_error) = new_guard.terminate(Duration::ZERO).await {
                                     error!("Failed to terminate core after IPC hardening failure: {kill_error:#}");
-                                    let now_secs = unix_timestamp_secs();
-                                    running_pid_arc.store(new_pid.unwrap_or_default(), Ordering::Release);
-                                    *start_time_arc.lock().await = Some(Instant::now());
-                                    started_at_arc.store(now_secs, Ordering::Relaxed);
+                                    shared_status.write().started(new_pid);
                                     if let Err(record_error) = write_runtime_record_for_config(
                                         new_pid,
                                         &config,
@@ -649,10 +644,7 @@ impl CoreManager {
                             {
                                 error!("Failed to commit restarted core runtime: {record_error:#}");
                                 if let Err(kill_error) = new_guard.terminate(Duration::ZERO).await {
-                                    let now_secs = unix_timestamp_secs();
-                                    running_pid_arc.store(new_pid.unwrap_or_default(), Ordering::Release);
-                                    *start_time_arc.lock().await = Some(Instant::now());
-                                    started_at_arc.store(now_secs, Ordering::Relaxed);
+                                    shared_status.write().started(new_pid);
                                     *failed_child_arc.lock().await = Some(new_guard);
                                     set_core_lifecycle_state(ServiceLifecycleState::Fatal);
                                     return Err(anyhow!(
@@ -662,12 +654,13 @@ impl CoreManager {
                                 recovery_exhausted = true;
                                 break 'watchdog;
                             }
-                            running_pid_arc.store(new_pid.unwrap_or_default(), Ordering::Release);
-                            *start_time_arc.lock().await = Some(Instant::now());
-                            let now_secs = unix_timestamp_secs();
-                            started_at_arc.store(now_secs, Ordering::Relaxed);
-                            restart_count_arc.fetch_add(1, Ordering::Relaxed);
-                            last_recovery_at_arc.store(now_secs, Ordering::Relaxed);
+                            core_started = Instant::now();
+                            {
+                                let mut status = shared_status.write();
+                                status.started(new_pid);
+                                status.restart_count = status.restart_count.saturating_add(1);
+                                status.last_recovery_at = Some(unix_timestamp_secs());
+                            }
                             consecutive_attempt += 1;
                             info!("Core restarted successfully (attempt #{})", consecutive_attempt);
                             set_core_lifecycle_state(ServiceLifecycleState::Running);
@@ -685,45 +678,38 @@ impl CoreManager {
                 }
             }
 
-            running_pid_arc.store(0, Ordering::Release);
-            *start_time_arc.lock().await = None;
-            started_at_arc.store(0, Ordering::Relaxed);
+            shared_status.write().stopped();
             remove_core_runtime_record().await;
             if recovery_exhausted {
                 set_core_lifecycle_state(ServiceLifecycleState::Fatal);
+                if let Err(error) = proxy.finish().await {
+                    error!("Failed to clear exhausted core's proxy; retaining its recovery receipt: {error:#}");
+                }
             }
             Ok(())
         });
 
-        *self.watchdog_shutdown.lock().await = Some(shutdown_tx);
-        *self.watchdog_handle.lock().await = Some(handle);
+        self.watchdog_shutdown = Some(shutdown_tx);
+        self.watchdog_handle = Some(handle);
     }
 
-    async fn stop_watchdog(&self, kill_by: Option<Instant>) -> Result<()> {
-        if let Some(shutdown_tx) = self.watchdog_shutdown.lock().await.take() {
+    async fn stop_watchdog(&mut self, kill_by: Option<Instant>) -> Result<()> {
+        if let Some(shutdown_tx) = self.watchdog_shutdown.take() {
             let _ = shutdown_tx.send(kill_by);
         }
 
-        if let Some(handle) = self.watchdog_handle.lock().await.take() {
-            handle.await.context("watchdog task failed to join")??;
+        if let Some(task) = self.watchdog_handle.as_mut() {
+            let result = task.await;
+            self.watchdog_handle.take();
+            result.context("watchdog task failed to join")??;
             info!("Watchdog stopped");
         }
 
         Ok(())
     }
 
-    pub(super) async fn status(&self) -> CoreStatusSnapshot {
-        CoreStatusSnapshot {
-            core_pid: non_zero_u32(self.running_pid.load(Ordering::Relaxed)),
-            core_started_at: non_zero_u64(self.core_started_at.load(Ordering::Relaxed)),
-            last_core_exit_reason: self.last_core_exit_reason.lock().await.clone(),
-            restart_count: self.restart_count.load(Ordering::Relaxed),
-            last_recovery_at: non_zero_u64(self.last_recovery_at.load(Ordering::Relaxed)),
-        }
-    }
-
-    async fn after_stop(&self, core_ipc_path: Option<String>) {
-        self.execution.lock().await.take();
+    async fn after_stop(&mut self, core_ipc_path: Option<String>) {
+        self.execution.take();
         #[cfg(unix)]
         {
             use std::path::Path;
@@ -750,18 +736,12 @@ impl CoreManager {
     }
 }
 
-pub async fn run_with_logging(
-    bin_path: &str,
-    args: &[String],
-    writer_config: &WriterConfig,
-    owner: &OwnerIdentity,
-) -> Result<ChildGuard> {
+pub async fn run_with_logging(bin_path: &str, args: &[String], owner: &OwnerIdentity) -> Result<ChildGuard> {
     // Every spawn is checked here rather than at the IPC boundary alone: desired-state
     // restoration and watchdog restarts reach this point without passing through
     // `prepare_runtime`, and state written by an older build can name a path this build refuses.
     let core = crate::core::runtime_generation::validate_core_path(bin_path)?;
     let bin_path = core.executable();
-    set_or_update_writer(writer_config)?;
 
     #[cfg(windows)]
     let child = {
@@ -769,6 +749,7 @@ pub async fn run_with_logging(
             return Err(anyhow!("Windows core requires a Windows owner identity"));
         };
         Command::new(bin_path)
+            .kill_on_drop(true)
             .args(args)
             .env("LISTEN_NAMEDPIPE_SDDL", windows_owner_pipe_sddl(sid))
             .stdout(Stdio::piped())
@@ -780,6 +761,7 @@ pub async fn run_with_logging(
     let child = unsafe {
         let _ = owner;
         Command::new(bin_path)
+            .kill_on_drop(true)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -812,16 +794,64 @@ fn spawn_line_reader<R>(reader: R, level: log::Level) -> JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    let epoch = LOG_RING.reader_epoch();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            write_core_line(level, &line);
-            LOG_RING.append_log(line);
-        }
+        read_core_lines(reader, |line| write_core_line(&epoch, level, line)).await;
     })
 }
 
+pub(super) async fn read_core_lines<R: tokio::io::AsyncRead + Unpin>(reader: R, mut emit: impl FnMut(String)) {
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::with_capacity(MAX_CORE_LINE_BYTES);
+    let mut truncated = false;
+    loop {
+        let available = match reader.fill_buf().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!("Failed to read core output; retaining the bounded log tail: {error}");
+                break;
+            }
+        };
+        if available.is_empty() {
+            if !line.is_empty() || truncated {
+                emit(bounded_core_line(&line, truncated));
+            }
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let length = newline.map_or(available.len(), |index| index + 1);
+        let content = if newline.is_some() { length - 1 } else { length };
+        let retained = content.min(MAX_CORE_LINE_BYTES - line.len());
+        line.extend_from_slice(&available[..retained]);
+        truncated |= retained < content;
+        reader.consume(length);
+        if newline.is_some() {
+            emit(bounded_core_line(&line, truncated));
+            line.clear();
+            truncated = false;
+        }
+    }
+}
+
+fn bounded_core_line(bytes: &[u8], truncated: bool) -> String {
+    const MARKER: &str = " [truncated]";
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    let mut line = String::from_utf8_lossy(bytes).into_owned();
+    let limit = MAX_CORE_LINE_BYTES - if truncated { MARKER.len() } else { 0 };
+    let mut end = line.len().min(limit);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line.truncate(end);
+    if truncated {
+        line.push_str(MARKER);
+    }
+    line
+}
+
 fn prepare_core_ipc_socket(core_ipc_path: &str, owner: &OwnerIdentity) -> Result<()> {
+    crate::core::runtime_generation::prepare_owner_ipc_directory(owner)
+        .map_err(|error| anyhow!("failed to prepare owner IPC directory: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
@@ -1081,6 +1111,88 @@ pub static CORE_MANAGER: Lazy<Arc<Mutex<CoreManager>>> = Lazy::new(|| Arc::new(M
 
 #[cfg(all(test, unix))]
 mod tests {
+
+    #[test]
+    fn proxy_cleanup_fixture_child() {
+        if std::env::var_os("CVS_PROXY_CLEANUP_FIXTURE_CHILD").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
+    #[cfg(feature = "test")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn proxy_cleanup_failure_still_joins_and_reaps_the_owned_core() -> anyhow::Result<()> {
+        use super::*;
+        let child = Command::new(std::env::current_exe()?)
+            .args(["--exact", "core::manager::tests::proxy_cleanup_fixture_child"])
+            .env("CVS_PROXY_CLEANUP_FIXTURE_CHILD", "1")
+            .kill_on_drop(true)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let pid = child.id().unwrap();
+        let guard = ChildGuard {
+            child: Some(child),
+            readers: Vec::new(),
+        };
+        let directory = std::env::temp_dir().join(format!("proxy-core-stop-{}", std::process::id()));
+        let config = ClashConfig {
+            core_config: crate::CoreConfig {
+                core_path: String::new(),
+                core_ipc_path: directory.join("core.sock").to_string_lossy().into_owned(),
+                config_path: String::new(),
+                config_dir: directory.to_string_lossy().into_owned(),
+            },
+            log_config: crate::WriterConfig {
+                directory: directory.to_string_lossy().into_owned(),
+                max_log_size: 1024,
+                max_log_files: 1,
+            },
+        };
+        let mut manager = CoreManager::new();
+        manager.status.write().started(Some(pid));
+        let reservation = Arc::new(crate::execution::CoreExecutionGuard::acquire()?);
+        manager.start_watchdog(
+            guard,
+            config,
+            OwnerIdentity::Unix {
+                uid: unsafe { platform_lib::geteuid() },
+                gid: unsafe { platform_lib::getegid() },
+            },
+            reservation,
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.stop_after_proxy_cleanup(Err(anyhow!("fixture native proxy clear failed")), None),
+        )
+        .await?
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("fixture native proxy clear failed"));
+        assert!(process_identity(pid)?.is_none());
+        assert!(manager.watchdog_handle.is_none());
+        assert!(manager.status.read().core_pid.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn core_output_bounds_long_lines_and_continues_after_invalid_utf8() {
+        let mut input = vec![b'x'; super::MAX_CORE_LINE_BYTES * 32];
+        input.extend_from_slice(b"\ninvalid-\xff\xfe\nvalid\nunterminated");
+        let mut lines = Vec::new();
+        super::read_core_lines(input.as_slice(), |line| lines.push(line)).await;
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0].len(), super::MAX_CORE_LINE_BYTES);
+        assert!(lines[0].ends_with(" [truncated]"));
+        assert!(lines[1].contains('\u{fffd}'));
+        assert_eq!(lines[2], "valid");
+        assert_eq!(lines[3], "unterminated");
+        let input = vec![b'x'; super::MAX_CORE_LINE_BYTES * 32];
+        let mut tail = Vec::new();
+        super::read_core_lines(input.as_slice(), |line| tail.push(line)).await;
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].len(), super::MAX_CORE_LINE_BYTES);
+    }
     use super::{prepare_core_ipc_socket, secure_core_ipc_socket};
     use crate::OwnerIdentity;
     use serial_test::serial;

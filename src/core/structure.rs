@@ -67,6 +67,11 @@ impl ProtocolInfo {
         self.protocol.epoch == ProtocolVersion::current().epoch
             && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_RUNTIME_FILE_READ
     }
+
+    pub const fn supports_runtime_geo_read(&self) -> bool {
+        self.protocol.epoch == ProtocolVersion::current().epoch
+            && self.protocol.revision >= crate::MIN_SERVICE_REVISION_FOR_RUNTIME_GEO_READ
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +299,8 @@ pub struct ServiceStatusSnapshot {
     pub desired_core_should_be_running: bool,
     pub desired_generation: u64,
     pub desired_updated_at: u64,
+    #[serde(default)]
+    pub desired_persistence_error: Option<String>,
 }
 
 #[cfg(feature = "response")]

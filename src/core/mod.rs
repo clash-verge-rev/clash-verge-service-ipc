@@ -27,8 +27,6 @@ mod desired;
 #[cfg(feature = "standalone")]
 mod installation;
 #[cfg(feature = "standalone")]
-mod legacy_cleanup;
-#[cfg(feature = "standalone")]
 mod logger;
 #[cfg(feature = "standalone")]
 mod maintenance;
@@ -61,8 +59,6 @@ mod trusted_core_location;
 #[cfg(all(feature = "standalone", unix))]
 mod unix_security;
 #[cfg(all(feature = "standalone", windows))]
-mod windows_legacy_cleanup;
-#[cfg(all(feature = "standalone", windows))]
 mod windows_security;
 
 /// Platform-specific service directory hardening.
@@ -82,9 +78,7 @@ pub use manager::{CoreWatchdogTestConfig, set_core_watchdog_config_for_tests};
 #[cfg(feature = "standalone")]
 pub use owner::{ServiceOwnerGuard, acquire_service_owner};
 #[cfg(feature = "standalone")]
-pub use proxy::{
-    apply_proxy, apply_proxy_or_direct, clear_proxy, clear_proxy_waiting_for_network, validate_proxy_config,
-};
+pub use proxy::validate_proxy_config;
 #[cfg(feature = "standalone")]
 pub use reconcile::reconcile_service_startup;
 #[cfg(feature = "standalone")]
