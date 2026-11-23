@@ -1,6 +1,6 @@
 [package]
 name = "clash_verge_service_ipc"
-version = "2.8.1"
+version = "2.8.2"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Tunglies"]
@@ -46,7 +46,6 @@ path = "src/bin/service_integration_driver.rs"
 required-features = ["client"]
 
 [features]
-development-channel = []
 standalone = [
     "kode-bridge",
     "kode-bridge/client",

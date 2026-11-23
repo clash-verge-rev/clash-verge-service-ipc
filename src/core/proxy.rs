@@ -380,11 +380,5 @@ async fn clear_owned_proxy(slot: &mut Option<crate::core::desired::ActiveOwnerSt
     Ok(())
 }
 
-#[cfg(all(
-    test,
-    target_os = "macos",
-    not(feature = "test"),
-    feature = "client",
-    feature = "development-channel"
-))]
+#[cfg(all(test, target_os = "macos", not(feature = "test"), feature = "client"))]
 pub(in crate::core) mod native_tests;

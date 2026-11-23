@@ -161,7 +161,7 @@ fn coordination_path() -> Result<PathBuf> {
         );
         PathBuf::from(String::from_utf16(&buffer[..size])?).join("Temp")
     };
-    // Both channels may keep idle helpers, but core execution is shared.
+    // Core execution is exclusive system-wide between the Service and any Sidecar.
     #[cfg(feature = "test")]
     let name = "clash-verge-service.core-execution-test.lock";
     #[cfg(not(feature = "test"))]
@@ -286,9 +286,6 @@ pub async fn check_sidecar_available() -> Result<()> {
         #[cfg(unix)]
         {
             let mut command = std::process::Command::new("ps");
-            #[cfg(target_os = "linux")]
-            command.args(["-axo", "comm=,args="]);
-            #[cfg(not(target_os = "linux"))]
             command.args(["-axo", "comm="]);
             let output = command.output().context("could not inspect remaining cores")?;
             anyhow::ensure!(output.status.success(), "could not inspect remaining cores");
@@ -302,48 +299,19 @@ pub async fn check_sidecar_available() -> Result<()> {
 
 #[cfg(all(unix, feature = "client"))]
 fn require_no_unix_core_processes(processes: &str, include_service: bool) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let other_helper = PathBuf::from("/Library/PrivilegedHelperTools")
-        .join(format!(
-            "{}.bundle",
-            if cfg!(feature = "development-channel") {
-                "io.github.clash-verge-rev.clash-verge-rev.service"
-            } else {
-                "io.github.clash-verge-rev.clash-verge-rev.dev.service"
-            }
-        ))
-        .join("Contents/MacOS/clash-verge-service");
-    #[cfg(target_os = "linux")]
-    let other_helper = PathBuf::from("/var/lib")
-        .join(if cfg!(feature = "development-channel") {
-            "clash-verge-service"
-        } else {
-            "clash-verge-service-dev"
-        })
-        .join("bin/clash-verge-service");
     // A residual helper outranks a core so the refusal stays repairable in any ps order.
     let mut remaining_core = None;
     for process in processes.lines() {
-        #[cfg(target_os = "linux")]
-        let (process, arguments) = process
-            .trim()
-            .split_once(char::is_whitespace)
-            .unwrap_or((process.trim(), ""));
         let executable = Path::new(process.trim());
         let name = executable.file_name().and_then(|name| name.to_str()).unwrap_or("");
         if ["verge-mihomo", "verge-mihomo-alpha", "verge-mihomo-al"].contains(&name) {
             remaining_core.get_or_insert(name);
         }
         if include_service && ["clash-verge-service", "clash-verge-ser"].contains(&name) {
-            // Linux comm is truncated; argv[0] retains the installed helper's channel path.
-            #[cfg(target_os = "linux")]
-            let executable = Path::new(arguments.split_whitespace().next().unwrap_or(""));
-            if executable != other_helper {
-                return Err(ResidualServiceError {
-                    process: executable.to_path_buf(),
-                }
-                .into());
+            return Err(ResidualServiceError {
+                process: executable.to_path_buf(),
             }
+            .into());
         }
     }
     if let Some(name) = remaining_core {
@@ -588,38 +556,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(all(target_os = "linux", feature = "client"))]
-    #[test]
-    fn linux_idle_helper_from_other_channel_does_not_block_fallback() -> Result<()> {
-        let other = if cfg!(feature = "development-channel") {
-            "clash-verge-service"
-        } else {
-            "clash-verge-service-dev"
-        };
-        let current = crate::SERVICE_SLUG;
-        require_no_unix_core_processes(
-            &format!("clash-verge-ser /var/lib/{other}/bin/clash-verge-service"),
-            true,
-        )?;
-        assert!(
-            require_no_unix_core_processes(
-                &format!("clash-verge-ser /var/lib/{current}/bin/clash-verge-service"),
-                true
-            )
-            .is_err()
-        );
-        assert!(require_no_unix_core_processes("clash-verge-ser /tmp/clash-verge-service", true).is_err());
-        assert!(
-            require_no_unix_core_processes(
-                &format!(
-                    "clash-verge-ser /var/lib/{other}/bin/clash-verge-service\nverge-mihomo-al /tmp/verge-mihomo-alpha"
-                ),
-                true
-            )
-            .is_err()
-        );
-        Ok(())
-    }
     #[cfg(all(unix, feature = "client"))]
     #[test]
     fn linux_truncated_alpha_core_blocks_fallback() {
@@ -662,30 +598,11 @@ mod tests {
     }
     #[cfg(all(target_os = "macos", feature = "client"))]
     #[test]
-    fn an_idle_helper_from_the_other_channel_does_not_block_fallback() -> Result<()> {
-        let production = "/Library/PrivilegedHelperTools/io.github.clash-verge-rev.clash-verge-rev.service.bundle/Contents/MacOS/clash-verge-service";
-        let development = "/Library/PrivilegedHelperTools/io.github.clash-verge-rev.clash-verge-rev.dev.service.bundle/Contents/MacOS/clash-verge-service";
-        let (current, other) = if cfg!(feature = "development-channel") {
-            (development, production)
-        } else {
-            (production, development)
-        };
-        require_no_unix_core_processes(other, true)?;
+    fn any_residual_helper_blocks_the_fallback_repairably() -> Result<()> {
         for residual in [
-            current.to_owned(),
+            "/Library/PrivilegedHelperTools/io.github.clash-verge-rev.clash-verge-rev.service.bundle/Contents/MacOS/clash-verge-service".to_owned(),
             "clash-verge-service".into(),
-            format!("/tmp{other}"),
-            format!("{other}\n/Library/Application Support/clash-verge-service/cores/verge-mihomo"),
-        ] {
-            assert!(
-                require_no_unix_core_processes(&residual, true).is_err(),
-                "unconfirmed idle state must remain blocked: {residual}"
-            );
-        }
-        for residual in [
-            current.to_owned(),
-            format!("/tmp/verge-mihomo\n{current}"),
-            format!("{current}\n/tmp/verge-mihomo"),
+            "/tmp/clash-verge-service".into(),
         ] {
             let refusal = require_no_unix_core_processes(&residual, true).expect_err("residual helper must block");
             assert!(
@@ -693,6 +610,16 @@ mod tests {
                 "a residual helper must stay repairable: {residual}"
             );
         }
+        for residual in [
+            "/tmp/verge-mihomo\nclash-verge-service".to_owned(),
+            "/Library/Application Support/clash-verge-service/cores/verge-mihomo".to_owned(),
+        ] {
+            assert!(
+                require_no_unix_core_processes(&residual, true).is_err(),
+                "residual state must remain blocked: {residual}"
+            );
+        }
+        assert!(require_no_unix_core_processes("clash-verge-service", false).is_ok());
         Ok(())
     }
 
