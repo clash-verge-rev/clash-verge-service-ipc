@@ -632,6 +632,13 @@ where
     ControlFlow::Continue((request, owner))
 }
 
+/// The service digest is explicit opt-in: hashing the service binary is elevated
+/// installer work, never something an unauthenticated bootstrap caller triggers
+/// by merely omitting the header.
+fn service_digest_opt_in(header: Option<&str>) -> bool {
+    header == Some("true")
+}
+
 fn create_ipc_router() -> Result<Router> {
     let router = Router::new()
         .get(IpcCommand::Magic.as_ref(), |ctx| async move {
@@ -652,8 +659,11 @@ fn create_ipc_router() -> Result<Router> {
                 Ok(requirements) => requirements,
                 Err(error) => return bad_request(format!("Invalid core requirements: {error}")),
             };
-            // Omitting this header retains the original response with a service digest.
-            let include_service_digest = ctx.headers.get("X-Service-Digest").is_none_or(|value| value != "false");
+            let include_service_digest = service_digest_opt_in(
+                ctx.headers
+                    .get("X-Service-Digest")
+                    .and_then(|value| value.to_str().ok()),
+            );
             match crate::core::installation::inspect(&requirements, include_service_digest).await {
                 Ok(status) => ok_json(status),
                 Err(error) => service_unavailable(format!("Failed to inspect installation: {error:#}")),
@@ -1027,6 +1037,16 @@ static OWNER_LIFECYCLE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[cfg(test)]
 mod owner_lifecycle_tests {
+
+    #[test]
+    fn service_digest_is_explicit_opt_in() {
+        let parse = super::service_digest_opt_in;
+        assert!(!parse(None), "omitting the header must not hash the service binary");
+        assert!(!parse(Some("false")));
+        assert!(!parse(Some("TRUE")));
+        assert!(!parse(Some("1")));
+        assert!(parse(Some("true")));
+    }
 
     #[cfg(all(unix, feature = "test"))]
     #[tokio::test]
