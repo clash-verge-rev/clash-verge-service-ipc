@@ -13,7 +13,7 @@ use anyhow::{Context as _, bail};
 use sha2::{Digest as _, Sha256};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use shared::run_command;
-#[cfg(all(target_os = "macos", not(feature = "development-channel")))]
+#[cfg(target_os = "macos")]
 use shared::uninstall_old_service;
 use shared::{enter_repair_gate, run_maintenance_if_requested};
 use std::fs::{File, OpenOptions};
@@ -819,7 +819,6 @@ fn main() -> Result<(), Error> {
         debug,
     )?;
     wait_for_service_ready()?;
-    #[cfg(not(feature = "development-channel"))]
     let _ = uninstall_old_service();
 
     Ok(())
@@ -958,16 +957,11 @@ fn main() -> anyhow::Result<()> {
 
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
-    let start_type = if cfg!(feature = "development-channel") {
-        ServiceStartType::OnDemand
-    } else {
-        ServiceStartType::AutoStart
-    };
     let service_info = ServiceInfo {
         name: OsString::from(clash_verge_service_ipc::WINDOWS_SERVICE_NAME),
         display_name: OsString::from(clash_verge_service_ipc::SERVICE_DISPLAY_NAME),
         service_type: ServiceType::OWN_PROCESS,
-        start_type,
+        start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: target.clone(),
         launch_arguments: vec![],

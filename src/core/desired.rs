@@ -211,7 +211,7 @@ pub(super) async fn persist_proxy_receipt(
         .await?
         .context("active owner is unavailable for proxy receipt")?;
     ensure_same_session(expected, &current)?;
-    #[cfg(all(test, not(feature = "test"), feature = "client", feature = "development-channel"))]
+    #[cfg(all(test, not(feature = "test"), feature = "client"))]
     if let Some(receipt) = receipt.as_ref() {
         crate::core::proxy::native_tests::before_proxy_write(receipt)?;
     }

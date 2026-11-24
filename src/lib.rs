@@ -42,28 +42,12 @@ pub use core::{CoreWatchdogTestConfig, set_core_watchdog_config_for_tests};
 #[cfg(feature = "client")]
 pub use client::*;
 
-#[cfg(all(target_os = "macos", not(feature = "test"), not(feature = "development-channel")))]
+#[cfg(all(target_os = "macos", not(feature = "test")))]
 pub static IPC_PATH: &str = "/var/run/clash-verge-service/service.sock";
-#[cfg(all(target_os = "macos", not(feature = "test"), feature = "development-channel"))]
-pub static IPC_PATH: &str = "/var/run/clash-verge-service-dev/service.sock";
-#[cfg(all(
-    unix,
-    not(target_os = "macos"),
-    not(feature = "test"),
-    not(feature = "development-channel")
-))]
+#[cfg(all(unix, not(target_os = "macos"), not(feature = "test")))]
 pub static IPC_PATH: &str = "/run/clash-verge-service/service.sock";
-#[cfg(all(
-    unix,
-    not(target_os = "macos"),
-    not(feature = "test"),
-    feature = "development-channel"
-))]
-pub static IPC_PATH: &str = "/run/clash-verge-service-dev/service.sock";
-#[cfg(all(windows, not(feature = "test"), not(feature = "development-channel")))]
+#[cfg(all(windows, not(feature = "test")))]
 pub static IPC_PATH: &str = r"\\.\pipe\clash-verge-service";
-#[cfg(all(windows, not(feature = "test"), feature = "development-channel"))]
-pub static IPC_PATH: &str = r"\\.\pipe\clash-verge-service-dev";
 
 #[cfg(all(feature = "test", unix))]
 pub static IPC_PATH: &str = "/tmp/clash-verge-service-ipc-test/service.sock";

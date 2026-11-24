@@ -8,7 +8,6 @@ pub struct ChannelIdentity {
     pub macos_service_id: &'static str,
 }
 
-#[cfg(not(feature = "development-channel"))]
 pub const CHANNEL_IDENTITY: ChannelIdentity = ChannelIdentity {
     id: "production",
     service_slug: "clash-verge-service",
@@ -16,16 +15,6 @@ pub const CHANNEL_IDENTITY: ChannelIdentity = ChannelIdentity {
     service_display_name: "Clash Verge Service",
     macos_app_bundle_id: "io.github.clash-verge-rev.clash-verge-rev",
     macos_service_id: "io.github.clash-verge-rev.clash-verge-rev.service",
-};
-
-#[cfg(feature = "development-channel")]
-pub const CHANNEL_IDENTITY: ChannelIdentity = ChannelIdentity {
-    id: "development",
-    service_slug: "clash-verge-service-dev",
-    windows_service_name: "clash_verge_service_dev",
-    service_display_name: "Clash Verge Development Service",
-    macos_app_bundle_id: "io.github.clash-verge-rev.clash-verge-rev.dev",
-    macos_service_id: "io.github.clash-verge-rev.clash-verge-rev.dev.service",
 };
 
 pub const SERVICE_SLUG: &str = CHANNEL_IDENTITY.service_slug;

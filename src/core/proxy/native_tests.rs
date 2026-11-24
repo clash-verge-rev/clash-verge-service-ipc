@@ -516,7 +516,7 @@ fn native_proxy_lifecycle() -> Result<()> {
     let paths = crate::service_paths()?;
     ensure!(
         !paths.persistent_state_dir().exists(),
-        "native development state already exists; refusing to touch it"
+        "native service state already exists; refusing to touch it"
     );
     std::fs::create_dir_all(root.join("owner"))?;
     crate::prepare_core_install_directory()?;

@@ -236,12 +236,17 @@ jobs:
             sudo target/release/clash-verge-service-uninstall --debug
           fi
 
+      - name: Clear service state for the native regression (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sudo rm -rf "/Library/Application Support/clash-verge-service" /var/run/clash-verge-service
+
       - name: Build native proxy regression (macOS)
         if: runner.os == 'macOS'
         shell: bash
         run: |
           cargo build --locked --target-dir target/native-fixture --features standalone,client,test --bin mock_binary --bin crash_binary
-          cargo test --locked --lib --features standalone,client,development-channel --no-run --message-format=json > target/native-proxy-build.jsonl
+          cargo test --locked --lib --features standalone,client --no-run --message-format=json > target/native-proxy-build.jsonl
           test_bin="$(python3 - <<'PY'
           import json
           from pathlib import Path

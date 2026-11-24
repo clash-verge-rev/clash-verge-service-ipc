@@ -46,7 +46,6 @@ path = "src/bin/service_integration_driver.rs"
 required-features = ["client"]
 
 [features]
-development-channel = []
 standalone = [
     "kode-bridge",
     "kode-bridge/client",
